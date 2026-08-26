@@ -1,0 +1,43 @@
+# Contract for projects.jsonl: the captain's registry of what SIANA works on.
+#
+# The captain owns this registry. SIANA reads it every session and `siana-dispatch`
+# resolves a task's project handle through it, so one record decides both what SIANA
+# knows and where a minion actually runs.
+#
+# Add or change a project with the store, never by hand-editing the log:
+#
+#   datafile -f projects.jsonl put --set handle=tasks \
+#       --set path='~/vvonkledge/sandbox/tasks' --set ship='just check'
+#
+# `put` writes a whole record, so changing one field means restating the required
+# ones. Read the record first (`datafile -f projects.jsonl get <handle>`), then put
+# it back with the change.
+#
+# `extra: forbid` is the point of keeping this in a store: a mistyped key is refused
+# at write, rather than becoming a setting the captain believes they made.
+
+name: Project
+key: handle
+extra: forbid
+
+fields:
+  handle:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{1,31}$'
+    description: what the captain calls this project in conversation
+  path:
+    type: str
+    min_length: 1
+    description: where minions run and where verification happens
+  ship:
+    type: str
+    required: false
+    description: the project's delivery rigor; SIANA types it into `tasks add --verify`
+  orders:
+    type: str
+    required: false
+    description: extra standing orders for this project, relative to path
+  worktree:
+    type: bool
+    default: true
+    description: false only for a project git cannot branch, which means no isolation

@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Put a minion on a task: its own worktree, one Herdr workspace, one agent, one prompt.
+
+This is mechanics, not judgment. SIANA has already decided the task exists and which
+project it belongs to. This script only carries that decision into a running agent,
+and it stops and reports rather than guessing when the world surprises it.
+
+Everything about where and how comes from two records, never from the command line:
+the task says which project it belongs to, and the captain's registry says what that
+project is. So a path is never typed, and a typo cannot start a minion in the wrong
+tree. A task with no project is refused, because a dispatch that guesses a directory
+is the false-green this fleet exists to prevent.
+
+Per-project configuration lives in the `$SIANA_HOME/projects.jsonl` store:
+
+    handle:   what the captain calls the project
+    path:     where minions run and where verification happens   (required)
+    ship:     the project's delivery rigor; SIANA types it into `tasks add
+              --verify`. Read by SIANA, not enforced here.
+    orders:   extra standing orders for this project, relative to `path`
+    worktree: false only for a project that is not a git repository
+
+Shape and types are the store contract's job, enforced when a record is written.
+What is left here is the part a contract cannot check: that the directory and the
+orders file actually exist on this machine right now.
+
+Usage:
+    siana-dispatch <task-id> [--label <text>] [--env K=V ...] [--prompt <text>]
+
+On success it prints the binding SIANA needs to find this minion again.
+"""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+# Only claude is verified end to end (2026-08-26, herdr 0.8.0, protocol 19). Other
+# kinds are refused rather than guessed: a wrong flag here starts an agent that
+# silently has no orders, which looks exactly like a working dispatch.
+AGENTS = {
+    "claude": {"args": ["--dangerously-skip-permissions"],
+               "orders_flag": "--append-system-prompt-file"},
+}
+
+READY_TIMEOUT_S = 90.0
+PROMPT_LANDED_S = 8.0
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said.
+
+    A bare `SystemExit(1)` stringifies to "1", so every `in str(e)` check that
+    tried to react to one silently never matched. Carrying the text means a
+    caller can inspect a refusal, report a whole registry instead of stopping at
+    the first bad entry, and turn a raw herdr code into a usable hint."""
+
+    def __init__(self, message: str, hints=()):
+        self.message, self.hints = message, tuple(hints)
+        super().__init__(1)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def die(message: str, *hints: str):
+    raise Refusal(message, hints)
+
+
+def report(r: "Refusal") -> None:
+    print(f"error: {r.message}", file=sys.stderr)
+    for h in r.hints:
+        print(f"  {h}", file=sys.stderr)
+
+
+class Herdr:
+    """One connection per call: the server closes the socket after each response.
+    Only events.subscribe keeps a connection open, and this script never needs it."""
+
+    def __init__(self, path: str, timeout: float = 30.0) -> None:
+        self.path, self.timeout, self.seq = path, timeout, 0
+
+    def call(self, method: str, **params):
+        self.seq += 1
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(self.timeout)
+            try:
+                sock.connect(self.path)
+            except OSError as e:
+                die(f"cannot reach herdr at {self.path}: {e}")
+            sock.sendall((json.dumps(
+                {"id": f"req_{self.seq}", "method": method, "params": params}) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    die(f"herdr {method}: connection closed without a response")
+                buf += chunk
+        msg = json.loads(buf.split(b"\n", 1)[0])
+        if "error" in msg:
+            die(f"herdr {method}: {msg['error'].get('code')}: {msg['error'].get('message')}")
+        return msg["result"]
+
+
+def fold(store: str, key: str):
+    """Fold an append-only datafile store into {key: record}.
+
+    Only reads go this way; every write still goes through `tasks` or `datafile`,
+    so what is on disk has already passed its contract. The log is append-only, so
+    the last line for an id wins, and a tombstone is a last line like any other: a
+    dropped record must read as absent, not as a record with every field missing.
+
+    A store with no writes yet has no file at all, which is an empty store rather
+    than a fault."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def load_registry(store: str, schema: str):
+    """The captain's registry. Absent is a stop: dispatching without it means
+    dispatching to a path nobody wrote down.
+
+    The schema is what says the registry exists, because a store with no projects
+    yet has no `.jsonl` file at all."""
+    if not os.path.isfile(schema):
+        die(f"no project registry at {store}",
+            "the registry is what turns a project handle into a directory",
+            "run `just init` in the distro")
+    return fold(store, "handle")
+
+
+def resolve(projects: dict, handle: str, store: str):
+    """Handle to configuration. Exact lookup, no inference: a handle that is not in
+    the registry is the captain's to add, never this script's to guess.
+
+    Types and required keys were settled by the contract when the record was
+    written, so what is checked here is only what a contract cannot see: whether
+    the directory and the orders file exist on this machine right now."""
+    if handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {handle}",
+            f"known handles: {known}",
+            f"the captain adds projects to {store}; a path is never guessed")
+    cfg = projects[handle]
+
+    path = os.path.abspath(os.path.expanduser(str(cfg["path"])))
+    if not os.path.isdir(path):
+        die(f"{handle} points at {path}, which is not a directory",
+            f"fix the `path` for {handle} in {store}")
+
+    orders = cfg.get("orders")
+    if orders:
+        orders = os.path.join(path, str(orders)) if not str(orders).startswith(("/", "~")) \
+            else os.path.abspath(os.path.expanduser(str(orders)))
+        if not os.path.isfile(orders):
+            die(f"{handle} names project orders at {orders}, which does not exist",
+                "a minion started without orders it was promised is a silent",
+                "half-briefing; fix the `orders` entry or remove it")
+
+    # `worktree` carries a default of true in the contract, so it is materialised on
+    # write. A record predating the field is still read as isolated, which is the
+    # safe direction: isolation withheld is a data-loss risk, isolation added is not.
+    return {"path": path, "orders": orders,
+            "worktree": cfg.get("worktree", True), "ship": cfg.get("ship")}
+
+
+def assemble_orders(home: str, task_id: str, base: str, project_orders, handle: str) -> str:
+    """One orders file, always.
+
+    claude's --append-system-prompt-file does not accumulate: passing it twice keeps
+    only the last file and silently drops the first, with no error (verified
+    2026-08-26). So project orders are concatenated here rather than passed as a
+    second flag, which would have dropped the fleet's standing orders entirely.
+
+    The combined file is durable rather than temporary, because the agent may reread
+    it when its session resumes, and because what a minion was actually told should
+    outlive the dispatch that told it."""
+    if not project_orders:
+        return base
+    out_dir = os.path.join(home, "orders")
+    os.makedirs(out_dir, exist_ok=True)
+    combined = os.path.join(out_dir, f"{task_id}.md")
+    with open(base) as fh:
+        text = fh.read()
+    with open(project_orders) as fh:
+        text += (f"\n\n---\n\n# Project orders: {handle}\n\n"
+                 f"These apply to every task in this project, on top of the standing\n"
+                 f"orders above. Where they conflict, these are more specific and win.\n\n"
+                 + fh.read())
+    with open(combined, "w") as fh:
+        fh.write(text)
+    return combined
+
+
+def check_registry(registry: str, schema: str) -> int:
+    """Every handle resolved exactly as a dispatch would resolve it, so a path that
+    has moved surfaces here rather than halfway through starting a minion."""
+    projects = load_registry(registry, schema)
+    if not projects:
+        print(f"registry {registry}\n  empty  no projects yet")
+        return 0
+    print(f"registry {registry}")
+    failed = 0
+    for handle in sorted(projects):
+        try:
+            cfg = resolve(projects, handle, registry)
+        except Refusal as r:
+            print(f"  BROKEN  {handle}: {r.message}")
+            for h in r.hints:
+                print(f"            {h}")
+            failed += 1
+            continue
+        notes = []
+        if cfg["ship"]:
+            notes.append(f"ship: {cfg['ship']}")
+        if cfg["orders"]:
+            notes.append(f"orders: {os.path.relpath(cfg['orders'], cfg['path'])}")
+        if not cfg["worktree"]:
+            notes.append("no worktree")
+        if not os.path.isdir(os.path.join(cfg["path"], ".git")) and cfg["worktree"]:
+            notes.append("WARNING: not a git repo, but worktree isolation is on")
+        suffix = f"  ({'; '.join(notes)})" if notes else ""
+        print(f"  ok      {handle} -> {cfg['path']}{suffix}")
+    return 1 if failed else 0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("task_id", nargs="?",
+                    help="the task to dispatch; omit only with --check")
+    ap.add_argument("--check", action="store_true",
+                    help="resolve every project in the registry and report, "
+                         "without dispatching anything")
+    ap.add_argument("--label", help="workspace label the captain sees (default: the task id)")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V",
+                    help="extra environment for the minion; repeatable")
+    ap.add_argument("--kind", default="claude", choices=sorted(AGENTS),
+                    help="agent kind; only verified kinds are offered")
+    ap.add_argument("--prompt", default="Take your task.",
+                    help="the dispatch trigger; the contract itself lives in the queue")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+    tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(home, "tasks.jsonl")
+    base_orders = os.path.join(home, "orders.md")
+    registry = os.path.join(home, "projects.jsonl")
+    registry_schema = os.path.join(home, "schema-projects.yaml")
+
+    # Reading the registry the same way a dispatch reads it is the point: a check
+    # that used its own parser could pass while a real dispatch fails.
+    if args.check:
+        raise SystemExit(check_registry(registry, registry_schema))
+    if not args.task_id:
+        die("which task?", "usage: siana-dispatch <task-id>",
+            "run `siana-dispatch --check` to inspect the registry instead")
+
+    if not os.path.isfile(tasks_file):
+        die(f"no task store at {tasks_file}", "run `just init` in the distro")
+    if not os.path.isfile(base_orders):
+        die(f"no standing orders at {base_orders}",
+            "a minion with no orders does not know how to report back",
+            "run `just init` in the distro")
+
+    task = fold(tasks_file, "id").get(args.task_id)
+    if task is None:
+        die(f"no such task: {args.task_id}",
+            f"run `tasks --file {tasks_file} list` to see the queue")
+
+    # Where the minion works is the task's project, not an argument. A task that
+    # cannot name its project is not yet a task, so this refuses rather than
+    # falling back to a directory nobody chose.
+    handle = task.get("project")
+    if not handle:
+        die(f"{args.task_id} carries no project",
+            "every task belongs to exactly one project, and the project is what",
+            "says where the minion works and which orders it gets",
+            f"set it with `tasks --file {tasks_file} add ... --project <handle>`")
+
+    project = resolve(load_registry(registry, registry_schema), handle, registry)
+    cwd = project["path"]
+    orders = assemble_orders(home, args.task_id, base_orders, project["orders"], handle)
+
+    env = {"SIANA_HOME": home, "SIANA_TASKS_FILE": tasks_file, "SIANA_TASK_ID": args.task_id}
+    for pair in args.env:
+        if "=" not in pair:
+            die(f"--env needs K=V, got {pair!r}")
+        k, v = pair.split("=", 1)
+        env[k] = v
+
+    h = Herdr(os.environ.get("HERDR_SOCKET_PATH", os.path.expanduser("~/.config/herdr/herdr.sock")))
+
+    # The container comes first, because the pane id is the durable handle the queue
+    # records. herdr does not enforce unique labels, so the label is for the captain's
+    # eyes only and never authorizes a lookup.
+    label = args.label or args.task_id
+    branch = None
+    if not project["worktree"]:
+        # workspace.create carries env, so the minion's identity is set at pane birth.
+        ws = h.call("workspace.create", label=label, cwd=cwd, focus=False, env=env)
+        workspace_id = ws["workspace"]["workspace_id"]
+        work_cwd = cwd
+        root_pane = pane_id = ws["root_pane"]["pane_id"]
+    else:
+        branch = f"siana/{args.task_id}"
+        try:
+            ws = h.call("worktree.create", cwd=cwd, branch=branch, label=label, focus=False)
+        except Refusal as e:
+            if "not_git_worktree" in str(e):
+                die(f"{handle} is at {cwd}, which is not a git repository",
+                    "a minion is isolated by its own worktree, which needs one",
+                    f"record {handle} with worktree=false to accept no isolation,",
+                    "which also means only one minion at a time there:",
+                    f"  datafile -f {registry} get {handle}   # then put it back",
+                    "  ... --set worktree=false")
+            if "already exists" in str(e):
+                die(f"a worktree for {branch} already exists",
+                    "a previous minion on this task was never cleaned up",
+                    "that worktree may hold unlanded work; look before removing it")
+            raise
+        workspace_id = ws["workspace"]["workspace_id"]
+        work_cwd = ws["worktree"]["path"]
+        root_pane = ws["root_pane"]["pane_id"]
+
+        # worktree.create takes no env, and herdr silently ignores unknown params, so
+        # passing one there would return success and leave the minion with no identity.
+        # Splitting a pane does carry env, so the work pane is made here and the
+        # env-less root pane is closed behind it.
+        pane_id = h.call("pane.split", direction="right", target_pane_id=root_pane,
+                         cwd=work_cwd, env=env, focus=False)["pane"]["pane_id"]
+        h.call("pane.close", pane_id=root_pane)
+
+    owner = f"{args.kind}@{pane_id}"
+
+    def abandon(message: str, *hints: str):
+        """Never leave a container behind that no task record points at. The worktree
+        is brand new and therefore clean, so removing it cannot destroy any work."""
+        if not project["worktree"]:
+            h.call("workspace.close", workspace_id=workspace_id)
+        else:
+            try:
+                h.call("worktree.remove", workspace_id=workspace_id)
+            except Refusal:
+                h.call("workspace.close", workspace_id=workspace_id)
+                print(f"warning: worktree left behind at {work_cwd}", file=sys.stderr)
+        die(message, *hints)
+
+    # `tasks start` is the gate: it refuses unmet dependencies and a task another
+    # minion already holds. Claiming after the pane exists means the record carries
+    # the real pane id on its first and only write. `--cwd` retargets the task to
+    # this minion's own tree, so `done` verifies where the work actually happened
+    # rather than in the shared tree the worktree was branched from.
+    claim = subprocess.run(["tasks", "--file", tasks_file, "start", args.task_id,
+                            "--owner", owner, "--cwd", work_cwd], capture_output=True,
+                           text=True, check=False)
+    if claim.returncode != 0:
+        abandon(f"tasks refused to dispatch {args.task_id}", claim.stdout.strip())
+
+    spec = AGENTS[args.kind]
+    # herdr refuses any agent argument containing a newline ("agent arguments cannot
+    # be encoded safely for the target shell"), so multi-line orders must travel as a
+    # file path. Verified 2026-08-26: newline is the only rejected character.
+    start_args = spec["args"] + [spec["orders_flag"], orders]
+    h.call("agent.start", name=args.task_id, kind=args.kind, pane_id=pane_id, args=start_args)
+
+    # agent.wait is level-triggered, so it answers "is in this state now" and can
+    # return before the agent has drawn anything. The honest readiness test is that
+    # herdr has identified the agent in this pane, not that the pane is quiet.
+    deadline = time.time() + READY_TIMEOUT_S
+    agent = {}
+    while time.time() < deadline:
+        agent = h.call("agent.get", target=args.task_id)["agent"]
+        if agent.get("agent") and agent.get("interactive_ready"):
+            break
+        time.sleep(0.5)
+    else:
+        die(f"{args.task_id} did not become ready in {READY_TIMEOUT_S:.0f}s",
+            f"the pane is alive at {pane_id}; read it before deciding what to do",
+            f"the task is held by {owner}, so reclaim it with `tasks reset` if the minion is gone")
+
+    # A minion can be born blocked: an untrusted directory raises a modal dialog that
+    # --dangerously-skip-permissions does not skip. Prompting into a modal types the
+    # task into a dialog box, so stop and let SIANA look instead.
+    if agent.get("agent_status") == "blocked":
+        die(f"{args.task_id} is blocked before it has its task",
+            f"read {pane_id}; a first-run trust dialog for {cwd} is the usual cause",
+            f"the task is held by {owner}")
+
+    # Delivering a prompt is not the same as it arriving. `interactive_ready` flips
+    # true while the agent's TUI still cannot accept input, and a prompt sent in that
+    # window is swallowed silently: the dispatch looks successful and the minion sits
+    # forever holding a task it never saw. So confirm the effect, and re-send once.
+    # Anything other than `idle` means the minion took it.
+    def delivered(within: float) -> bool:
+        limit = time.time() + within
+        while time.time() < limit:
+            if h.call("agent.get", target=args.task_id)["agent"].get("agent_status") != "idle":
+                return True
+            time.sleep(0.5)
+        return False
+
+    h.call("agent.prompt", target=args.task_id, text=args.prompt)
+    if not delivered(PROMPT_LANDED_S):
+        h.call("agent.prompt", target=args.task_id, text=args.prompt)
+        if not delivered(PROMPT_LANDED_S * 2):
+            die(f"{args.task_id} did not take its prompt",
+                f"the minion is alive at {pane_id} but never started working",
+                f"the task is held by {owner}; reclaim it with `tasks reset` if it stays idle")
+
+    print(json.dumps({"task_id": args.task_id, "owner": owner, "project": handle,
+                      "workspace_id": workspace_id, "pane_id": pane_id,
+                      "kind": args.kind, "project_path": cwd, "cwd": work_cwd,
+                      "branch": branch, "orders": orders}, indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Refusal as r:
+        report(r)
+        raise SystemExit(1) from None
