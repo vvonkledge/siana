@@ -1,0 +1,6 @@
+# Python bytecode, written beside the scripts in bin/ when one is imported.
+__pycache__/
+*.pyc
+
+# Linter cache.
+.ruff_cache/

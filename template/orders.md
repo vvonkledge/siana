@@ -21,6 +21,20 @@ task before you do anything else:
 Its `verify` is how your work will be judged. Its `context` holds the pointers you
 need. If something is missing from either, that is a `block`, not a guess.
 
+## Your brief
+
+The queue holds the checkable half of your contract. The rest is your brief:
+
+    $SIANA_HOME/briefs/$SIANA_TASK_ID.md
+
+Read it straight after your task. It says what the work actually is, what done looks
+like beyond the verify command, and what is deliberately not being asked of you.
+Where it and these standing orders meet, the brief is the more specific and wins.
+
+A brief that is missing, or that still carries an unfilled `{...}` placeholder, is a
+`block` and never a guess: without it you would be inventing the contract you were
+sent to fulfil.
+
 ## How you finish
 
 End by calling exactly one of these, and nothing else:

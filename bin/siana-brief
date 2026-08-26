@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Scaffold the contract a minion is briefed with, at $SIANA_HOME/briefs/<task-id>.md.
+#
+# The task record already carries what a script can check: the project, the working
+# directory, the verify command, the pointers to read. What it cannot carry is what
+# the work actually is, what "done" looks like beyond an exit code, and what is
+# deliberately not being asked for. That is this file, and SIANA writes it by hand
+# because it is judgment.
+#
+# The mechanics are here instead: pick the right contract for the delivery kind,
+# refuse a task that does not exist, and never clobber a brief that already does.
+#
+# Usage: siana-brief <task-id> --ship | --scout
+#
+#   --ship   the work lands. The minion commits on `siana/<task-id>` and the branch
+#            is the deliverable; SIANA lands it.
+#   --scout  the work reports. The minion writes $SIANA_HOME/reports/<task-id>.md and
+#            lands nothing; its worktree is scratch.
+#
+# The kind is never defaulted. Ship work and scout work are not allowed to blur into
+# each other on their own, and a default is how they would.
+#
+# The brief is found by convention, not by wiring: a minion is told where its own
+# brief lives, and treats a missing one as a `block`. So the brief is written after
+# `tasks add` has chosen the id, and no pointer has to be threaded anywhere.
+set -euo pipefail
+
+usage() {
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
+
+die() {
+    echo "error: $1" >&2
+    shift
+    for hint in "$@"; do echo "  $hint" >&2; done
+    exit 1
+}
+
+id=""
+kind=""
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+        --ship)  [ -z "$kind" ] || die "--ship and --scout are the two kinds; pick one"
+                 kind=ship ;;
+        --scout) [ -z "$kind" ] || die "--ship and --scout are the two kinds; pick one"
+                 kind=scout ;;
+        -*) die "unknown option: $arg" "run \`siana-brief --help\`" ;;
+        *)  [ -z "$id" ] || die "one task at a time; got '$id' and '$arg'"
+            id="$arg" ;;
+    esac
+done
+
+[ -n "$id" ] || die "which task?" "usage: siana-brief <task-id> --ship | --scout"
+[ -n "$kind" ] || die "$id needs a delivery kind: --ship or --scout" \
+    "ship work lands through the project's rigor; scout work leaves a report" \
+    "and lands nothing. Neither is inferred, because a wrong guess here is a" \
+    "minion shipping what was only meant to be investigated"
+
+home="${SIANA_HOME:-$HOME/.siana}"
+tasks_file="${SIANA_TASKS_FILE:-$home/tasks.jsonl}"
+template="$home/brief-$kind.md"
+brief="$home/briefs/$id.md"
+
+[ -f "$template" ] || die "no $kind brief template at $template" \
+    "SIANA owns its home copy and can evolve it" \
+    "run \`just init\` in the distro to lay one down"
+
+# Ask the queue rather than reading the store here: a second reader is a second
+# chance to disagree with the first. A typo in the id has to stop at this line,
+# because a brief filed under a name no task carries is a brief no minion ever sees.
+if ! show="$(tasks --file "$tasks_file" show "$id" 2>&1)"; then
+    die "no such task: $id" "$(printf '%s' "$show" | head -1)" \
+        "run \`tasks --file $tasks_file list\` to see the queue"
+fi
+
+[ -e "$brief" ] && die "$id is already briefed at $brief" \
+    "a brief is rewritten by editing it, never by scaffolding over it:" \
+    "a minion may already have read this one"
+
+mkdir -p "$home/briefs"
+cp "$template" "$brief"
+
+echo "briefed  $brief ($kind)"
+
+# Filling this in is the whole point of scaffolding it, so say what is still empty.
+# The minion refuses to work on an unfilled placeholder, which keeps a forgotten one
+# from becoming a guess.
+placeholders="$(grep -o '{[A-Z_]\+}' "$brief" | sort -u | tr '\n' ' ')"
+[ -n "$placeholders" ] && echo "  fill   $placeholders"
+
+# A brief that arrives after dispatch is late, not wrong: the minion has already
+# blocked on the missing one and can be pointed at this. Say so rather than refuse.
+if printf '%s' "$show" | grep -q '^  status: doing$'; then
+    echo "  late   $id is already dispatched; its minion started without this brief" >&2
+    echo "         fill it, then tell that minion to read it" >&2
+fi

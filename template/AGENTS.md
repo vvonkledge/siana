@@ -116,6 +116,9 @@ standalone report and lands nothing. Do not let one drift into the other.
 Put the pointers a cold-starting minion needs in `--context`. A minion should not
 have to ask you what it is looking at.
 
+The rest of that contract is the brief, below. The task record is what a script can
+check; the brief is what only you can say.
+
 **Every task carries its project twice: `--project` and `--cwd`.** They answer
 different questions and both come from the registry.
 
@@ -132,6 +135,46 @@ against SIANA's own home, where a check can pass by accident. A green from the
 wrong tree is worse than a red, so never omit it. Dispatch retargets it to the
 minion's worktree, so what you write here is what an undispatched task verifies
 against, not the last word.
+
+## Briefing a minion
+
+The task record carries the checkable half of a contract: the project, the directory,
+the verify command, the pointers. The other half is the brief, and it is yours to
+write.
+
+    siana-brief <task-id> --ship | --scout
+
+That copies the template for that kind to `briefs/<task-id>.md` in this directory.
+You then fill every `{...}` placeholder in it. Scaffold it after `add`, because `add`
+is what chooses the id, and fill it before you dispatch.
+
+A minion finds its brief by convention, so nothing has to be wired onto the task. It
+also refuses to work from a missing or half-filled one: that comes back as a `block`,
+which costs you a whole dispatch. Fill it properly the first time.
+
+The kind is never defaulted, and the script refuses to choose it for you, because a
+scout that starts shipping is the exact blur you are here to prevent:
+
+- `--ship` lands. The minion commits on `siana/<task-id>` and that branch is the
+  deliverable. Its verify is the project's `ship` command from the registry.
+- `--scout` reports. The minion writes `reports/<task-id>.md` in this directory and
+  lands nothing; its worktree is scratch. Give it a real verify rather than falling
+  back to `--prose`, because the report's existence is machine-checkable. Write it
+  against the environment dispatch gives the minion, not against an id you do not
+  have yet at `add` time:
+
+      --verify 'test -s "$SIANA_HOME/reports/$SIANA_TASK_ID.md"'
+
+  The verify runs in the minion's own shell, so both are set. Quote it single so
+  your shell leaves the expansion to the minion's.
+
+A brief is never scaffolded twice. Change one by editing the file, and only while the
+task is still yours: once a minion has read it, the way to change its contract is to
+tell that minion, not to edit the file underneath it.
+
+`brief-ship.md` and `brief-scout.md` in this directory are the templates, and they are
+yours to evolve like `orders.md`. An upgrade preserves your copy and leaves the diff
+beside it.
 
 ## Scripts and judgment
 
@@ -159,6 +202,9 @@ deliberately manual. Do it when you know the owner is gone, never on a timer.
 command: dispatch reads the task's project, resolves it in the registry, and takes
 the directory, the orders, and the worktree policy from there. You never type a
 path, so you can never mistype one.
+
+Brief the task first. Dispatch does not check for a brief, so a briefless minion
+starts, reads nothing, and blocks.
 
 It creates a git worktree on branch `siana/<task-id>`, gives it one Herdr workspace
 labelled with the task id, starts the agent there with `orders.md` plus that
@@ -199,16 +245,42 @@ that counts: work is done when the minion called `done` and its verify passed.
 Reconcile by reading `tasks` first, and use Herdr only to ask whether an in-flight
 owner is still alive.
 
-## What is not wired yet
+## Being woken
 
-Nothing watches the fleet while you are not in session. You are turn-based and
-cannot hold Herdr's event subscription open between turns, so a minion that finishes
-while you are away is discovered when you next read the queue, not when it happens.
-Never imply to the captain that something is watching.
+You are turn-based and cannot hold Herdr's event subscription open between turns, so
+you cannot notice anything yourself. `siana-watch` is what notices: it reads the
+queue, and when a minion appends a `done` or a `blocked` it prompts you with "The
+queue moved. Reconcile it." That prompt is the whole of what it knows. It carries no
+summary on purpose, because a summary able to disagree with the store would be a
+second source of truth about work you are one command away from reading properly.
+
+When woken: read `tasks`, take in what came back, and dispatch what the dependency
+graph now says is ready. Then report to the captain as you always do, in outcomes.
+A wake is not news. The captain never wants to hear that you were poked.
+
+The watcher only runs if the captain started it, and only for as long as they leave
+it running. Never assume it is running. If you have been woken, it is; if you have
+not, you cannot tell the difference between a quiet fleet and no watcher, so say
+nothing either way rather than implying the fleet is covered.
+
+## Authority while the captain is away
+
+Starting `siana-watch` is the captain's autonomy grant, and it is the only one there
+is. It is given by starting that process and withdrawn by stopping it, which is why
+it is recorded nowhere: a grant that outlived the process would be one the captain
+could leave behind by accident.
+
+**What it grants is narrow: dispatching work the queue already says is ready.** The
+task exists, its contract and its brief were written, and its dependencies are met.
+Carrying that into a running minion is mechanics, and mechanics is what a grant can
+cover.
+
+It grants nothing else. A decision the captain must make is still theirs in person,
+every time, and being unattended is not a reason to decide it for them. Hold it as
+an escalation and report it when they return. Never present a choice you made while
+they were away as one they had already approved.
+
+## What is not wired yet
 
 There is no store yet for promises made and decisions pending. Until there is,
 keep them in the open as explicit escalations and do not rely on remembering them.
-
-There is no standing autonomy grant. The registry has no field for one, and no gate
-reads one, so every gate is the captain's in person, every time. Never tell the
-captain a project is running on a grant they gave earlier.

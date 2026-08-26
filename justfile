@@ -35,10 +35,10 @@ init: _contract-drift
         [ -n "$datafile" ] && echo "TASKS_DATAFILE=$(readlink "$datafile" || echo "$datafile")"
     } > "$home/siana.env"
 
-    # SIANA can evolve its own instructions and the orders its minions are started
-    # with, so a home copy that has diverged is the captain's work, not drift to be
-    # cleaned up. Never clobber it.
-    for f in AGENTS.md orders.md; do
+    # SIANA can evolve its own instructions, the orders its minions are started with,
+    # and the brief templates it scaffolds a task contract from, so a home copy that
+    # has diverged is the captain's work, not drift to be cleaned up. Never clobber it.
+    for f in AGENTS.md orders.md brief-ship.md brief-scout.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "wrote    $home/$f"
@@ -91,7 +91,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch; do
+    for c in siana siana-dispatch siana-brief siana-watch; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -137,7 +137,7 @@ upgrade: _initialized init
     backup="$home/upgrade/$stamp"
     kept=""
     echo
-    for f in AGENTS.md orders.md; do
+    for f in AGENTS.md orders.md brief-ship.md brief-scout.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "restored $home/$f (it was missing)"
@@ -204,7 +204,7 @@ doctor: _contract-drift
     set -uo pipefail
     home='{{home}}'
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md schema-projects.yaml schema-tasks.yaml .pi/settings.json; do
+    for f in siana.env AGENTS.md orders.md brief-ship.md brief-scout.md schema-projects.yaml schema-tasks.yaml .pi/settings.json; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -219,9 +219,10 @@ doctor: _contract-drift
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
     done
-    # The registry is hand-edited, so a bad path or bad YAML is discovered here
-    # rather than halfway through starting a minion. Dispatch does the resolving,
-    # so this cannot drift from what a real dispatch would accept.
+    # Dispatch does the resolving and holds the pane bindings, so asking it means
+    # this cannot drift from what a real dispatch would accept or from where a real
+    # minion was put. It reports a dead owner and never reclaims one: `tasks reset`
+    # stays manual because a dead minion's worktree may hold unlanded work.
     echo
     SIANA_HOME="$home" "$PWD/bin/siana-dispatch" --check || true
     echo
@@ -231,7 +232,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch; do
+    for c in siana siana-dispatch siana-brief siana-watch; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

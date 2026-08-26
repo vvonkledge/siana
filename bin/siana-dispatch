@@ -242,14 +242,72 @@ def check_registry(registry: str, schema: str) -> int:
     return 1 if failed else 0
 
 
+def check_owners(tasks_file: str) -> int:
+    """Report whether the pane each in-flight task is bound to still holds its minion.
+
+    A dead minion is the one failure the fleet cannot see. It appends nothing, so the
+    watcher never fires; `--stale` covers only `todo` and `blocked`, so no age ever
+    flags it; and its task sits in `doing` forever with everything behind it waiting.
+
+    This only reports. Reclaiming is `tasks reset`, and it stays manual because the
+    worktree behind a dead minion may hold work nobody has landed, and because herdr
+    cannot tell a minion that finished from one stalled on a prose question. What is
+    checked here is narrower and unambiguous: whether the pane still holds that kind
+    of agent at all. That much is mechanics; what to do about it is judgment.
+    """
+    doing = sorted((t for t in fold(tasks_file, "id").values()
+                    if t.get("status") == "doing"),
+                   key=lambda t: t.get("id") or "")
+    if not doing:
+        print("in flight  nothing")
+        return 0
+    print(f"in flight  {len(doing)} claimed")
+
+    h = Herdr(os.environ.get("HERDR_SOCKET_PATH",
+                             os.path.expanduser("~/.config/herdr/herdr.sock")))
+    # Reachability once, not once per task: an unanswering herdr is one fact about
+    # the world, and repeating it per minion would read as many separate faults.
+    try:
+        h.call("workspace.list")
+    except Refusal as r:
+        print(f"  unknown {len(doing)} in flight, none checked: {r.message}")
+        print("            herdr is the only way to ask, so say nothing about whether")
+        print("            these are alive rather than implying they are")
+        return 1
+
+    failed = 0
+    for t in doing:
+        tid, owner = t.get("id"), t.get("owner") or ""
+        kind, _, pane = owner.partition("@")
+        if not pane:
+            print(f"  BROKEN  {tid}: owner {owner or '(none)'} names no pane")
+            print("            nothing can find this minion; it was claimed outside dispatch")
+            failed += 1
+            continue
+        try:
+            agent = h.call("agent.get", target=pane)["agent"]
+        except Refusal:
+            print(f"  GONE    {tid}: herdr has no agent in {pane}")
+        else:
+            seen = agent.get("agent")
+            if seen == kind:
+                print(f"  ok      {tid} -> {owner} ({agent.get('agent_status') or 'unknown'})")
+                continue
+            print(f"  GONE    {tid}: {pane} now holds {seen or 'no agent'}, not {kind}")
+        print(f"            look at its worktree before `tasks reset {tid}`; a refusal")
+        print("            to discard unlanded work is a finding, not an obstacle")
+        failed += 1
+    return 1 if failed else 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("task_id", nargs="?",
                     help="the task to dispatch; omit only with --check")
     ap.add_argument("--check", action="store_true",
-                    help="resolve every project in the registry and report, "
-                         "without dispatching anything")
+                    help="resolve every project in the registry, report whether "
+                         "each in-flight minion is still alive, and dispatch nothing")
     ap.add_argument("--label", help="workspace label the captain sees (default: the task id)")
     ap.add_argument("--env", action="append", default=[], metavar="K=V",
                     help="extra environment for the minion; repeatable")
@@ -268,7 +326,9 @@ def main() -> None:
     # Reading the registry the same way a dispatch reads it is the point: a check
     # that used its own parser could pass while a real dispatch fails.
     if args.check:
-        raise SystemExit(check_registry(registry, registry_schema))
+        rc = check_registry(registry, registry_schema)
+        print()
+        raise SystemExit(max(rc, check_owners(tasks_file)))
     if not args.task_id:
         die("which task?", "usage: siana-dispatch <task-id>",
             "run `siana-dispatch --check` to inspect the registry instead")

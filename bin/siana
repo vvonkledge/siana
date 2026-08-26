@@ -43,6 +43,25 @@ if [ -f "$home/schema-projects.yaml" ]; then
 $registry")
 fi
 
+# Record which pane this session runs in, so `siana-watch` can wake SIANA when a
+# minion reports. The pane id is the durable handle - herdr's labels are not unique
+# and searching for a pi agent that looks about right could poke the wrong session -
+# and it comes from the environment herdr sets, so it is never inferred.
+#
+# Outside herdr there is no pane and therefore nothing to poke. That is a working
+# SIANA, just one the fleet cannot wake, so it is said plainly rather than refused.
+session="$home/session"
+if [ -n "${HERDR_PANE_ID:-}" ]; then
+    printf '%s\n' "$HERDR_PANE_ID" > "$session"
+    # The file must not outlive the session it names: a stale pane id is a poke sent
+    # into whatever occupies that pane next. `siana-watch` also checks the pane still
+    # holds pi, because a session killed outright never reaches this trap.
+    trap 'rm -f "$session"' EXIT
+else
+    rm -f "$session"
+    echo "not running under herdr: siana-watch cannot wake this session" >&2
+fi
+
 # --approve trusts this directory's project-local pi files. The captain created
 # this directory by running init, so the consent is explicit rather than inferred.
-exec pi --approve "${prompt[@]}" "$@"
+pi --approve "${prompt[@]}" "$@"

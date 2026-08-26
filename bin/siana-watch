@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Wake SIANA when a minion reports, so the fleet does not idle while nobody looks.
+
+SIANA is turn-based. It cannot hold Herdr's event subscription open between turns,
+so without this a minion that finishes is discovered whenever the captain next takes
+a turn, and everything downstream of it waits that long for no reason.
+
+This watches the queue, not the fleet. Herdr says a process stopped, never that it
+succeeded, and its `idle` covers both a minion that finished and one that asked a
+question in prose and stalled forever. The queue is the only report that counts, so
+a terminal record appended to `tasks.jsonl` is the only thing that pokes anyone.
+
+**The poke carries no content.** It says the queue moved and nothing else, because
+anything it summarised would be a second source of truth able to disagree with the
+store SIANA is about to read anyway. That is also why a missed poke costs only
+timeliness: the store still holds everything, and the next poke or the next turn
+recovers the whole picture. Never make this the report.
+
+**Running this is the captain's autonomy grant.** SIANA reconciles and dispatches
+ready work when poked, so while this runs the fleet advances without the captain in
+the room. The grant is this process: it is given by starting it and withdrawn by
+stopping it, which is why it lives nowhere else. No flag, no registry field, and no
+record outlives it, so a grant can never be inherited by a session the captain did
+not choose to leave running.
+
+Usage:
+    siana-watch [--interval S]
+
+It runs until interrupted. SIANA's session is found through `$SIANA_HOME/session`,
+written by `siana` at startup, so this must be started after SIANA is up.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+
+# What a minion writes and SIANA does not. SIANA calls add, start, dep, drop and
+# reset, none of which land here, so this predicate isolates minion reports without
+# guessing from owners. A `done` SIANA typed itself costs one wasted reconcile.
+TERMINAL = {"done", "blocked"}
+
+# How long SIANA may stay mid-turn before this says so. It is a warning and never a
+# deadline: a report is held until it can be delivered, however long that takes,
+# because SIANA can be blocked waiting on the captain and the captain can be away.
+SETTLE_WARN_S = 300.0
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching siana-dispatch."""
+
+    def __init__(self, lines):
+        self.lines = lines
+        super().__init__(1)
+
+    def __str__(self):
+        return "\n".join(self.lines)
+
+
+def die(*lines):
+    raise Refusal(list(lines))
+
+
+class Herdr:
+    """One request, one connection. Same protocol as siana-dispatch."""
+
+    def __init__(self, path):
+        self.path = os.path.expanduser(path)
+
+    def call(self, method, **params):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(self.path)
+        except OSError as e:
+            die(f"herdr is not reachable at {self.path}: {e}",
+                "the session SIANA runs in lives in herdr; start it first")
+        with s:
+            s.sendall((json.dumps({"id": "siana-watch", "method": method,
+                                   "params": params}) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    die(f"herdr closed the connection during {method}")
+                buf += chunk
+        reply = json.loads(buf)
+        if "error" in reply:
+            err = reply["error"]
+            die(f"herdr refused {method}: {err.get('message', err)}")
+        return reply.get("result", {})
+
+
+def read_session(home):
+    """SIANA's pane id, which is the only durable handle back to its session.
+
+    Herdr's labels are not unique and its pane metadata is wiped when its server
+    restarts, so this reads what `siana` recorded and never searches for a pi agent
+    that looks about right. A stale file names a pane that is gone or now holds
+    something else, and both are refusals rather than a poke sent into whatever
+    happens to be there now."""
+    path = os.path.join(home, "session")
+    if not os.path.isfile(path):
+        die(f"no SIANA session recorded at {path}",
+            "`siana` writes it at startup, so either SIANA is not running or it was",
+            "started outside herdr, where there is no pane to poke")
+    with open(path) as f:
+        pane = f.read().strip()
+    if not pane:
+        die(f"{path} is empty", "restart SIANA so it records its pane again")
+    return pane
+
+
+def confirm_alive(h, pane, home):
+    """That pane still holds SIANA, not a shell or somebody else's agent."""
+    try:
+        agent = h.call("agent.get", target=pane)["agent"]
+    except Refusal:
+        agent = {}
+    if agent.get("agent") == "pi":
+        return agent
+    seen = agent.get("agent") or "no agent"
+    die(f"pane {pane} is not running SIANA: herdr sees {seen}",
+        "if SIANA is starting, herdr has not detected it yet: wait and rerun",
+        "otherwise that session has exited, and restarting SIANA rewrites",
+        f"{home}/session with the pane it lands in")
+
+
+def reports(path, offset):
+    """New terminal records since `offset`, and where to read from next.
+
+    The store is an append-only log of whole records, so a byte offset is the whole
+    of the state this needs. A log shorter than the offset was rewritten underneath
+    us, so this resumes from the end and reports once: something certainly happened,
+    and the poke carries no content that could be wrong about what."""
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
+        return [], 0          # An empty queue has no file until the first append.
+    if size < offset:
+        return ["the queue was rewritten"], size
+    if size == offset:
+        return [], offset
+    with open(path) as f:
+        f.seek(offset)
+        block = f.read()
+        offset = f.tell()
+    found = []
+    for line in block.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue          # A partial line mid-append; its offset is not consumed.
+        if rec.get("status") in TERMINAL:
+            found.append(f"{rec['id']} {rec['status']}")
+    return found, offset
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--interval", type=float, default=2.0, metavar="S",
+                    help="seconds between reads of the queue (default: 2)")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+    tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(home, "tasks.jsonl")
+    pane = read_session(home)
+    h = Herdr(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
+    confirm_alive(h, pane, home)
+
+    # Start at the end. Reports from before this began were SIANA's to reconcile in
+    # the session that saw them, and replaying them would poke about work already
+    # accounted for. The poke carries no content, so nothing is lost by not knowing
+    # what happened while nothing was watching.
+    offset = os.path.getsize(tasks_file) if os.path.exists(tasks_file) else 0
+    print(f"watching {tasks_file}\npoking   SIANA at {pane}", flush=True)
+
+    # Reading the queue and delivering the poke are separate steps of one tick, so
+    # neither can stall the other. Reports that land while SIANA is mid-turn keep
+    # accumulating and leave together, because SIANA reads the whole queue and a poke
+    # per report would only spend turns saying the same thing.
+    pending, waiting_since, warned = [], None, False
+    while True:
+        # Liveness every tick, not only when there is something to deliver. This
+        # process is the captain's autonomy grant, so it must never keep running
+        # after the session it grants for is gone: a watcher that looks alive while
+        # it can wake nobody is the fleet quietly stopping and no one being told.
+        status = confirm_alive(h, pane, home).get("agent_status")
+        found, offset = reports(tasks_file, offset)
+        if found:
+            print(f"report   {', '.join(found)}", flush=True)
+            pending += found
+        if pending:
+            # A prompt sent into a working agent is typed into a turn already in
+            # flight, and one sent into a blocked agent is typed into whatever
+            # blocked it, the same hazard dispatch guards against at birth. So wait
+            # for a settled state rather than forcing one, however long that takes.
+            if status in ("idle", "done"):
+                h.call("agent.prompt", target=pane, text="The queue moved. Reconcile it.")
+                print(f"poked    {len(pending)} report(s)", flush=True)
+                pending, waiting_since, warned = [], None, False
+            else:
+                waiting_since = waiting_since or time.time()
+                if not warned and time.time() - waiting_since > SETTLE_WARN_S:
+                    warned = True
+                    print(f"waiting  SIANA has been mid-turn for {SETTLE_WARN_S:.0f}s; "
+                          f"{len(pending)} report(s) held", file=sys.stderr, flush=True)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Refusal as r:
+        print(str(r), file=sys.stderr)
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        print("\nstopped; SIANA no longer advances the fleet unattended")
