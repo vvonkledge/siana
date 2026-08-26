@@ -59,8 +59,15 @@ class Refusal(SystemExit):
         return "\n".join(self.lines)
 
 
-def die(*lines):
-    raise Refusal(list(lines))
+class Unreachable(Refusal):
+    """herdr itself never answered, which is a fact about herdr and about nothing
+    else. A caller asking after a pane must not read it as an answer about that
+    pane: reporting a live session as gone is how a captain is talked into
+    abandoning one."""
+
+
+def die(*lines, kind=Refusal):
+    raise kind(list(lines))
 
 
 class Herdr:
@@ -75,7 +82,8 @@ class Herdr:
             s.connect(self.path)
         except OSError as e:
             die(f"herdr is not reachable at {self.path}: {e}",
-                "the session SIANA runs in lives in herdr; start it first")
+                "the session SIANA runs in lives in herdr; start it first",
+                kind=Unreachable)
         with s:
             s.sendall((json.dumps({"id": "siana-watch", "method": method,
                                    "params": params}) + "\n").encode())
@@ -83,7 +91,8 @@ class Herdr:
             while not buf.endswith(b"\n"):
                 chunk = s.recv(65536)
                 if not chunk:
-                    die(f"herdr closed the connection during {method}")
+                    die(f"herdr closed the connection during {method}",
+                        kind=Unreachable)
                 buf += chunk
         reply = json.loads(buf)
         if "error" in reply:
@@ -116,6 +125,8 @@ def confirm_alive(h, pane, home):
     """That pane still holds SIANA, not a shell or somebody else's agent."""
     try:
         agent = h.call("agent.get", target=pane)["agent"]
+    except Unreachable:
+        raise                 # herdr said nothing, so say nothing about the pane.
     except Refusal:
         agent = {}
     if agent.get("agent") == "pi":
@@ -142,20 +153,32 @@ def reports(path, offset):
         return ["the queue was rewritten"], size
     if size == offset:
         return [], offset
-    with open(path) as f:
+    with open(path, "rb") as f:
         f.seek(offset)
         block = f.read()
-        offset = f.tell()
+    # Bytes, and only through the last newline. An append larger than the writer's
+    # buffer reaches disk in more than one write, so the tail of a read is routinely
+    # half a record; consuming it would drop that report for good and split a
+    # multi-byte character across two decodes. Whole lines only, and the remainder
+    # stays unread until the rest of it lands.
+    end = block.rfind(b"\n") + 1
+    if not end:
+        return [], offset
+    offset += end
     found = []
-    for line in block.splitlines():
+    for line in block[:end].splitlines():
         if not line.strip():
             continue
         try:
             rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue          # A partial line mid-append; its offset is not consumed.
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A whole line that will not parse is not a partial write, so it is
+            # never coming back. Said out loud, because the report it may have
+            # carried is exactly what this process exists to deliver.
+            print(f"skipped  unreadable record in {path}", file=sys.stderr, flush=True)
+            continue
         if rec.get("status") in TERMINAL:
-            found.append(f"{rec['id']} {rec['status']}")
+            found.append(f"{rec.get('id')} {rec['status']}")
     return found, offset
 
 

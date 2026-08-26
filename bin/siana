@@ -56,9 +56,20 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
     # The file must not outlive the session it names: a stale pane id is a poke sent
     # into whatever occupies that pane next. `siana-watch` also checks the pane still
     # holds pi, because a session killed outright never reaches this trap.
-    trap 'rm -f "$session"' EXIT
+    #
+    # Only this session's own id is cleared. A second session in the same home
+    # overwrites the file, and removing whatever is there on the way out would
+    # strip a still-running SIANA of the pointer the fleet wakes it through.
+    release_session() {
+        if [ "$(cat "$session" 2>/dev/null)" = "$HERDR_PANE_ID" ]; then
+            rm -f "$session"
+        fi
+    }
+    trap release_session EXIT
 else
-    rm -f "$session"
+    # Nothing is removed here. With no pane of its own this session cannot tell a
+    # stale pointer from one a running SIANA is reachable through, and `siana-watch`
+    # already refuses on a pane that no longer holds pi.
     echo "not running under herdr: siana-watch cannot wake this session" >&2
 fi
 
