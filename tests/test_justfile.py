@@ -109,10 +109,26 @@ class Init(Recipe):
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch", "siana-owe"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
-            self.assertEqual(os.readlink(link), os.path.join(DISTRO, "bin", c))
+            # realpath both sides: what matters is that the link lands on this
+            # distro's command, not how the path to it happens to be spelled. A
+            # checkout under a symlinked prefix spells it two ways.
+            self.assertEqual(os.path.realpath(link),
+                             os.path.realpath(os.path.join(DISTRO, "bin", c)))
         doctor = self.just("doctor")
-        self.assertNotIn("missing ", doctor.stdout)
         self.assertNotIn("stale", doctor.stderr)
+        # The ambient queue is the one part of an install that depends on something
+        # outside the distro: `init` writes `.pi/settings.json` only when the tasks
+        # pi package sits beside the checkout, and says so when it does not. From a
+        # linked worktree that sibling is absent, so a blanket "nothing is missing"
+        # asserts on where this suite was checked out rather than on the install -
+        # green in the main tree and red in every minion's. Demanded when the package
+        # is there, tolerated by name when it is not, and nothing else ever tolerated.
+        missing = [line.strip() for line in doctor.stdout.splitlines()
+                   if "missing " in line]
+        if os.path.isdir(os.path.join(DISTRO, os.pardir, "tasks", "pi-agent-tasks")):
+            self.assertEqual(missing, [])
+        else:
+            self.assertEqual(missing, ["missing .pi/settings.json"])
 
     def test_it_is_idempotent_and_never_clobbers_an_evolved_file(self):
         # SIANA can evolve its own instructions, so a diverged home copy is the
