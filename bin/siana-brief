@@ -86,7 +86,7 @@ echo "briefed  $brief ($kind)"
 # Filling this in is the whole point of scaffolding it, so say what is still empty.
 # The minion refuses to work on an unfilled placeholder, which keeps a forgotten one
 # from becoming a guess.
-placeholders="$(grep -o '{[A-Z_]\+}' "$brief" | sort -u | tr '\n' ' ')"
+placeholders="$({ grep -o '{[A-Z_]\+}' "$brief" || true; } | sort -u | tr '\n' ' ')"
 [ -n "$placeholders" ] && echo "  fill   $placeholders"
 
 # A brief that arrives after dispatch is late, not wrong: the minion has already

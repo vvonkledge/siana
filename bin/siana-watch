@@ -47,6 +47,16 @@ TERMINAL = {"done", "blocked"}
 # because SIANA can be blocked waiting on the captain and the captain can be away.
 SETTLE_WARN_S = 300.0
 
+# How long a pane may answer "no agent here" before this calls the session gone.
+# Herdr loses its pane metadata across a server restart and re-detects each agent
+# from the pane itself, so for a few seconds after a routine `herdr update` it
+# truthfully reports no agent in a pane SIANA is alive and working in. Two minutes
+# is far longer than that restart and re-detection take together, so anything still
+# undetected at the end of it has really exited - and it is short enough that a
+# session that did exit is said out loud long before the captain, seeing this process
+# still running, has spent an afternoon believing the fleet was advancing.
+DETECT_GRACE_S = 120.0
+
 
 class Refusal(SystemExit):
     """A refusal that still knows what it said, matching siana-dispatch."""
@@ -59,32 +69,54 @@ class Refusal(SystemExit):
         return "\n".join(self.lines)
 
 
-def die(*lines):
-    raise Refusal(list(lines))
+class Unreachable(Refusal):
+    """herdr itself never answered, which is a fact about herdr and about nothing
+    else. A caller asking after a pane must not read it as an answer about that
+    pane: reporting a live session as gone is how a captain is talked into
+    abandoning one."""
+
+
+def die(*lines, kind=Refusal):
+    raise kind(list(lines))
 
 
 class Herdr:
-    """One request, one connection. Same protocol as siana-dispatch."""
+    """One request, one connection. Same protocol and timeout as siana-dispatch.
 
-    def __init__(self, path):
-        self.path = os.path.expanduser(path)
+    The timeout is the point: a herdr that accepts the connection and then says
+    nothing - wedged, stopped mid-request, or a listener bound by a server still
+    starting - would otherwise park this process inside `recv` forever. A watcher
+    parked there is the one thing this must never be, a process that looks like a
+    live autonomy grant while it polls nothing and can wake nobody."""
+
+    def __init__(self, path, timeout=30.0):
+        self.path, self.timeout = os.path.expanduser(path), timeout
 
     def call(self, method, **params):
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(self.timeout)
             s.connect(self.path)
         except OSError as e:
             die(f"herdr is not reachable at {self.path}: {e}",
-                "the session SIANA runs in lives in herdr; start it first")
+                "the session SIANA runs in lives in herdr; start it first",
+                kind=Unreachable)
         with s:
-            s.sendall((json.dumps({"id": "siana-watch", "method": method,
-                                   "params": params}) + "\n").encode())
-            buf = b""
-            while not buf.endswith(b"\n"):
-                chunk = s.recv(65536)
-                if not chunk:
-                    die(f"herdr closed the connection during {method}")
-                buf += chunk
+            try:
+                s.sendall((json.dumps({"id": "siana-watch", "method": method,
+                                       "params": params}) + "\n").encode())
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        die(f"herdr closed the connection during {method}",
+                            kind=Unreachable)
+                    buf += chunk
+            except OSError as e:
+                die(f"herdr stopped answering during {method}: {e}",
+                    "it accepted the connection and then said nothing, so nothing",
+                    "here knows anything about SIANA's pane",
+                    kind=Unreachable)
         reply = json.loads(buf)
         if "error" in reply:
             err = reply["error"]
@@ -122,15 +154,31 @@ def read_session(home):
     return pane
 
 
-def confirm_alive(h, pane, home):
-    """That pane still holds SIANA, not a shell or somebody else's agent."""
+def pane_agent(h, pane):
+    """What herdr says is in that pane, or None when it answers that nothing is.
+
+    None is herdr's answer and not its silence: an unreachable herdr knows nothing
+    about this pane and is left to propagate, because a caller cannot tell a pane
+    apart from any other pane on a fact it never received."""
     try:
-        agent = h.call("agent.get", target=pane)["agent"]
+        return h.call("agent.get", target=pane)["agent"]
+    except Unreachable:
+        raise                 # herdr said nothing, so say nothing about the pane.
     except Refusal:
-        agent = {}
-    if agent.get("agent") == "pi":
+        return None
+
+
+def confirm_alive(h, pane, home):
+    """That pane still holds SIANA, not a shell or somebody else's agent.
+
+    This is the check at startup, where an undetected agent is refused outright:
+    the captain is at the keyboard and a rerun costs them a second. Once the loop
+    is running the same answer is held instead, because by then nobody is watching
+    for the refusal and stopping is the fleet quietly halting."""
+    agent = pane_agent(h, pane)
+    if agent and agent.get("agent") == "pi":
         return agent
-    seen = agent.get("agent") or "no agent"
+    seen = (agent or {}).get("agent") or "no agent"
     die(f"pane {pane} is not running SIANA: herdr sees {seen}",
         "if SIANA is starting, herdr has not detected it yet: wait and rerun",
         "otherwise that session has exited, and restarting SIANA rewrites",
@@ -152,20 +200,32 @@ def reports(path, offset):
         return ["the queue was rewritten"], size
     if size == offset:
         return [], offset
-    with open(path) as f:
+    with open(path, "rb") as f:
         f.seek(offset)
         block = f.read()
-        offset = f.tell()
+    # Bytes, and only through the last newline. An append larger than the writer's
+    # buffer reaches disk in more than one write, so the tail of a read is routinely
+    # half a record; consuming it would drop that report for good and split a
+    # multi-byte character across two decodes. Whole lines only, and the remainder
+    # stays unread until the rest of it lands.
+    end = block.rfind(b"\n") + 1
+    if not end:
+        return [], offset
+    offset += end
     found = []
-    for line in block.splitlines():
+    for line in block[:end].splitlines():
         if not line.strip():
             continue
         try:
             rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue          # A partial line mid-append; its offset is not consumed.
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A whole line that will not parse is not a partial write, so it is
+            # never coming back. Said out loud, because the report it may have
+            # carried is exactly what this process exists to deliver.
+            print(f"skipped  unreadable record in {path}", file=sys.stderr, flush=True)
+            continue
         if rec.get("status") in TERMINAL:
-            found.append(f"{rec['id']} {rec['status']}")
+            found.append(f"{rec.get('id')} {rec['status']}")
     return found, offset
 
 
@@ -194,12 +254,42 @@ def main():
     # accumulating and leave together, because SIANA reads the whole queue and a poke
     # per report would only spend turns saying the same thing.
     pending, waiting_since, warned = [], None, False
+    undetected_since = None
     while True:
         # Liveness every tick, not only when there is something to deliver. This
         # process is the captain's autonomy grant, so it must never keep running
         # after the session it grants for is gone: a watcher that looks alive while
         # it can wake nobody is the fleet quietly stopping and no one being told.
-        status = confirm_alive(h, pane, home).get("agent_status")
+        #
+        # But "herdr sees no agent there" is routinely a detection gap and not a
+        # dead session, so it is held for DETECT_GRACE_S rather than acted on. While
+        # it is held no poke goes out: a pane this cannot identify is precisely the
+        # pane a poke must not be typed into, and a report waiting costs timeliness
+        # where a poke into a stranger's session costs the stranger.
+        agent = pane_agent(h, pane)
+        if agent is None:
+            if undetected_since is None:
+                undetected_since = time.time()
+                print(f"unsure   herdr sees no agent in {pane}; every poke is held",
+                      file=sys.stderr, flush=True)
+            if time.time() - undetected_since > DETECT_GRACE_S:
+                die(f"pane {pane} has had no detected agent for {DETECT_GRACE_S:.0f}s",
+                    "a herdr that restarted re-detects well inside that, so this is a",
+                    "session that has exited rather than one not yet recognised;",
+                    f"restarting SIANA rewrites {home}/session with its new pane")
+            status = None
+        elif agent.get("agent") != "pi":
+            # Not a gap. Something else holds that pane now, so every poke from here
+            # would be typed into somebody else's session. No window makes that safer.
+            die(f"pane {pane} is not running SIANA: herdr sees {agent.get('agent')}",
+                "that session has exited and its pane was taken over; restarting",
+                f"SIANA rewrites {home}/session with the pane it lands in")
+        else:
+            if undetected_since is not None:
+                undetected_since = None
+                print(f"detected herdr sees SIANA at {pane} again; pokes resume",
+                      flush=True)
+            status = agent.get("agent_status")
         found, offset = reports(tasks_file, offset)
         if found:
             print(f"report   {', '.join(found)}", flush=True)
@@ -213,7 +303,7 @@ def main():
                 h.call("agent.prompt", target=pane, text="The queue moved. Reconcile it.")
                 print(f"poked    {len(pending)} report(s)", flush=True)
                 pending, waiting_since, warned = [], None, False
-            else:
+            elif status is not None:
                 waiting_since = waiting_since or time.time()
                 if not warned and time.time() - waiting_since > SETTLE_WARN_S:
                     warned = True

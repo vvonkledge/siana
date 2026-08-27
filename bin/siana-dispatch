@@ -72,8 +72,14 @@ class Refusal(SystemExit):
         return self.message
 
 
-def die(message: str, *hints: str):
-    raise Refusal(message, hints)
+class Unreachable(Refusal):
+    """herdr never answered. It is one fact about herdr and says nothing about any
+    pane, workspace or minion, so a caller asking after one must not read it as an
+    answer about that one: a live fleet reported dead is worse than an unread one."""
+
+
+def die(message: str, *hints: str, kind=Refusal):
+    raise kind(message, hints)
 
 
 def report(r: "Refusal") -> None:
@@ -96,15 +102,19 @@ class Herdr:
             try:
                 sock.connect(self.path)
             except OSError as e:
-                die(f"cannot reach herdr at {self.path}: {e}")
-            sock.sendall((json.dumps(
-                {"id": f"req_{self.seq}", "method": method, "params": params}) + "\n").encode())
-            buf = b""
-            while b"\n" not in buf:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    die(f"herdr {method}: connection closed without a response")
-                buf += chunk
+                die(f"cannot reach herdr at {self.path}: {e}", kind=Unreachable)
+            try:
+                sock.sendall((json.dumps(
+                    {"id": f"req_{self.seq}", "method": method, "params": params}) + "\n").encode())
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        die(f"herdr {method}: connection closed without a response",
+                            kind=Unreachable)
+                    buf += chunk
+            except OSError as e:
+                die(f"herdr {method}: {e}", kind=Unreachable)
         msg = json.loads(buf.split(b"\n", 1)[0])
         if "error" in msg:
             die(f"herdr {method}: {msg['error'].get('code')}: {msg['error'].get('message')}")
@@ -281,7 +291,7 @@ def check_owners(tasks_file: str) -> int:
         print("            these are alive rather than implying they are")
         return 1
 
-    failed = 0
+    failed = gone = 0
     for t in doing:
         tid, owner = t.get("id"), t.get("owner") or ""
         kind, _, pane = owner.partition("@")
@@ -292,6 +302,12 @@ def check_owners(tasks_file: str) -> int:
             continue
         try:
             agent = h.call("agent.get", target=pane)["agent"]
+        except Unreachable as r:
+            print(f"  unknown {tid} and every task after it, unchecked: {r.message}")
+            print("            herdr stopped answering partway through, which is a fact")
+            print("            about herdr and about none of these minions; rerun once")
+            print("            it answers again rather than reading silence as death")
+            return 1
         except Refusal:
             print(f"  GONE    {tid}: herdr has no agent in {pane}")
         else:
@@ -303,6 +319,12 @@ def check_owners(tasks_file: str) -> int:
         print(f"            look at its worktree before `tasks reset {tid}`; a refusal")
         print("            to discard unlanded work is a finding, not an obstacle")
         failed += 1
+        gone += 1
+    if gone:
+        # Detection is by label, and a herdr that has just restarted has not put the
+        # labels back yet. So GONE is a reading of this moment, not a verdict.
+        print("  note    a herdr that restarted recently reads as GONE everywhere until")
+        print("          it has re-detected its agents; rerun before acting on this")
     return 1 if failed else 0
 
 
