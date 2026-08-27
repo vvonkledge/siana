@@ -450,7 +450,10 @@ def main() -> None:
             if "already exists" in str(e):
                 die(f"a worktree for {branch} already exists",
                     "a previous minion on this task was never cleaned up",
-                    "that worktree may hold unlanded work; look before removing it")
+                    "that worktree may hold unlanded work; look before removing it",
+                    "if the work is committed, the branch keeps it: removing only the",
+                    "worktree and dispatching again puts a new minion on those commits,",
+                    "because a worktree is cut from an existing branch at its own head")
             raise
         workspace_id = ws["workspace"]["workspace_id"]
         work_cwd = ws["worktree"]["path"]

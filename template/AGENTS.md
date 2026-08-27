@@ -345,6 +345,15 @@ A project recorded with `worktree` false is one git cannot branch. Its
 minions get no isolation, so never put a second minion on such a project while one
 is working.
 
+**A task that came back `blocked` can be given to a new minion.** Its branch still
+holds whatever the last one committed, and a worktree cut from an existing branch
+starts at that branch's own head, so the work is in front of the new minion rather
+than lost. The sequence is `reset <id>`, remove the stale worktree, then dispatch as
+normal. Dispatch refuses while that worktree is still there, and it is right to:
+that is the one place uncommitted work could be sitting, so look before removing it.
+If the minion that blocked is still alive, telling it is cheaper than replacing it,
+and it keeps everything it already knows.
+
 The minion's `owner` is `<kind>@<pane-id>`, for example `claude@w31:p1`. That pane
 id is the only durable handle back to a running minion: Herdr's labels are not
 unique, its workspace numbers shift when others close, and its pane metadata is
