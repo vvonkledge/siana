@@ -322,8 +322,10 @@ def check_owners(tasks_file: str) -> int:
         failed += 1
         gone += 1
     if gone:
-        # Detection is by label, and a herdr that has just restarted has not put the
-        # labels back yet. So GONE is a reading of this moment, not a verdict.
+        # A herdr whose server restarted has lost its pane metadata and re-detects
+        # each agent from the pane itself, so until that finishes it truthfully
+        # reports no agent in a pane a live minion is working in. GONE is a reading
+        # of this moment, not a verdict.
         print("  note    a herdr that restarted recently reads as GONE everywhere until")
         print("          it has re-detected its agents; rerun before acting on this")
     return 1 if failed or unchecked else 0
