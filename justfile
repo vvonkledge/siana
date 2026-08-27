@@ -49,15 +49,19 @@ init: _contract-drift
         fi
     done
 
-    # The captain's project registry, a datafile store like the queue. The contract
-    # is what says the registry exists: projects.jsonl itself is written by the first
-    # `datafile put`, so an empty registry is a schema and no log.
-    if [ -f "$home/schema-projects.yaml" ]; then
-        echo "current  $home/schema-projects.yaml"
-    else
-        cp "$distro/template/schema-projects.yaml" "$home/schema-projects.yaml"
-        echo "wrote    $home/schema-projects.yaml"
-    fi
+    # The captain's project registry and SIANA's obligations: datafile stores like
+    # the queue. The contract is what says each store exists, because the `.jsonl`
+    # itself is written by the first `datafile put`, so an empty store is a schema
+    # and no log. Never overwritten, for the reason the queue's contract is not: a
+    # field dropped from a live contract makes every record carrying it unreadable.
+    for c in schema-projects schema-obligations; do
+        if [ -f "$home/$c.yaml" ]; then
+            echo "current  $home/$c.yaml"
+        else
+            cp "$distro/template/$c.yaml" "$home/$c.yaml"
+            echo "wrote    $home/$c.yaml"
+        fi
+    done
 
     # The registry used to be a hand-edited projects.yaml. Say so rather than leave
     # a file that still looks authoritative but is read by nothing.
@@ -91,7 +95,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -162,7 +166,7 @@ upgrade: _initialized init
     # project-contract drift announces itself, because `datafile` names the field it
     # rejected and `siana` refuses to start on a registry it cannot read.
     echo "kept     $home/projects.jsonl (the captain's registry)"
-    for c in schema-projects schema-tasks; do
+    for c in schema-projects schema-obligations schema-tasks; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
     done
 
@@ -204,7 +208,7 @@ doctor: _contract-drift
     set -uo pipefail
     home='{{home}}'
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md brief-ship.md brief-scout.md schema-projects.yaml schema-tasks.yaml .pi/settings.json; do
+    for f in siana.env AGENTS.md orders.md brief-ship.md brief-scout.md schema-projects.yaml schema-obligations.yaml schema-tasks.yaml .pi/settings.json; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -215,6 +219,9 @@ doctor: _contract-drift
     if [ -e "$home/projects.jsonl" ]; then echo "  ok      projects.jsonl"
     elif [ -e "$home/schema-projects.yaml" ]; then echo "  ok      projects.jsonl (empty; written on the first project)"
     else echo "  missing projects.jsonl"; fi
+    if [ -e "$home/obligations.jsonl" ]; then echo "  ok      obligations.jsonl"
+    elif [ -e "$home/schema-obligations.yaml" ]; then echo "  ok      obligations.jsonl (empty; written on the first promise)"
+    else echo "  missing obligations.jsonl"; fi
     for cmd in pi tasks datafile; do
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
@@ -239,13 +246,15 @@ doctor: _contract-drift
     echo
     SIANA_HOME="$home" "$PWD/bin/siana-dispatch" --check || true
     echo
+    SIANA_HOME="$home" "$PWD/bin/siana-owe" || true
+    echo
     [ -d "$home" ] && (cd "$home" && tasks)
 
 # Remove the installed commands. SIANA's home and its queue are left alone.
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

@@ -31,7 +31,12 @@ cd "$home"
 #
 # A registry that cannot be read is a stop, not an empty registry. Injecting an
 # error message here would leave SIANA believing the captain has no projects.
-prompt=()
+#
+# Both blocks build one string rather than passing the flag twice. claude's
+# --append-system-prompt-file keeps only the last of two and silently drops the
+# first (see siana-dispatch), and a fleet that assumed otherwise would start SIANA
+# with half the context it believes it has. One flag cannot have that bug.
+context=""
 if [ -f "$home/schema-projects.yaml" ]; then
     if ! registry="$(datafile -f "$home/projects.jsonl" \
             list --fields handle,path,ship,orders,worktree 2>&1)"; then
@@ -39,9 +44,39 @@ if [ -f "$home/schema-projects.yaml" ]; then
         echo "$registry" >&2
         exit 1
     fi
-    prompt=(--append-system-prompt "# The captain's projects ($home/projects.jsonl)
-$registry")
+    context="# The captain's projects ($home/projects.jsonl)
+$registry"
 fi
+
+# What SIANA owes the captain and has not yet paid. Injected for the same reason the
+# registry is: an obligation SIANA has to remember to go and look for is an
+# obligation kept in memory, which is the whole thing this store replaces. A promise
+# survives the session that made it only if the next session is told about it.
+#
+# Nothing owed is injected too, and is not skipped as an empty section: "owed
+# nothing" is a fact SIANA needs, and its absence would read as never having asked.
+#
+# Unreadable is a stop, exactly as it is for the registry. Injecting the error text
+# instead would leave SIANA believing it owes the captain nothing, which is the one
+# wrong answer this store must never give.
+if [ -f "$home/schema-obligations.yaml" ]; then
+    if ! owed="$(siana-owe 2>&1)"; then
+        echo "the obligations at $home/obligations.jsonl are not readable" >&2
+        echo "$owed" >&2
+        exit 1
+    fi
+    context="${context:+$context
+
+}# What SIANA owes ($home/obligations.jsonl)
+$owed
+
+Record a new one with \`siana-owe promise|decision <text>\`, and retire it with
+\`siana-owe close <id> --answer <text>\` when a durable event answers it. Never
+close one from recollection, and never carry one in this conversation instead."
+fi
+
+prompt=()
+[ -n "$context" ] && prompt=(--append-system-prompt "$context")
 
 # One SIANA leads the fleet, and this file is what says which. A second would
 # dispatch against the same queue while both believed they were the only one, so

@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Record what SIANA owes the captain, and retire it only when something answers it.
+
+A promise made mid-conversation and a decision waiting on the captain both die with
+the session holding them. The queue holds work, and an obligation is not work, so
+until now they lived in chat memory - which is the one place the fleet has promised
+never to keep anything that matters.
+
+This is mechanics, not judgment. SIANA decides what it owes and what answered it.
+This only makes those two facts durable, and refuses the three ways they go wrong:
+
+  - the clock is stamped here, never typed by an agent guessing what time it is
+  - closing rereads the stored record, so `body` is never retyped from memory and
+    a slip cannot silently rewrite the promise it was meant to retire
+  - closing without naming what answered it is refused, because an obligation
+    retired by recollection is exactly what this store exists to replace
+
+Reads fold the log directly; every write goes through `datafile`, so what lands has
+already passed the contract.
+
+Usage:
+    siana-owe                                  what is still open
+    siana-owe promise <text> [--task <id>]     something SIANA owes the captain
+    siana-owe decision <text> [--task <id>]    something only the captain can answer
+    siana-owe close <id> --answer <text>       retire one, naming what answered it
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import UTC, datetime
+
+# Long enough to read as a sentence fragment, short enough that the open view stays
+# one line per obligation. Matches the id budget the queue uses, so the two stores
+# never disagree about what a task id looks like.
+SLUG_BUDGET = 24
+SLUG_STOP = {"a", "an", "the", "to", "of", "for", "and", "or", "in", "on", "is"}
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching siana-dispatch."""
+
+    def __init__(self, message: str, hints=()):
+        self.message, self.hints = message, tuple(hints)
+        super().__init__(1)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def die(message: str, *hints: str):
+    raise Refusal(message, hints)
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def age(stamp: str) -> str:
+    """How long this has been owed. A number of days is the only part of an
+    obligation's history the open view has room for, and the part that matters:
+    an old promise is a promise the captain has stopped expecting."""
+    try:
+        dt = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return "?"
+    if dt.tzinfo is None:                      # hand-edited row: assume UTC
+        dt = dt.replace(tzinfo=UTC)
+    secs = (datetime.now(UTC) - dt).total_seconds()
+    if secs < 3600:
+        return f"{max(0, int(secs // 60))}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+def fold(store: str, key: str):
+    """Fold an append-only datafile store into {key: record}.
+
+    The same read siana-dispatch does, for the same reason: the log is append-only,
+    so the last line for an id wins, and a tombstone is a last line like any other.
+    A store with no writes yet has no file at all, which is empty rather than a
+    fault - the contract is what says the store exists."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                die(f"{store} has a line that is not JSON",
+                    "run `datafile -f obligations.jsonl repair` to quarantine it")
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def slug(body: str, taken) -> str:
+    """Ids are derived from the body, never invented by the caller, so an id is
+    self-describing everywhere it appears later - including in the one line of the
+    open view that has no room to repeat the body."""
+    words = [w for w in re.split(r"[^a-z0-9]+", body.lower()) if w]
+    s = ""
+    for w in words:                            # whole words up to the budget
+        if s and len(s) + 1 + len(w) > SLUG_BUDGET:
+            break
+        s = f"{s}-{w}" if s else w
+    parts = s.split("-")
+    while len(parts) > 1 and parts[-1] in SLUG_STOP:   # never end on a stopword
+        parts.pop()
+    s = "-".join(parts)
+    if not s or not s[0].isalpha():
+        s = "owe-" + s if s else "owed"
+    s = s[:48]
+    while len(s) < 3:
+        s += "-x"
+    if s not in taken:
+        return s
+    for n in range(2, 1000):
+        cand = f"{s[:48 - len(str(n)) - 1]}-{n}"
+        if cand not in taken:
+            return cand
+    die(f"cannot derive a free id from {body!r}")
+
+
+def write(store: str, schema: str, record: dict) -> None:
+    """Every write goes through `datafile` so the contract is enforced by the same
+    code that enforces it for the queue and the registry. Writing the JSONL line
+    here would be a second writer, and a second writer is a second set of rules."""
+    try:
+        proc = subprocess.run(
+            ["datafile", "-f", store, "-c", schema, "put", json.dumps(record)],
+            capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die("datafile is not on PATH",
+            "it is what enforces this store's contract; without it nothing is written",
+            "run `just init` in the distro")
+    if proc.returncode != 0:
+        die("the store refused this record",
+            *(proc.stdout + proc.stderr).strip().splitlines()[:6])
+
+
+def view(items) -> None:
+    """The open view, in the shape siana-dispatch reports in: aligned plain text,
+    outcomes first. Nothing owed is the ordinary state and never a fault, so it
+    reads as a zero rather than as a warning."""
+    if not items:
+        print("owed     nothing")
+        return
+    print(f"owed     {len(items)}")
+    wid = max(len(i["id"]) for i in items)
+    for rec in items:
+        task = f"  ({rec['task']})" if rec.get("task") else ""
+        print(f"  {rec['kind']:<8} {rec['id']:<{wid}}  {age(rec.get('opened', '')):>3}"
+              f"  {rec['body']}{task}")
+
+
+def open_items(store: str):
+    """Oldest first: the longest-owed obligation is the one most likely to have been
+    forgotten, so it is the one the captain should read first."""
+    items = [r for r in fold(store, "id").values() if r.get("status") == "open"]
+    return sorted(items, key=lambda r: str(r.get("opened", "")))
+
+
+def main() -> None:
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    store = os.path.join(home, "obligations.jsonl")
+    schema = os.path.join(home, "schema-obligations.yaml")
+
+    ap = argparse.ArgumentParser(
+        prog="siana-owe", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter, add_help=True)
+    sub = ap.add_subparsers(dest="cmd")
+    for kind in ("promise", "decision"):
+        p = sub.add_parser(kind)
+        p.add_argument("body")
+        p.add_argument("--task", help="the queue task this is about, if it is about one")
+    c = sub.add_parser("close")
+    c.add_argument("id")
+    c.add_argument("--answer", help="the durable event that answered this")
+    args = ap.parse_args()
+
+    # The contract is what says the store exists, because a store with no
+    # obligations yet has no `.jsonl` file at all. Missing it is a stop: recording
+    # an obligation nowhere is worse than refusing to record it.
+    if not os.path.isfile(schema):
+        die(f"no obligations contract at {schema}",
+            "it is what makes a promise outlive the session that made it",
+            "run `just init` in the distro")
+
+    if args.cmd is None:
+        view(open_items(store))
+        return
+
+    if args.cmd == "close":
+        records = fold(store, "id")
+        rec = records.get(args.id)
+        if rec is None:
+            known = ", ".join(r["id"] for r in open_items(store)) or "(nothing is owed)"
+            die(f"nothing owed under that id: {args.id}",
+                f"open: {known}")
+        if rec.get("status") == "closed":
+            die(f"{args.id} was already answered by: {rec.get('answer', '(unrecorded)')}",
+                "an obligation is retired once, by the event that answered it;",
+                "closing it twice would hide which event actually did")
+        if not args.answer:
+            die(f"what answered {args.id}?",
+                "usage: siana-owe close <id> --answer <text>",
+                "an obligation closed without naming what answered it is closed by",
+                "recollection, which is the thing this store replaces")
+        # Reread and rewrite the whole record rather than restate it: `put` takes a
+        # whole record, and every field SIANA retyped here would be a field it could
+        # get wrong. `body` in particular must survive closing untouched.
+        rec = dict(rec)
+        rec.update(status="closed", closed=now(), answer=args.answer)
+        write(store, schema, rec)
+        print(f"answered {args.id}")
+        print(f"  by     {args.answer}")
+        return
+
+    body = args.body.strip()
+    if not body:
+        die("an obligation needs a body", "what is it that is owed?")
+    rid = slug(body, fold(store, "id"))
+    rec = {"id": rid, "kind": args.cmd, "body": body, "status": "open", "opened": now()}
+    if args.task:
+        rec["task"] = args.task
+    write(store, schema, rec)
+    print(f"owed     {rid} ({args.cmd})")
+    print(f"  close  siana-owe close {rid} --answer <what answered it>")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Refusal as r:
+        print(f"error: {r.message}", file=sys.stderr)
+        for h in r.hints:
+            print(f"  {h}", file=sys.stderr)
+        raise
+    except KeyboardInterrupt:
+        sys.exit(130)
