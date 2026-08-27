@@ -257,7 +257,7 @@ def main():
     # accumulating and leave together, because SIANA reads the whole queue and a poke
     # per report would only spend turns saying the same thing.
     pending, waiting_since, warned = [], None, False
-    undetected_since, poke_failed = None, False
+    undetected_since, poke_held_since = None, None
     while True:
         # Liveness every tick, not only when there is something to deliver. This
         # process is the captain's autonomy grant, so it must never keep running
@@ -323,16 +323,22 @@ def main():
                     h.call("agent.prompt", target=pane,
                            text="The queue moved. Reconcile it.")
                 except Refusal as r:
-                    if not poke_failed:
-                        poke_failed = True
+                    # Said again on the settle cadence for as long as it keeps
+                    # failing. A herdr that answers `agent.get` and refuses
+                    # `agent.prompt` passes the liveness check every tick, so
+                    # nothing else here would ever mention it, and reports piling
+                    # up behind a silent process is the one state this must not be.
+                    if (poke_held_since is None
+                            or time.time() - poke_held_since > SETTLE_WARN_S):
+                        poke_held_since = time.time()
                         print(f"held     herdr took no poke: {str(r).splitlines()[0]}; "
                               f"{len(pending)} report(s) held",
                               file=sys.stderr, flush=True)
                 else:
-                    poke_failed = False
+                    poke_held_since = None
                     print(f"poked    {len(pending)} report(s)", flush=True)
                     pending, waiting_since, warned = [], None, False
-            elif status is not None:
+            elif unsure is None:
                 waiting_since = waiting_since or time.time()
                 if not warned and time.time() - waiting_since > SETTLE_WARN_S:
                     warned = True
