@@ -17,6 +17,15 @@
 #   --scout  the work reports. The minion writes $SIANA_HOME/reports/<task-id>.md and
 #            lands nothing; its worktree is scratch.
 #
+# A ship task in a project whose registry record carries a `qa` command is paired
+# here with a QA task of its own: it depends on the ship task, so the queue makes
+# it ready the moment that work comes back, and its `base` is `siana/<task-id>`,
+# so its minion is put on the branch it was queued to judge. The pairing happens
+# here because this is the only place a task's delivery kind is ever stated, and a
+# QA task nobody remembered to queue is exactly the false-green that registry
+# field was set to prevent. Skipping QA for one task is `tasks drop <qa-id>`,
+# which is a decision the queue records.
+#
 # The kind is never defaulted. Ship work and scout work are not allowed to blur into
 # each other on their own, and a default is how they would.
 #
@@ -34,6 +43,65 @@ die() {
     shift
     for hint in "$@"; do echo "  $hint" >&2; done
     exit 1
+}
+
+# The project's QA command, read from the registry itself rather than parsed out of
+# `tasks show`. A command carrying a quote or a colon comes back from TOON escaped,
+# and a QA task whose verify was mangled on the way in is a check that fails for a
+# reason nobody wrote. The log is folded the way every other reader folds it: the
+# last write for a handle wins, and a tombstone is an absence.
+#
+# It prints `none`, or `qa` followed by the project's path and its command.
+registry_qa() {
+    python3 - "$home/projects.jsonl" "$1" <<'PYEOF'
+import json, os, sys
+
+store, handle = sys.argv[1], sys.argv[2]
+projects = {}
+if os.path.isfile(store):
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                sys.exit(f"error: {store} holds a line that is not a record")
+            seen = rec.get("handle")
+            if seen is None:
+                continue
+            if rec.get("_deleted"):
+                projects.pop(seen, None)
+            else:
+                projects[seen] = rec
+
+if handle not in projects:
+    sys.exit(f"error: unknown project: {handle}\n"
+             "  the task names it and the registry does not have it, so dispatch\n"
+             "  will refuse this task for the same reason")
+qa = projects[handle].get("qa")
+if not qa:
+    print("none")
+    raise SystemExit(0)
+if not projects[handle].get("worktree", True):
+    sys.exit(f"error: {handle} asks for QA, and git cannot branch it\n"
+             "  a QA minion judges the ship task's branch from a worktree of its\n"
+             "  own, and this project is recorded as having neither\n"
+             "  either make it a git repository, or clear `qa` on it and accept that\n"
+             "  ship work there lands on the word of the minion that did it")
+
+path = projects[handle]["path"]
+# Both travel back a line at a time, so a newline in either would silently cut one
+# of them in half and leave a QA task verifying something nobody wrote.
+for name, value in (("path", path), ("qa command", qa)):
+    if "\n" in value:
+        sys.exit(f"error: the {name} for {handle} spans more than one line\n"
+                 "  it has to survive as one line to reach the QA task intact")
+print("qa")
+print(path)
+print(qa)
+PYEOF
 }
 
 id=""
@@ -78,6 +146,30 @@ fi
     "a brief is rewritten by editing it, never by scaffolding over it:" \
     "a minion may already have read this one"
 
+# Resolved before anything is written. A registry that cannot answer has to stop
+# the whole scaffolding, rather than leave a briefed ship task standing in a project
+# whose captain asked for QA behind every one of them.
+handle=""; qa_path=""; qa_cmd=""
+if [ "$kind" = ship ]; then
+    # The handle is the one field safe to read out of TOON: its contract is a
+    # pattern with no character TOON would quote or escape.
+    handle="$(printf '%s\n' "$show" | sed -n 's/^  project: //p')"
+    if [ -z "$handle" ] || [ "$handle" = null ]; then
+        echo "warning: $id names no project, so nothing here can say whether it needs" >&2
+        echo "         QA; dispatch refuses it until it has one either way" >&2
+    else
+        info="$(registry_qa "$handle")" || exit 1
+        if [ "$(printf '%s\n' "$info" | sed -n 1p)" = qa ]; then
+            qa_path="$(printf '%s\n' "$info" | sed -n 2p)"
+            qa_cmd="$(printf '%s\n' "$info" | sed -n 3p)"
+            [ -f "$home/brief-qa.md" ] || die "no qa brief template at $home/brief-qa.md" \
+                "$handle asks for QA behind every ship task, and a QA minion with no" \
+                "contract would judge the work by its own lights instead of its brief" \
+                "run \`just init\` in the distro to lay one down"
+        fi
+    fi
+fi
+
 mkdir -p "$home/briefs"
 cp "$template" "$brief"
 
@@ -90,6 +182,36 @@ echo "briefed  $brief ($kind)"
 # under `pipefail` its exit 1 would kill this script after the brief was copied.
 placeholders="$({ grep -o '{[A-Z_]\+}' "$brief" || true; } | sort -u | tr '\n' ' ')"
 [ -n "$placeholders" ] && echo "  fill   $placeholders"
+
+# The QA task exists from the moment the ship task is briefed, and waits on it. The
+# dependency is the whole trigger: the queue makes it ready when the work comes
+# back, so nothing has to notice that a minion finished.
+#
+# Its verify is the project's QA command and the report together, so a QA `done` is
+# evidence that the work was exercised here and that the finding survived the
+# minion that found it. `--base` is how dispatch puts that minion on the branch it
+# is judging rather than on a tree that never held the work.
+if [ -n "$qa_cmd" ]; then
+    verify='test -s "$SIANA_HOME/reports/$SIANA_TASK_ID.md" && '"$qa_cmd"
+    if ! added="$(tasks --file "$tasks_file" add "QA $id" --project "$handle" \
+            --cwd "$qa_path" --verify "$verify" --dep "$id" \
+            --base "siana/$id" 2>&1)"; then
+        die "$id is briefed, but the QA task behind it was not created" \
+            "$(printf '%s' "$added" | head -1)" \
+            "queue it by hand before dispatching $id, or dispatch knowing this" \
+            "work will come back with nobody independent having looked at it"
+    fi
+    qa_id="$(printf '%s\n' "$added" | sed -n 's/^id: //p' | head -1)"
+    [ -n "$qa_id" ] || die "the queue did not name the QA task it created for $id" \
+        "run \`tasks --file $tasks_file list\` and finish the pairing by hand"
+    # Nothing in a QA brief is SIANA's to fill: what the work was asked to do is
+    # the ship task's own brief, and what to run is the project's QA command. That
+    # is what makes QA cost nothing per task and therefore get used.
+    sed -e "s|{SHIP_TASK}|$id|g" -e "s|{SHIP_BRANCH}|siana/$id|g" \
+        "$home/brief-qa.md" > "$home/briefs/$qa_id.md"
+    echo "paired   $home/briefs/$qa_id.md (qa $qa_id, waiting on $id)"
+    echo "  runs   $qa_cmd"
+fi
 
 # A brief that arrives after dispatch is late, not wrong: the minion has already
 # blocked on the missing one and can be pointed at this. Say so rather than refuse.

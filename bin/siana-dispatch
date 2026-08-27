@@ -17,8 +17,16 @@ Per-project configuration lives in the `$SIANA_HOME/projects.jsonl` store:
     path:     where minions run and where verification happens   (required)
     ship:     the project's delivery rigor; SIANA types it into `tasks add
               --verify`. Read by SIANA, not enforced here.
+    qa:       independent validation of ship work; `siana-brief` types it into
+              the paired QA task's `--verify`. Read there, not here.
     orders:   extra standing orders for this project, relative to `path`
     worktree: false only for a project that is not a git repository
+
+A minion's worktree branches from whatever the project is checked out to, unless
+the task carries a `base`. That is how a QA task is put on the branch it was
+queued to judge, rather than on a tree that never held the work. `siana-brief`
+writes it onto a QA task, and SIANA writes it onto follow-up work that has to
+start from an existing branch rather than from the project's default one.
 
 Shape and types are the store contract's job, enforced when a record is written.
 What is left here is the part a contract cannot check: that the directory and the
@@ -194,8 +202,8 @@ def resolve(projects: dict, handle: str, store: str):
     # `worktree` carries a default of true in the contract, so it is materialised on
     # write. A record predating the field is still read as isolated, which is the
     # safe direction: isolation withheld is a data-loss risk, isolation added is not.
-    return {"path": path, "orders": orders,
-            "worktree": cfg.get("worktree", True), "ship": cfg.get("ship")}
+    return {"path": path, "orders": orders, "worktree": cfg.get("worktree", True),
+            "ship": cfg.get("ship"), "qa": cfg.get("qa")}
 
 
 def assemble_orders(home: str, task_id: str, base: str, project_orders, handle: str) -> str:
@@ -247,6 +255,8 @@ def check_registry(registry: str, schema: str) -> int:
         notes = []
         if cfg["ship"]:
             notes.append(f"ship: {cfg['ship']}")
+        if cfg["qa"]:
+            notes.append(f"qa: {cfg['qa']}")
         if cfg["orders"]:
             notes.append(f"orders: {os.path.relpath(cfg['orders'], cfg['path'])}")
         if not cfg["worktree"]:
@@ -387,6 +397,14 @@ def main() -> None:
             f"set it with `tasks --file {tasks_file} add ... --project <handle>`")
 
     project = resolve(load_registry(registry, registry_schema), handle, registry)
+    # The ref this minion's tree is cut from. A task written before the contract
+    # carried the field reads as None, which is the same as the default it always
+    # had: the project's own checkout.
+    base = task.get("base")
+    if base and not project["worktree"]:
+        die(f"{args.task_id} names base {base}, but {handle} has worktree isolation off",
+            "there is no branch to make, so the minion would work in the project",
+            "tree at whatever it is checked out to and never see that base at all")
     cwd = project["path"]
     orders = assemble_orders(home, args.task_id, base_orders, project["orders"], handle)
 
@@ -413,7 +431,8 @@ def main() -> None:
     else:
         branch = f"siana/{args.task_id}"
         try:
-            ws = h.call("worktree.create", cwd=cwd, branch=branch, label=label, focus=False)
+            ws = h.call("worktree.create", cwd=cwd, branch=branch, base=base,
+                        label=label, focus=False)
         except Refusal as e:
             if "not_git_worktree" in str(e):
                 die(f"{handle} is at {cwd}, which is not a git repository",
@@ -422,6 +441,12 @@ def main() -> None:
                     "which also means only one minion at a time there:",
                     f"  datafile -f {registry} get {handle}   # then put it back",
                     "  ... --set worktree=false")
+            if base and "invalid reference" in str(e):
+                die(f"{args.task_id} branches from {base}, which this repository does not have",
+                    "the work it was queued to judge is not there under that name;",
+                    "the branch may have been landed and deleted, or never made at all",
+                    "look before deciding: a task judging a branch nobody can find is",
+                    "a green nobody should trust")
             if "already exists" in str(e):
                 die(f"a worktree for {branch} already exists",
                     "a previous minion on this task was never cleaned up",
@@ -519,7 +544,7 @@ def main() -> None:
     print(json.dumps({"task_id": args.task_id, "owner": owner, "project": handle,
                       "workspace_id": workspace_id, "pane_id": pane_id,
                       "kind": args.kind, "project_path": cwd, "cwd": work_cwd,
-                      "branch": branch, "orders": orders}, indent=2))
+                      "branch": branch, "base": base, "orders": orders}, indent=2))
 
 
 if __name__ == "__main__":
