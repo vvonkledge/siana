@@ -71,7 +71,7 @@ made, decisions pending, and the captain's preferences live in durable records, 
 chat memory.
 
 The fleet reconciles from disk and from live session state, so killing any session,
-including the first mate's own, loses nothing and surprises no one.
+including the soulmate's own, loses nothing and surprises no one.
 
 Obligations are closed by records, not by recollection: a promised reply, an open decision,
 or a queued wake is retired only by the durable event that answers it.
@@ -100,7 +100,7 @@ Harness adapters earn trust through verification, and the fleet keeps sailing wh
 vendor's tool degrades. Contracts bind to semantics a vendor actually exposes, never to the
 pixels of today's UI.
 
-Quota, model, and effort choices stay inspectable and captain-owned; the first mate never
+Quota, model, and effort choices stay inspectable and captain-owned; the soulmate never
 downgrades the intelligence doing the work without the captain's standing, explicit
 permission.
 
