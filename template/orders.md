@@ -71,9 +71,13 @@ End by calling exactly one of these, and nothing else:
     tasks --file "$SIANA_TASKS_FILE" done "$SIANA_TASK_ID" --reason "<what you found>"
     tasks --file "$SIANA_TASKS_FILE" block "$SIANA_TASK_ID" --reason "<what stopped you>"
 
-Always pass `--reason`, even when your verify is a command that passes. What you
-found is the only thing that reaches SIANA, and the queue is the only place it
-survives: your screen is closed the moment your work is accepted.
+Both require `--reason`, including `done` when your verify is a command that
+passes. A green command says it exited zero; it cannot say what you found, and
+what you found is the only thing that reaches SIANA. The queue is the only place
+it survives, because your screen is closed the moment your work is accepted.
+
+`done` asks for it before it runs your verify, so a refusal there costs you a
+retype and not a whole verify run.
 
 Never call `tasks add`. A minion that discovers new work calls `block` and returns;
 SIANA queues the unblocker and wires the dependency.
