@@ -50,12 +50,18 @@ named after a rule is how the next agent finds out the rule exists.
   to the home from here would edit the fleet you are running inside.
 - Never edit `CHANGELOG.md` or any file marked auto-generated.
 
-## This project's ship rigor is a gate
+## When a brief sends you through the gate
 
-Ship work here is validated by `no-mistakes`: a pipeline you drive round by round,
-not a command that runs once. Your standing orders say what holds for any rigor of
-this kind. This says how this one behaves.
+**This project's routine rigor is `just test`, and your task's `verify` says so.**
+Run it, make it pass, and report. That is the whole of what most ship work here
+needs.
 
+`no-mistakes` is a different thing and it is not the default. It is a validation
+pipeline you drive round by round, and it costs a minion tens of minutes and several
+human decisions, so it runs when a brief explicitly asks for it and never because
+this section exists. If your brief does not mention it, you are not driving it.
+
+When your brief does ask for it, the rest of this section is how it behaves.
 Everything below was established by driving real runs from a dispatch worktree. Where
 it contradicts what the tool's own help steers you toward, the tool's help is the one
 that has been observed to be wrong.
