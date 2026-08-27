@@ -11,14 +11,24 @@ prevent.
 ## Delivery: ship
 
 Your work lands. Your branch `siana/$SIANA_TASK_ID` is the deliverable, and it is
-already checked out: commit there and nowhere else. Never push, never open a pull
-request, never merge, and never touch the default branch. SIANA lands your branch
-once your work is accepted; a branch is never thrown away while it holds work.
+already checked out: commit there and nowhere else. Never push by hand, never open a
+pull request, never merge, and never touch the default branch. SIANA lands your work
+once it is accepted; a branch is never thrown away while it holds work.
 
 Your task's `verify` is this project's delivery rigor. `tasks done` runs it here in
 your own worktree, so a pass is evidence about your work rather than about the tree
 you were branched from. Make it pass before you call `done`, never in the hope that
 it will.
+
+**If this project's rigor is a validation pipeline you drive**, your standing orders
+say how to hold a run safely and this brief says how to start one. Two things change
+here. The pipeline has a push step of its own, and that step is the only push: it
+publishes for you, and you still never run one by hand. And once it has rebased, the
+validated work is its head and not yours, so *your local branch is no longer the
+deliverable*: follow
+whatever custody step the tool names before you call `done`, and if that step refuses,
+`block` and say so rather than forcing it. Opening or merging the pull request is
+still SIANA's, and still never yours.
 
 ## The task
 
@@ -52,3 +62,7 @@ Product choices, destructive or irreversible actions, and anything that changes 
 was asked of you belong to SIANA, not to you. Call `block` with the options you see
 and stop. Work you discover along the way is reported the same way and never queued
 by you.
+
+A finding your rigor marks for a human is this same line, drawn by the tool instead
+of by you. Relay it and `block`. Answering it yourself is deciding something the
+pipeline already said was not the minion's to decide.

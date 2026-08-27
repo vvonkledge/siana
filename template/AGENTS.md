@@ -52,8 +52,10 @@ record.
 Every project carries its own configuration there:
 
 - `path` is where minions run and where verification happens.
-- `ship` is the command you type into `tasks add --verify` for ship work in that
-  project. No script enforces it; a task's verify is whatever you wrote on it.
+- `ship` is that project's delivery rigor. Usually it is a command you type into
+  `tasks add --verify`. No script enforces it; a task's verify is whatever you
+  wrote on it. In some projects the rigor is a process the minion drives instead,
+  and then the verify only reads its outcome. See "When the rigor is a gate".
 - `qa` is that project's independent validation command. Setting it is the
   captain saying ship work there is not accepted on the word of the minion that
   did it, and it puts a QA task behind every ship task you brief.
@@ -118,6 +120,11 @@ is deliberately more work, because machine-checkable verification is the goal.
 Ship work lands through the project's delivery rigor. Scout work leaves a
 standalone report and lands nothing. Do not let one drift into the other.
 
+A verify that *starts* the rigor is not a verify. It runs once, after the minion has
+already declared itself finished, so anything the rigor demanded arrives too late to
+act on, and a rigor that parks for a human decision can exit 0 while still parked at
+one. Verify the outcome, never the process.
+
 Put the pointers a cold-starting minion needs in `--context`. A minion should not
 have to ask you what it is looking at.
 
@@ -166,7 +173,9 @@ The kind is never defaulted, and the script refuses to choose it for you, becaus
 scout that starts shipping is the exact blur you are here to prevent:
 
 - `--ship` lands. The minion commits on `siana/<task-id>` and that branch is the
-  deliverable. Its verify is the project's `ship` command from the registry.
+  deliverable. Its verify is the project's `ship` command from the registry. Where
+  that rigor is a gate, the brief has to carry how it is driven, because the verify
+  no longer expresses it.
 - `--scout` reports. The minion writes `reports/<task-id>.md` in this directory and
   lands nothing; its worktree is scratch. Give it a real verify rather than falling
   back to `--prose`, because the report's existence is machine-checkable. Write it
@@ -215,8 +224,8 @@ Its verdict comes back through the queue like any other:
 
 Acting on a rejection is yours. Queue the fix as ship work in the same project
 with `--base siana/<ship-id>`, so its minion starts from the work rather than
-from a tree that never had it, and brief it with what the report found. That fix task gets a QA pair of its own, because it is ship work like any
-other.
+from a tree that never had it, and brief it with what the report found. That fix
+task gets a QA pair of its own, because it is ship work like any other.
 
 Skipping QA for one task is `tasks drop <qa-id>`. It is a decision you report to
 the captain, never a tidy-up: the registry field is their standing answer for that
@@ -224,6 +233,47 @@ project, and dropping the pair overrides them for one piece of work.
 
 None of this lands anything. A green QA says the work holds up; whether it lands,
 and through what, is still the captain's call and still done by hand.
+
+## When the rigor is a gate
+
+Some projects deliver through a validation pipeline the minion drives, rather than a
+command that runs once at `done`. Three things change, and all three are yours.
+
+**The verify reads the outcome, never starts the gate.** A gate parks for human
+decisions, and at least one of them exits 0 while still parked at an open one. A
+verify built on it reports success on work nobody approved, which is a false green on
+exactly the boundary this fleet defends. Give a gated ship task a verify that reads
+the run's terminal verdict, or what the gate published, and never one that starts it.
+
+**The brief and the project's orders carry the protocol.** The verify no longer says
+how the work is validated, so the ship brief has to, and the tool's own protocol
+belongs in that project's `orders` file where every minion on it gets the same copy.
+A minion sent into a gate with neither drives it by guessing.
+
+**Never move a branch under a live run.** A gate validates the head the minion
+submitted to it. If `siana/<task-id>` moves while a run is parked on it, the
+pipeline's fixes land on a head that branch has already left behind, and the run is
+stranded - silently, because the tool reports the healthy and the stranded case
+identically. The minion is told not to move its own branch. **You are the only other
+one who can**: never land, rebase, or force-update `siana/<task-id>` while a run is
+parked on it. Nothing else in the fleet can give that guarantee.
+
+Where the boundary sits is the captain's standing ruling:
+
+- **The push happens under the gate, on the minion's side of the line.** The minion
+  never pushes by hand; the pipeline's own push step does it. That is what lets the
+  gate reach its push, pull request and CI steps, which are most of what it was
+  built to do.
+- **SIANA merges the pull request.** The gate's boundary ends at the push target;
+  yours ends at what lands, and merge authority is still the captain's.
+
+So a gated ship task comes back with work published and unmerged, and the merge is
+the same hand-done decision it always was.
+
+A gated run is not fire and forget. The minion is parked for the whole of it - tens
+of minutes, several returns, and escalations at more than one step, not only at
+review. It can do nothing else while it waits. Dispatch on that basis, and never read
+a long silence from a gated minion as a stall.
 
 ## Scripts and judgment
 
@@ -365,6 +415,12 @@ an escalation and report it when they return. Never present a choice you made wh
 they were away as one they had already approved.
 
 ## What is not wired yet
+
+QA behind a gated project is unsettled. A QA task's worktree is cut from
+`siana/<ship-id>`, and a gate that rebases leaves the validated head somewhere that
+branch does not point at, so the second minion could judge a head nobody shipped.
+Setting both `qa` and a gated `ship` on one project is a decision to take to the
+captain, not one to resolve by dispatching and hoping.
 
 The captain's standing preferences have no store. They live in this file, which you
 can edit, and `just upgrade` preserves your copy with a diff beside it when the

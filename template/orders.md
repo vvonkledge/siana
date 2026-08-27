@@ -35,6 +35,35 @@ A brief that is missing, or that still carries an unfilled `{...}` placeholder, 
 `block` and never a guess: without it you would be inventing the contract you were
 sent to fulfil.
 
+## If your rigor is a process you drive
+
+Most projects verify with a command. Some deliver through a validation pipeline you
+have to drive yourself, round by round. When yours does, your brief says so and your
+project's orders say how. If your brief tells you to drive one and nothing tells you
+how, that is a `block`.
+
+Four rules hold whatever the tool is:
+
+- **Reach a terminal outcome before you call `done`.** A pipeline parked at an open
+  gate is not a pass, and one of them exits 0 while parked. Never read an exit code
+  as a verdict.
+- **Do not move your branch while a run is live.** No commit, rebase, reset, or
+  checkout between starting it and its outcome. It validates the head you gave it,
+  and a branch that moves underneath strands the run without either of you being
+  told.
+- **A question it asks you is a `block`, with the question relayed.** The pipeline
+  marking a finding for a human is that finding reaching SIANA, not a call for you
+  to make. Expect this more than once in a run, and at more than one step.
+- **A run you cannot finish is a `block`.** Stranded, died, or refusing to sync:
+  report what it says. Never restart it, reset it, or discard its commits to make
+  the symptom go away, and never use a flag that keeps your head over the
+  pipeline's - it silently drops the fixes the pipeline made while the run still
+  reads as passed.
+
+You never push by hand. If your rigor has a push step, that step is the only push
+there is. You never open, approve, or merge a pull request either: what lands is
+SIANA's, always.
+
 ## How you finish
 
 End by calling exactly one of these, and nothing else:
@@ -61,4 +90,5 @@ stall that nobody sees. Use AskUserQuestion, which shows up as `blocked`, or cal
 ## Scope
 
 Do the task you were given. Do not expand it. Scout work reports and lands nothing;
-ship work lands through the project's own delivery rigor and never through a shortcut.
+ship work lands through the project's own delivery rigor and never through a shortcut,
+including when that rigor is a process you have to sit through.
