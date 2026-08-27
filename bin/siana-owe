@@ -78,6 +78,22 @@ def age(stamp: str) -> str:
     return f"{int(secs // 86400)}d"
 
 
+def answered(rec) -> str:
+    """What retired this obligation, for a reader.
+
+    Not `rec.get("answer", "(unrecorded)")`. `datafile` materialises every optional
+    field, so an obligation stored without an answer carries `"answer": null` rather
+    than no key at all: `.get` finds it, returns None, and the default never fires.
+    The fallback has to be written against the value, not against the key's absence,
+    or the captain reads a Python `None` where the text was meant to say so plainly.
+
+    No command here can write such a record, because `close` refuses without
+    `--answer`. It is the guard for a hand-written one, and a guard that has never
+    fired is exactly the kind that is wrong.
+    """
+    return rec.get("answer") or "(unrecorded)"
+
+
 def fold(store: str, key: str):
     """Fold an append-only datafile store into {key: record}.
 
@@ -179,7 +195,7 @@ def closed_view(items) -> None:
     wid = max(len(i["id"]) for i in items)
     for rec in items:
         print(f"  {rec['kind']:<8} {rec['id']:<{wid}}  {age(rec.get('closed', '')):>3}"
-              f"  {rec['body']}  by {rec.get('answer', '(unrecorded)')}")
+              f"  {rec['body']}  by {answered(rec)}")
 
 
 def open_items(store: str):
@@ -240,7 +256,7 @@ def main() -> None:
             die(f"nothing owed under that id: {args.id}",
                 f"open: {known}")
         if rec.get("status") == "closed":
-            die(f"{args.id} was already answered by: {rec.get('answer', '(unrecorded)')}",
+            die(f"{args.id} was already answered by: {answered(rec)}",
                 "an obligation is retired once, by the event that answered it;",
                 "closing it twice would hide which event actually did")
         if not args.answer:

@@ -229,6 +229,48 @@ class Command(HomeTest):
         self.assertNotIn("Report on the fleet at noon", view)
         self.assertNotIn("the noon report", view)
 
+    def hand_written_closed(self, rid="no-answer-field"):
+        """A closed obligation carrying no answer. `close` refuses to make one, so
+        this is written straight through `datafile` - the only way such a record
+        exists, and therefore the only way the guard against it can be tested."""
+        out = self.run_cmd(["datafile", "-f", self.at("obligations.jsonl"),
+                            "-c", self.at("schema-obligations.yaml"), "put",
+                            json.dumps({"id": rid, "kind": "decision",
+                                        "body": "Closed with no answer recorded",
+                                        "status": "closed",
+                                        "opened": "2026-01-01T00:00:00+00:00",
+                                        "closed": "2026-08-01T00:00:00+00:00"})])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return rid
+
+    def test_an_answer_the_store_holds_as_null_reads_as_unrecorded(self):
+        # `datafile` materialises every optional field, so an absent answer is
+        # stored as null and not as a missing key. A fallback written against the
+        # key's absence never fires, and the captain reads a Python `None`.
+        rid = self.hand_written_closed()
+        out = self.assertAccepted(self.owe("closed"))
+        self.assertIn("(unrecorded)", out)
+        self.assertNotIn("None", out)
+
+    def test_the_already_answered_refusal_reads_as_unrecorded_too(self):
+        # The same expression, in the refusal that says why a second close is not
+        # allowed. A `None` there is the captain being told the obligation was
+        # answered by nothing.
+        rid = self.hand_written_closed()
+        out = self.assertRefused(self.owe("close", rid, "--answer", "anything"),
+                                 "already answered by")
+        self.assertIn("(unrecorded)", out)
+        self.assertNotIn("None", out)
+
+    def test_a_real_answer_is_never_replaced_by_the_fallback(self):
+        # The guard must not swallow the thing it guards.
+        self.assertAccepted(self.owe("promise", "Report on the fleet at noon"))
+        rid = self.records()[0]["id"]
+        self.assertAccepted(self.owe("close", rid, "--answer", "the noon report"))
+        out = self.assertAccepted(self.owe("closed"))
+        self.assertIn("the noon report", out)
+        self.assertNotIn("(unrecorded)", out)
+
     def test_a_mistyped_field_is_refused_by_the_contract_not_accepted(self):
         # `extra: forbid` is the point of keeping this in a store.
         out = self.run_cmd(["datafile", "-f", self.at("obligations.jsonl"),
