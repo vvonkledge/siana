@@ -223,6 +223,17 @@ _contract-drift:
     echo "          until then every task the CLI writes is rejected by the" >&2
     echo "          contract, which is a traceback rather than a refusal" >&2
 
+# Run the distro's tests. Pass unittest arguments through: `just test -v`, or
+# `just test -k slug` for one rule.
+test *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # `-s tests` and no `-t` so the suite's own helpers import by name. Nothing is
+    # installed to run these: they drive the commands where the mechanics are pure,
+    # and drive them as processes against a real `tasks` and `datafile` where they
+    # are not, because a stubbed store would only ever agree with this suite.
+    python3 -m unittest discover -s tests {{args}}
+
 # Report SIANA's state without changing anything
 doctor: _contract-drift
     #!/usr/bin/env bash
