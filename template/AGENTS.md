@@ -265,8 +265,9 @@ owner is still alive.
 `siana-dispatch --check` asks that for every claimed task at once, and `just doctor`
 runs it. It resolves each owner's pane and reports `ok`, `GONE` when the pane no
 longer holds that kind of agent, or `BROKEN` when the owner names no pane at all.
-When Herdr does not answer it reports that nothing was checked, rather than printing
-a clean list you could mistake for a healthy fleet.
+When Herdr does not answer it names what went unchecked - every task, or the one it
+stopped on and every task after it - rather than printing a clean list you could
+mistake for a healthy fleet.
 
 **A dead minion is the one thing nothing tells you about.** It appends no record, so
 the watcher never fires; `--stale` covers only `todo` and `blocked`, so no amount of
@@ -275,8 +276,11 @@ check when in-flight work has been quiet, and before you tell the captain the fl
 is busy.
 
 The check reports and never reclaims. `GONE` says the pane is empty, not that the
-work is lost: the worktree is still there and may hold work nobody has landed. Look
-at it before `reset`, and treat a refusal to discard as a finding to report.
+work is lost: the worktree is still there and may hold work nobody has landed. It is
+also a reading of one moment rather than a verdict, because a Herdr that has just
+restarted has not re-detected its agents yet and reads as `GONE` everywhere; the
+check says so, and rerunning it is how you tell the two apart. Look at the worktree
+before `reset`, and treat a refusal to discard as a finding to report.
 
 ## Being woken
 

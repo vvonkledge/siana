@@ -291,7 +291,7 @@ def check_owners(tasks_file: str) -> int:
         print("            these are alive rather than implying they are")
         return 1
 
-    failed = gone = 0
+    failed = gone = unchecked = 0
     for t in doing:
         tid, owner = t.get("id"), t.get("owner") or ""
         kind, _, pane = owner.partition("@")
@@ -307,7 +307,8 @@ def check_owners(tasks_file: str) -> int:
             print("            herdr stopped answering partway through, which is a fact")
             print("            about herdr and about none of these minions; rerun once")
             print("            it answers again rather than reading silence as death")
-            return 1
+            unchecked = 1
+            break
         except Refusal:
             print(f"  GONE    {tid}: herdr has no agent in {pane}")
         else:
@@ -321,11 +322,13 @@ def check_owners(tasks_file: str) -> int:
         failed += 1
         gone += 1
     if gone:
-        # Detection is by label, and a herdr that has just restarted has not put the
-        # labels back yet. So GONE is a reading of this moment, not a verdict.
+        # A herdr whose server restarted has lost its pane metadata and re-detects
+        # each agent from the pane itself, so until that finishes it truthfully
+        # reports no agent in a pane a live minion is working in. GONE is a reading
+        # of this moment, not a verdict.
         print("  note    a herdr that restarted recently reads as GONE everywhere until")
         print("          it has re-detected its agents; rerun before acting on this")
-    return 1 if failed else 0
+    return 1 if failed or unchecked else 0
 
 
 def main() -> None:
