@@ -20,6 +20,7 @@ already passed the contract.
 
 Usage:
     siana-owe                                  what is still open
+    siana-owe closed                           what was answered, and by what
     siana-owe promise <text> [--task <id>]     something SIANA owes the captain
     siana-owe decision <text> [--task <id>]    something only the captain can answer
     siana-owe close <id> --answer <text>       retire one, naming what answered it
@@ -75,6 +76,22 @@ def age(stamp: str) -> str:
     if secs < 86400:
         return f"{int(secs // 3600)}h"
     return f"{int(secs // 86400)}d"
+
+
+def answered(rec) -> str:
+    """What retired this obligation, for a reader.
+
+    Not `rec.get("answer", "(unrecorded)")`. `datafile` materialises every optional
+    field, so an obligation stored without an answer carries `"answer": null` rather
+    than no key at all: `.get` finds it, returns None, and the default never fires.
+    The fallback has to be written against the value, not against the key's absence,
+    or the captain reads a Python `None` where the text was meant to say so plainly.
+
+    No command here can write such a record, because `close` refuses without
+    `--answer`. It is the guard for a hand-written one, and a guard that has never
+    fired is exactly the kind that is wrong.
+    """
+    return rec.get("answer") or "(unrecorded)"
 
 
 def fold(store: str, key: str):
@@ -167,11 +184,33 @@ def view(items) -> None:
               f"  {rec['body']}{task}")
 
 
+def closed_view(items) -> None:
+    """The answered view, in the open view's shape, with what answered it in place
+    of the task. The answer is the whole point of reading this: an obligation
+    without it is the recollection this store replaces."""
+    if not items:
+        print("answered nothing")
+        return
+    print(f"answered {len(items)}")
+    wid = max(len(i["id"]) for i in items)
+    for rec in items:
+        print(f"  {rec['kind']:<8} {rec['id']:<{wid}}  {age(rec.get('closed', '')):>3}"
+              f"  {rec['body']}  by {answered(rec)}")
+
+
 def open_items(store: str):
     """Oldest first: the longest-owed obligation is the one most likely to have been
     forgotten, so it is the one the captain should read first."""
     items = [r for r in fold(store, "id").values() if r.get("status") == "open"]
     return sorted(items, key=lambda r: str(r.get("opened", "")))
+
+
+def closed_items(store: str):
+    """Newest first, the opposite of the open view and deliberately so: a captain
+    asking what was delivered is asking about the recent past, while one reading
+    what is still owed is looking for what has been forgotten."""
+    items = [r for r in fold(store, "id").values() if r.get("status") == "closed"]
+    return sorted(items, key=lambda r: str(r.get("closed", "")), reverse=True)
 
 
 def main() -> None:
@@ -187,6 +226,7 @@ def main() -> None:
         p = sub.add_parser(kind)
         p.add_argument("body")
         p.add_argument("--task", help="the queue task this is about, if it is about one")
+    sub.add_parser("closed")
     c = sub.add_parser("close")
     c.add_argument("id")
     c.add_argument("--answer", help="the durable event that answered this")
@@ -204,6 +244,10 @@ def main() -> None:
         view(open_items(store))
         return
 
+    if args.cmd == "closed":
+        closed_view(closed_items(store))
+        return
+
     if args.cmd == "close":
         records = fold(store, "id")
         rec = records.get(args.id)
@@ -212,7 +256,7 @@ def main() -> None:
             die(f"nothing owed under that id: {args.id}",
                 f"open: {known}")
         if rec.get("status") == "closed":
-            die(f"{args.id} was already answered by: {rec.get('answer', '(unrecorded)')}",
+            die(f"{args.id} was already answered by: {answered(rec)}",
                 "an obligation is retired once, by the event that answered it;",
                 "closing it twice would hide which event actually did")
         if not args.answer:
