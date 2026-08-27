@@ -184,6 +184,51 @@ class Command(HomeTest):
         view = self.assertAccepted(self.owe())
         self.assertLess(view.index("First thing owed"), view.index("Second thing owed"))
 
+    def test_the_closed_view_shows_what_was_answered_and_by_what(self):
+        # An obligation without what answered it is the recollection this store
+        # replaces, so a closed view that omitted the answer would be worse than none.
+        self.assertAccepted(self.owe("promise", "Report on the fleet at noon"))
+        rid = self.records()[0]["id"]
+        self.assertAccepted(self.owe("close", rid, "--answer", "the noon report"))
+        out = self.assertAccepted(self.owe("closed"))
+        self.assertIn(rid, out)
+        self.assertIn("Report on the fleet at noon", out)
+        self.assertIn("the noon report", out)
+
+    def test_the_closed_view_omits_what_is_still_open(self):
+        self.assertAccepted(self.owe("promise", "Still owed"))
+        out = self.assertAccepted(self.owe("closed"))
+        self.assertNotIn("Still owed", out)
+        self.assertIn("answered nothing", out)
+
+    def test_the_closed_view_is_newest_first(self):
+        # The opposite of the open view, and deliberately so: a captain asking what
+        # was delivered is asking about the recent past.
+        self.assertAccepted(self.owe("promise", "First thing owed"))
+        self.assertAccepted(self.owe("promise", "Second thing owed"))
+        first, second = (r["id"] for r in self.records()[:2])
+        self.assertAccepted(self.owe("close", first, "--answer", "answered first"))
+        self.assertAccepted(self.owe("close", second, "--answer", "answered second"))
+        out = self.assertAccepted(self.owe("closed"))
+        self.assertLess(out.index("Second thing owed"), out.index("First thing owed"))
+
+    def test_nothing_answered_yet_reads_as_a_zero_and_not_a_warning(self):
+        self.assertIn("answered nothing", self.assertAccepted(self.owe("closed")))
+
+    def test_the_bare_view_is_untouched_by_the_closed_one(self):
+        # `siana` injects the bare view into SIANA's system prompt at every session
+        # start, so a change to its shape changes what SIANA is told it owes.
+        self.assertIn("owed     nothing", self.assertAccepted(self.owe()))
+        self.assertAccepted(self.owe("promise", "Report on the fleet at noon"))
+        rid = self.records()[0]["id"]
+        self.assertAccepted(self.owe("promise", "Second thing owed"))
+        self.assertAccepted(self.owe("close", rid, "--answer", "the noon report"))
+        view = self.assertAccepted(self.owe())
+        self.assertIn("owed     1", view)
+        self.assertIn("Second thing owed", view)
+        self.assertNotIn("Report on the fleet at noon", view)
+        self.assertNotIn("the noon report", view)
+
     def test_a_mistyped_field_is_refused_by_the_contract_not_accepted(self):
         # `extra: forbid` is the point of keeping this in a store.
         out = self.run_cmd(["datafile", "-f", self.at("obligations.jsonl"),

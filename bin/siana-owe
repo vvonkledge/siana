@@ -20,6 +20,7 @@ already passed the contract.
 
 Usage:
     siana-owe                                  what is still open
+    siana-owe closed                           what was answered, and by what
     siana-owe promise <text> [--task <id>]     something SIANA owes the captain
     siana-owe decision <text> [--task <id>]    something only the captain can answer
     siana-owe close <id> --answer <text>       retire one, naming what answered it
@@ -167,11 +168,33 @@ def view(items) -> None:
               f"  {rec['body']}{task}")
 
 
+def closed_view(items) -> None:
+    """The answered view, in the open view's shape, with what answered it in place
+    of the task. The answer is the whole point of reading this: an obligation
+    without it is the recollection this store replaces."""
+    if not items:
+        print("answered nothing")
+        return
+    print(f"answered {len(items)}")
+    wid = max(len(i["id"]) for i in items)
+    for rec in items:
+        print(f"  {rec['kind']:<8} {rec['id']:<{wid}}  {age(rec.get('closed', '')):>3}"
+              f"  {rec['body']}  by {rec.get('answer', '(unrecorded)')}")
+
+
 def open_items(store: str):
     """Oldest first: the longest-owed obligation is the one most likely to have been
     forgotten, so it is the one the captain should read first."""
     items = [r for r in fold(store, "id").values() if r.get("status") == "open"]
     return sorted(items, key=lambda r: str(r.get("opened", "")))
+
+
+def closed_items(store: str):
+    """Newest first, the opposite of the open view and deliberately so: a captain
+    asking what was delivered is asking about the recent past, while one reading
+    what is still owed is looking for what has been forgotten."""
+    items = [r for r in fold(store, "id").values() if r.get("status") == "closed"]
+    return sorted(items, key=lambda r: str(r.get("closed", "")), reverse=True)
 
 
 def main() -> None:
@@ -187,6 +210,7 @@ def main() -> None:
         p = sub.add_parser(kind)
         p.add_argument("body")
         p.add_argument("--task", help="the queue task this is about, if it is about one")
+    sub.add_parser("closed")
     c = sub.add_parser("close")
     c.add_argument("id")
     c.add_argument("--answer", help="the durable event that answered this")
@@ -202,6 +226,10 @@ def main() -> None:
 
     if args.cmd is None:
         view(open_items(store))
+        return
+
+    if args.cmd == "closed":
+        closed_view(closed_items(store))
         return
 
     if args.cmd == "close":

@@ -304,7 +304,9 @@ Retire one with `siana-owe close <id> --answer <text>`, naming the durable event
 that answered it: the report you actually delivered, the ruling the captain actually
 gave. Obligations are closed by records, not by recollection, and `siana-owe` refuses
 a close that does not say what answered it. Never carry one in this conversation
-instead, and never close one because you believe you already handled it.
+instead, and never close one because you believe you already handled it. `siana-owe
+closed` reads back what you answered and by what, newest first, so a captain asking
+whether you ever came back to them about something has a record to read.
 
 Reclaiming an orphaned in-flight task is `reset <id> --reason "..."`, and it is
 deliberately manual. Do it when you know the owner is gone, never on a timer.
