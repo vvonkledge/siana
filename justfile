@@ -38,7 +38,7 @@ init: _contract-drift
     # SIANA can evolve its own instructions, the orders its minions are started with,
     # and the brief templates it scaffolds a task contract from, so a home copy that
     # has diverged is the captain's work, not drift to be cleaned up. Never clobber it.
-    for f in AGENTS.md orders.md brief-ship.md brief-scout.md; do
+    for f in AGENTS.md orders.md brief-ship.md brief-scout.md brief-qa.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "wrote    $home/$f"
@@ -141,7 +141,7 @@ upgrade: _initialized init
     backup="$home/upgrade/$stamp"
     kept=""
     echo
-    for f in AGENTS.md orders.md brief-ship.md brief-scout.md; do
+    for f in AGENTS.md orders.md brief-ship.md brief-scout.md brief-qa.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "restored $home/$f (it was missing)"
@@ -191,6 +191,25 @@ _contract-drift:
     #!/usr/bin/env bash
     set -uo pipefail
     home='{{home}}'
+
+    # A field the distro's project contract has and the home copy does not is a
+    # setting the captain cannot make: `extra: forbid` refuses the write and names
+    # the key, without saying that the contract is simply older than the field. An
+    # upgrade never rewrites a live contract, because a dropped field makes every
+    # record still carrying it unreadable, so growing one stays the captain's call
+    # and this only makes sure they know there is one to make.
+    if [ -f "$home/schema-projects.yaml" ]; then
+        absent="$(comm -13 \
+            <(grep -oE '^  [a-z_]+:' "$home/schema-projects.yaml" | tr -d ' :' | sort) \
+            <(grep -oE '^  [a-z_]+:' "$PWD/template/schema-projects.yaml" | tr -d ' :' | sort))"
+        if [ -n "$absent" ]; then
+            echo "  stale   schema-projects.yaml is missing: $(echo $absent | tr '\n' ' ')" >&2
+            echo "          copy those fields into $home/schema-projects.yaml from" >&2
+            echo "          $PWD/template/schema-projects.yaml; until then the registry" >&2
+            echo "          refuses to record them" >&2
+        fi
+    fi
+
     [ -f "$home/schema-tasks.yaml" ] || exit 0
     fresh="$(mktemp -d)"
     (cd "$fresh" && tasks init >/dev/null 2>&1) || exit 0
@@ -201,6 +220,8 @@ _contract-drift:
     [ -z "$missing" ] && exit 0
     echo "  stale   schema-tasks.yaml is missing: $(echo $missing | tr '\n' ' ')" >&2
     echo "          add those fields to $home/schema-tasks.yaml" >&2
+    echo "          until then every task the CLI writes is rejected by the" >&2
+    echo "          contract, which is a traceback rather than a refusal" >&2
 
 # Report SIANA's state without changing anything
 doctor: _contract-drift
@@ -208,7 +229,7 @@ doctor: _contract-drift
     set -uo pipefail
     home='{{home}}'
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md brief-ship.md brief-scout.md schema-projects.yaml schema-obligations.yaml schema-tasks.yaml .pi/settings.json; do
+    for f in siana.env AGENTS.md orders.md brief-ship.md brief-scout.md brief-qa.md schema-projects.yaml schema-obligations.yaml schema-tasks.yaml .pi/settings.json; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first

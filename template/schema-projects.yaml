@@ -33,6 +33,11 @@ fields:
     type: str
     required: false
     description: the project's delivery rigor; SIANA types it into `tasks add --verify`
+  qa:
+    type: str
+    required: false
+    description: independent validation of ship work; set it to put a QA minion
+      behind every ship task in this project
   orders:
     type: str
     required: false

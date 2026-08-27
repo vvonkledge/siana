@@ -54,6 +54,9 @@ Every project carries its own configuration there:
 - `path` is where minions run and where verification happens.
 - `ship` is the command you type into `tasks add --verify` for ship work in that
   project. No script enforces it; a task's verify is whatever you wrote on it.
+- `qa` is that project's independent validation command. Setting it is the
+  captain saying ship work there is not accepted on the word of the minion that
+  did it, and it puts a QA task behind every ship task you brief.
 - `orders` names extra standing orders every minion on that project receives,
   appended after `orders.md`. That is where a project's build command, its
   conventions, and its untouchable files belong, so you never have to repeat
@@ -138,6 +141,11 @@ wrong tree is worse than a red, so never omit it. Dispatch retargets it to the
 minion's worktree, so what you write here is what an undispatched task verifies
 against, not the last word.
 
+`--base` is the ref the minion's worktree is cut from. Leave it off and the minion
+starts from whatever the project is checked out to, which is what new work wants.
+Set it when the work has to start from an existing branch: a QA task judging
+`siana/<ship-id>`, or a fix that has to build on one.
+
 ## Briefing a minion
 
 The task record carries the checkable half of a contract: the project, the directory,
@@ -174,9 +182,48 @@ A brief is never scaffolded twice. Change one by editing the file, and only whil
 task is still yours: once a minion has read it, the way to change its contract is to
 tell that minion, not to edit the file underneath it.
 
-`brief-ship.md` and `brief-scout.md` in this directory are the templates, and they are
-yours to evolve like `orders.md`. An upgrade preserves your copy and leaves the diff
-beside it.
+`brief-ship.md`, `brief-scout.md` and `brief-qa.md` in this directory are the
+templates, and they are yours to evolve like `orders.md`. An upgrade preserves your
+copy and leaves the diff beside it.
+
+In a project that sets `qa`, `--ship` also queues the QA task that will judge the
+work. See "Independent validation".
+
+## Independent validation
+
+A minion's `done` is that minion's own word for it. A project that carries `qa` in
+the registry is the captain saying that word is not enough there: every ship task
+gets a QA task behind it, and the work is not accepted until a second minion, one
+that did not write it, has exercised it and said so.
+
+`siana-brief <id> --ship` queues that QA task for you. It depends on the ship task,
+so the dependency graph makes it ready the moment the work comes back, and you
+dispatch it with the same command as anything else. Nothing in its brief is yours
+to fill: it judges the ship work against the ship task's own brief, and it runs the
+project's `qa` command as its verify.
+
+Its worktree is cut from `siana/<ship-id>`, so it reads and runs the work without
+touching the branch that holds it. It fixes nothing, on purpose: a minion that
+repairs what it was sent to judge has spent the only independent reading of the
+work, and the repair arrives with nobody left to check it.
+
+Its verdict comes back through the queue like any other:
+
+- `done` means it exercised the work and the work does what its brief asked.
+- `blocked` means it does not. That is a finding and not a stall, and
+  `reports/<qa-id>.md` holds what was run, what broke, and where.
+
+Acting on a rejection is yours. Queue the fix as ship work in the same project
+with `--base siana/<ship-id>`, so its minion starts from the work rather than
+from a tree that never had it, and brief it with what the report found. That fix task gets a QA pair of its own, because it is ship work like any
+other.
+
+Skipping QA for one task is `tasks drop <qa-id>`. It is a decision you report to
+the captain, never a tidy-up: the registry field is their standing answer for that
+project, and dropping the pair overrides them for one piece of work.
+
+None of this lands anything. A green QA says the work holds up; whether it lands,
+and through what, is still the captain's call and still done by hand.
 
 ## Scripts and judgment
 
