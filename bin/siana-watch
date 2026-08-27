@@ -219,9 +219,12 @@ def reports(path, offset):
         try:
             rec = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            # A whole line that will not parse is not a partial write, so it is
-            # never coming back. Said out loud, because the report it may have
-            # carried is exactly what this process exists to deliver.
+            rec = None
+        if not isinstance(rec, dict):
+            # A whole line that will not parse, or that parses to something which
+            # is not a record, is not a partial write, so it is never coming back.
+            # Said out loud, because the report it may have carried is exactly what
+            # this process exists to deliver.
             print(f"skipped  unreadable record in {path}", file=sys.stderr, flush=True)
             continue
         if rec.get("status") in TERMINAL:
@@ -254,29 +257,40 @@ def main():
     # accumulating and leave together, because SIANA reads the whole queue and a poke
     # per report would only spend turns saying the same thing.
     pending, waiting_since, warned = [], None, False
-    undetected_since = None
+    undetected_since, poke_failed = None, False
     while True:
         # Liveness every tick, not only when there is something to deliver. This
         # process is the captain's autonomy grant, so it must never keep running
         # after the session it grants for is gone: a watcher that looks alive while
         # it can wake nobody is the fleet quietly stopping and no one being told.
         #
-        # But "herdr sees no agent there" is routinely a detection gap and not a
-        # dead session, so it is held for DETECT_GRACE_S rather than acted on. While
-        # it is held no poke goes out: a pane this cannot identify is precisely the
-        # pane a poke must not be typed into, and a report waiting costs timeliness
-        # where a poke into a stranger's session costs the stranger.
-        agent = pane_agent(h, pane)
-        if agent is None:
+        # But not knowing what is in that pane is routinely a herdr restart rather
+        # than a dead session, so it is held for DETECT_GRACE_S rather than acted on.
+        # A restart is one event however it presents - herdr refusing the socket,
+        # herdr answering that no agent is there, or herdr answering with a pane it
+        # has not re-detected yet - so all three run the same clock. While it runs no
+        # poke goes out: a pane this cannot identify is precisely the pane a poke must
+        # not be typed into, and a report waiting costs timeliness where a poke into a
+        # stranger's session costs the stranger.
+        unsure = None
+        try:
+            agent = pane_agent(h, pane)
+            if not (agent and agent.get("agent")):
+                unsure = f"herdr sees no agent in {pane}"
+        except Unreachable as e:
+            agent, unsure = None, str(e).splitlines()[0]
+        if unsure:
             if undetected_since is None:
                 undetected_since = time.time()
-                print(f"unsure   herdr sees no agent in {pane}; every poke is held",
+                print(f"unsure   {unsure}; every poke is held",
                       file=sys.stderr, flush=True)
             if time.time() - undetected_since > DETECT_GRACE_S:
-                die(f"pane {pane} has had no detected agent for {DETECT_GRACE_S:.0f}s",
-                    "a herdr that restarted re-detects well inside that, so this is a",
-                    "session that has exited rather than one not yet recognised;",
-                    f"restarting SIANA rewrites {home}/session with its new pane")
+                die(f"pane {pane} has gone {DETECT_GRACE_S:.0f}s without herdr",
+                    f"confirming SIANA is in it: {unsure}",
+                    "a herdr that restarted answers and re-detects well inside that,",
+                    "so this is a session that has exited or a herdr that is not",
+                    f"coming back; restarting SIANA rewrites {home}/session with the",
+                    "pane it lands in")
             status = None
         elif agent.get("agent") != "pi":
             # Not a gap. Something else holds that pane now, so every poke from here
@@ -300,9 +314,24 @@ def main():
             # blocked it, the same hazard dispatch guards against at birth. So wait
             # for a settled state rather than forcing one, however long that takes.
             if status in ("idle", "done"):
-                h.call("agent.prompt", target=pane, text="The queue moved. Reconcile it.")
-                print(f"poked    {len(pending)} report(s)", flush=True)
-                pending, waiting_since, warned = [], None, False
+                # Delivery failing is a fact about this attempt, not about the
+                # session, and ending this process is ending the grant. So hold the
+                # reports - not clearing `pending` already retries next tick - and
+                # let the next tick's liveness check be the thing that decides
+                # whether that pane is still SIANA's.
+                try:
+                    h.call("agent.prompt", target=pane,
+                           text="The queue moved. Reconcile it.")
+                except Refusal as r:
+                    if not poke_failed:
+                        poke_failed = True
+                        print(f"held     herdr took no poke: {str(r).splitlines()[0]}; "
+                              f"{len(pending)} report(s) held",
+                              file=sys.stderr, flush=True)
+                else:
+                    poke_failed = False
+                    print(f"poked    {len(pending)} report(s)", flush=True)
+                    pending, waiting_since, warned = [], None, False
             elif status is not None:
                 waiting_since = waiting_since or time.time()
                 if not warned and time.time() - waiting_since > SETTLE_WARN_S:
