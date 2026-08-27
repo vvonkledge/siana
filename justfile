@@ -219,6 +219,19 @@ doctor: _contract-drift
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
     done
+    # One SIANA leads the fleet, so which one is a thing the captain can ask about.
+    # No session is the ordinary state between sessions and never a fault; a session
+    # whose pid is gone is one killed before its trap ran, and blocks the next start.
+    pid="$(sed -n 's/^SIANA_PID=//p' "$home/session" 2>/dev/null)"
+    pane="$(sed -n 's/^SIANA_PANE=//p' "$home/session" 2>/dev/null)"
+    if [ -z "$pid" ]; then
+        echo "  ok      no SIANA running"
+    elif ! kill -0 "$pid" 2>/dev/null; then
+        echo "  stale   session claims pid $pid, which is gone" >&2
+        echo "          remove $home/session to start a new SIANA" >&2
+    else
+        echo "  ok      SIANA running (pid $pid${pane:+, pane $pane})"
+    fi
     # Dispatch does the resolving and holds the pane bindings, so asking it means
     # this cannot drift from what a real dispatch would accept or from where a real
     # minion was put. It reports a dead owner and never reclaims one: `tasks reset`

@@ -43,24 +43,69 @@ if [ -f "$home/schema-projects.yaml" ]; then
 $registry")
 fi
 
-# Record which pane this session runs in, so `siana-watch` can wake SIANA when a
-# minion reports. The pane id is the durable handle - herdr's labels are not unique
-# and searching for a pi agent that looks about right could poke the wrong session -
-# and it comes from the environment herdr sets, so it is never inferred.
+# One SIANA leads the fleet, and this file is what says which. A second would
+# dispatch against the same queue while both believed they were the only one, so
+# every task either could claim would be a race, and the captain would be talking to
+# one of two agents with no way to tell which.
 #
-# Outside herdr there is no pane and therefore nothing to poke. That is a working
-# SIANA, just one the fleet cannot wake, so it is said plainly rather than refused.
+# It carries the pid, because that is what liveness can be asked about, and the pane
+# id when there is one, because that is how `siana-watch` wakes this session. The
+# pane id comes from the environment herdr sets, never from searching for a pi agent
+# that looks about right: herdr's labels are not unique, so a search could poke the
+# wrong session.
 session="$home/session"
-if [ -n "${HERDR_PANE_ID:-}" ]; then
-    printf '%s\n' "$HERDR_PANE_ID" > "$session"
-    # The file must not outlive the session it names: a stale pane id is a poke sent
-    # into whatever occupies that pane next. `siana-watch` also checks the pane still
-    # holds pi, because a session killed outright never reaches this trap.
-    trap 'rm -f "$session"' EXIT
-else
+
+# Whether the recorded session is still running. A pid alone is not enough, because
+# pids are reused, so the process wearing it must still be a siana. Anything else
+# means the file outlived its session and is ours to take.
+alive() {
+    local pid
+    pid="$(sed -n 's/^SIANA_PID=//p' "$session" 2>/dev/null)" || return 1
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    case "$(ps -p "$pid" -o command= 2>/dev/null)" in (*siana*) return 0 ;; esac
+    return 1
+}
+
+# `ln` is atomic and refuses an existing destination, so two siana starting together
+# cannot both win. Writing the content first and linking it into place also means the
+# file is never visible half-written, which a reader would mistake for a dead session.
+claim() {
+    local tmp="$session.$$"
+    {
+        printf 'SIANA_PID=%s\n' "$$"
+        [ -n "${HERDR_PANE_ID:-}" ] && printf 'SIANA_PANE=%s\n' "$HERDR_PANE_ID"
+    } > "$tmp"
+    if ln "$tmp" "$session" 2>/dev/null; then
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+if ! claim; then
+    if alive; then
+        pane="$(sed -n 's/^SIANA_PANE=//p' "$session" 2>/dev/null)"
+        pid="$(sed -n 's/^SIANA_PID=//p' "$session" 2>/dev/null)"
+        echo "SIANA is already leading the fleet (pid $pid)" >&2
+        if [ -n "$pane" ]; then
+            echo "  it is at pane $pane; attach with \`herdr agent attach $pane\`" >&2
+        else
+            echo "  it is running outside herdr, so it has no pane to attach to" >&2
+        fi
+        echo "  a second SIANA would race the first for every task in the queue" >&2
+        exit 1
+    fi
+    # The recorded session is gone, so the file is a leftover from one that was
+    # killed before its trap could run. Taking it over is the whole recovery.
     rm -f "$session"
-    echo "not running under herdr: siana-watch cannot wake this session" >&2
+    claim || { echo "cannot take $session; remove it and start again" >&2; exit 1; }
 fi
+trap 'rm -f "$session"' EXIT
+
+[ -n "${HERDR_PANE_ID:-}" ] || \
+    echo "not running under herdr: siana-watch cannot wake this session" >&2
 
 # --approve trusts this directory's project-local pi files. The captain created
 # this directory by running init, so the consent is explicit rather than inferred.

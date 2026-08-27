@@ -103,12 +103,22 @@ def read_session(home):
     path = os.path.join(home, "session")
     if not os.path.isfile(path):
         die(f"no SIANA session recorded at {path}",
-            "`siana` writes it at startup, so either SIANA is not running or it was",
-            "started outside herdr, where there is no pane to poke")
+            "`siana` writes it at startup and removes it at exit, so SIANA is not",
+            "running; start it first, then start this")
+    fields = {}
     with open(path) as f:
-        pane = f.read().strip()
+        for line in f:
+            if "=" in line:
+                k, v = line.split("=", 1)
+                fields[k.strip()] = v.strip()
+    pane = fields.get("SIANA_PANE")
     if not pane:
-        die(f"{path} is empty", "restart SIANA so it records its pane again")
+        # A SIANA outside herdr is a working SIANA, just one with no pane to prompt.
+        # Saying which of the two it is beats reporting a missing session that is
+        # sitting right there in front of the captain.
+        die(f"SIANA (pid {fields.get('SIANA_PID', '?')}) is running outside herdr",
+            "nothing can wake a session herdr does not host; restart SIANA inside",
+            "herdr if you want the fleet to advance while you are away")
     return pane
 
 

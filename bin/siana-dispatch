@@ -26,8 +26,14 @@ orders file actually exist on this machine right now.
 
 Usage:
     siana-dispatch <task-id> [--label <text>] [--env K=V ...] [--prompt <text>]
+    siana-dispatch --check
 
 On success it prints the binding SIANA needs to find this minion again.
+
+`--check` dispatches nothing. It resolves every project exactly as a dispatch would,
+and then asks Herdr whether the pane each in-flight task is bound to still holds its
+minion. Both live here because both are about bindings this script made: a check with
+its own parser could pass while a real dispatch fails.
 """
 
 import argparse
