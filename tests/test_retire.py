@@ -180,6 +180,33 @@ class Preconditions(Retire):
                            "already been retired")
         self.assertBranch()
 
+    def test_a_detached_worktree_is_found_rather_than_called_retired(self):
+        # Any minion that checks out a commit to read it leaves the tree like this.
+        # The lookup is by branch, so it came back empty and the command answered
+        # "it has already been retired" about a tree still on disk with work in it
+        # (QA, 2026-08-28). Acting on that walks the next dispatch into its own
+        # "a worktree already exists" refusal with no idea why.
+        worktree = self.finished()
+        loose = self.write(worktree, "notes.md", "what I found\n")
+        self.git("checkout", "-q", "--detach", cwd=worktree)
+        text = self.assertRefused(self.retire(), "detached at",
+                                  "nothing has been removed")
+        self.assertIn(worktree, text)
+        self.assertNotIn("already been retired", text)
+        self.assertTrue(os.path.isfile(loose))
+        self.assertBranch()
+
+    def test_a_worktree_moved_onto_another_branch_is_reported_as_it_is(self):
+        # The same blind spot, reached the other way. Neither is this command's to
+        # undo: moving a head back is a decision, and it is not mechanics.
+        worktree = self.finished()
+        self.git("checkout", "-q", "-b", "sidetrack", cwd=worktree)
+        text = self.assertRefused(self.retire(),
+                                  "checked out on refs/heads/sidetrack")
+        self.assertNotIn("already been retired", text)
+        self.assertTrue(os.path.isdir(worktree))
+        self.assertBranch()
+
     def test_the_projects_own_checkout_is_never_removed(self):
         # A minion branch checked out in the captain's tree is a state to report.
         # Removing the main worktree is not a cleanup, it is deleting the project.
@@ -247,6 +274,39 @@ class WorkThatWouldBeLost(Retire):
         self.assertTrue(os.path.isdir(worktree))
         self.assertTrue(os.path.isfile(os.path.join(worktree, "litter/secrets.env")))
 
+    def test_a_repository_setting_cannot_blind_the_check(self):
+        # `status.showUntrackedFiles=no` is an ordinary large-repo performance
+        # setting, and `git status` honours it by returning an empty untracked *and*
+        # an empty ignored bucket. Under it this check saw nothing, removed the tree
+        # and printed a success (QA, 2026-08-28), which is worse than not existing:
+        # `git worktree remove` is blinded by the same setting, so the command was
+        # offering an assurance it no longer had any way to make.
+        worktree = self.finished()
+        self.git("config", "status.showUntrackedFiles", "no")
+        secret = self.write(worktree, "notes-nobody-committed.md", "SECRET=1\n")
+        self.write(worktree, "litter/secrets.env", "TOKEN=1\n")
+        self.assertRefused(self.retire(), "untracked file(s)",
+                           "notes-nobody-committed.md", "ignored path(s)")
+        self.assertTrue(os.path.isfile(secret))
+        self.assertTrue(os.path.isdir(worktree))
+
+    def test_a_users_own_gitconfig_cannot_blind_the_check_either(self):
+        # The same setting one level up. A safety check that depends on how the
+        # captain configured git is a check that is off on somebody else's machine,
+        # so the flag has to override every config source rather than the repository
+        # being kept clean of it.
+        worktree = self.finished()
+        secret = self.write(worktree, "notes-nobody-committed.md", "SECRET=1\n")
+        config = self.at("global.gitconfig")
+        with open(config, "w") as fh:
+            fh.write("[status]\n\tshowUntrackedFiles = no\n")
+        self.assertRefused(
+            self.run_bin("siana-retire", "make-thing",
+                         env={"GIT_CONFIG_GLOBAL": config}),
+            "untracked file(s)", "notes-nobody-committed.md")
+        self.assertTrue(os.path.isfile(secret))
+        self.assertTrue(os.path.isdir(worktree))
+
     def test_every_kind_of_loss_is_reported_at_once(self):
         # Stopping at the first would make emptying the tree a guessing game.
         worktree = self.finished()
@@ -264,17 +324,47 @@ class WorkThatWouldBeLost(Retire):
         self.assertBranch()
 
 
-class TheLandingRule(Retire):
-    """A `done` task's worktree goes only when its branch is not the last copy."""
+class TheExternalAnchorRule(Retire):
+    """A `done` task's worktree goes only when something outside the fleet's own
+    branches holds a copy of what it built. Every `siana/*` branch is one `git
+    branch -D` from gone, so none of them is somewhere work has been left."""
 
-    def test_finished_work_that_landed_nowhere_is_refused(self):
+    def test_finished_work_anchored_nowhere_is_refused(self):
         worktree = self.dispatched()
         self.commit_in(worktree)
         self.tasks("done", "make-thing", "--reason", "built it")
-        text = self.assertRefused(self.retire(), "reachable from no other ref",
-                                  "its only copy")
-        self.assertIn("land it", text)
+        text = self.assertRefused(self.retire(),
+                                  "reachable from no ref outside the fleet")
+        self.assertIn("land it or publish it", text)
         self.assertTrue(os.path.isdir(worktree))
+
+    def test_the_qa_branch_cut_from_the_ship_branch_is_not_an_anchor(self):
+        # The live false positive, reproduced exactly (QA, 2026-08-28). SIANA
+        # dispatches QA with the ship branch as its base, so `siana/qa-<id>` is
+        # created at the ship head. Counting any `refs/heads` ref made every ship
+        # branch read as landed from the moment its own review started - which is
+        # to say from before it had landed anywhere at all.
+        worktree = self.dispatched()
+        self.commit_in(worktree)
+        self.tasks("done", "make-thing", "--reason", "built it")
+        self.git("worktree", "add", "-q", "-b", "siana/qa-make-thing",
+                 self.at("wt", "qa-make-thing"), "siana/make-thing")
+        self.assertRefused(self.retire(), "reachable from no ref outside the fleet",
+                           "QA is cut from the ship")
+        self.assertTrue(os.path.isdir(worktree))
+
+    def test_a_branch_outside_the_fleet_namespace_is_an_anchor(self):
+        # What is excluded is `refs/heads/siana/*` and not `refs/heads`. A branch
+        # cut deliberately to hold this work is a second copy, and the rule has to
+        # be able to say so, or a merge would be the only thing that ever satisfied
+        # it and the captain would have no way to keep work without landing it.
+        worktree = self.dispatched()
+        head = self.commit_in(worktree)
+        self.tasks("done", "make-thing", "--reason", "built it")
+        self.git("branch", "keep/make-thing", "siana/make-thing")
+        self.assertAccepted(self.retire())
+        self.assertFalse(os.path.exists(worktree))
+        self.assertEqual(self.assertBranch(), head)
 
     def test_work_merged_into_the_default_branch_may_be_retired(self):
         worktree = self.dispatched()
@@ -285,10 +375,12 @@ class TheLandingRule(Retire):
         self.assertFalse(os.path.exists(worktree))
         self.assertEqual(self.assertBranch(), head)
 
-    def test_work_reachable_from_any_other_ref_may_be_retired(self):
-        # Merged is the usual way this is met, but the rule is reachability and
-        # not merge: work fetched onto a remote-tracking ref is equally not a
-        # last copy, and stating the rule that way is what makes it testable.
+    def test_work_pushed_to_a_remote_may_be_retired_under_its_own_name(self):
+        # Merged is one way this is met, never the only one: a gated ship task comes
+        # back published and unmerged, and the copy on the remote is a copy. The
+        # exclusion is of *local* `siana/*` branches only, so a remote-tracking ref
+        # spelled with the same name is still an anchor, which is the whole
+        # difference between "landed" and "exists somewhere else".
         worktree = self.dispatched()
         head = self.commit_in(worktree)
         self.tasks("done", "make-thing", "--reason", "built it")
@@ -296,21 +388,21 @@ class TheLandingRule(Retire):
         self.assertAccepted(self.retire())
         self.assertFalse(os.path.exists(worktree))
 
-    def test_a_stash_is_not_somewhere_work_has_landed(self):
+    def test_a_stash_is_not_an_anchor(self):
         # A stash entry is parented on the head it was taken from, so counting
-        # `refs/stash` as another ref would read every stashed branch as landed on
+        # `refs/stash` as another ref would read every stashed branch as anchored on
         # the strength of something its own minion was in the middle of.
         worktree = self.dispatched()
         self.commit_in(worktree)
         self.write(worktree, "b.txt", "second thoughts\n")
         self.git("stash", "push", "-q", "-m", "mid-thought", cwd=worktree)
         self.tasks("done", "make-thing", "--reason", "built it")
-        self.assertRefused(self.retire(), "reachable from no other ref")
+        self.assertRefused(self.retire(), "reachable from no ref outside the fleet")
         self.assertTrue(os.path.isdir(worktree))
 
     def test_work_that_lands_nothing_is_retired_without_argument(self):
         # Scout and QA branches sit at whatever they were cut from, so the base
-        # itself satisfies the rule and neither needs landing to be tidied away.
+        # anchors them and neither needs landing to be tidied away.
         worktree = self.finished()
         self.assertAccepted(self.retire())
         self.assertFalse(os.path.exists(worktree))
