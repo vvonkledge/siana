@@ -21,6 +21,9 @@ and the line between those two is the project's whole design.
 
 ## How your work is checked
 
+Every ship task here is validated by a pipeline you drive, and the last section of
+this file is how you drive it. The first thing a run of it executes is the suite:
+
     just test
 
 About a minute. It drives the pure mechanics in-process and drives the commands as
@@ -70,19 +73,24 @@ this list is judgment and lives only here.
   to the home from here would edit the fleet you are running inside.
 - Never edit `CHANGELOG.md` or any file marked auto-generated.
 
-## When a brief sends you through the pipeline
+## The pipeline
 
-**This project's routine rigor is `just test`, and your task's `verify` says so.**
-Run it, make it pass, and report. That is the whole of what most ship work here
-needs.
+**Every ship task in this project is validated by `siana-pipeline`.** The captain's
+registry record for `siana` carries `pipeline: true`, and that field is what makes a
+driven pipeline the rigor here rather than something a brief opts into. SIANA queues
+ship work with `verify: siana-pipeline check`, and `check` reads what a run recorded
+instead of starting one. So no brief has to ask for this, and none does. If you are
+shipping, you are driving a run, and work that never reached a passing one cannot
+verify.
 
-`siana-pipeline` is a different thing and it is not the default. It is this distro's
-own validation pipeline: it runs the project's `ship` command and then puts an agent
-on your diff, so every finding costs a review round. It runs when a brief explicitly
-asks for it, and never because this section exists. If your brief does not mention
-it, you are not driving one.
+A run is two steps, in that order. First it executes this project's own `ship`
+command, which is the `just test` above: exact, about a minute, and yours to get
+green before you spend a run on it. Then it puts an agent on your diff, read against
+your brief and against these orders. That second step is why the rigor is a pipeline
+and not a command: it is judgment, it costs tokens, and every finding it raises costs
+you another round.
 
-When your brief does ask for it, the rest of this section is how it behaves.
+The rest of this section is how a round behaves.
 
 ### A round
 
