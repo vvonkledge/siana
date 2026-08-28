@@ -25,7 +25,7 @@ nothing here has been run on an operating system other than macOS.
 
 | Tool       | Verified   | Why it is needed                                      |
 | ---------- | ---------- | ----------------------------------------------------- |
-| `python3`  | 3.13.13    | `siana-dispatch`, `siana-watch` and `siana-owe`       |
+| `python3`  | 3.13.13    | every `siana-*` command but `siana` and `siana-brief` |
 | `bash`     | 5.3.9      | `siana`, `siana-brief`, and the recipes in `justfile` |
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
@@ -98,9 +98,9 @@ not written here. `datafile` creates each on its first append, so a contract wit
 `.jsonl` beside it is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
-`siana-brief`, `siana-watch`, `siana-owe`. They are links, so a `git pull` here
-updates the commands with no reinstall. It does not update the home; `just upgrade`
-does that.
+`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-publish`,
+`siana-reap`. They are links, so a `git pull` here updates the commands with no
+reinstall. It does not update the home; `just upgrade` does that.
 
 ### The tasks pi package
 
