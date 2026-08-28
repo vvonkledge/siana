@@ -267,6 +267,32 @@ nothing. Worth one look before a project's first publish.
 Then it stops, and the merge is the captain's. Report the merge request; do not merge
 it because the checks are green.
 
+## Reaping
+
+    siana-reap <handle>          # report only, nothing is touched
+    siana-reap <handle> --yes    # remove what has landed
+
+Every rejection adds a link: the ship branch, the QA branch that rejected it, the fix
+branch cut from the ship branch, and the QA branch that reads the fix. Dispatch
+refuses onto a worktree that is already there, so left alone this blocks work rather
+than merely accumulating.
+
+**Landed is the only thing that authorises a removal**, and it is asked two ways
+because one is not enough. A branch contained in `origin/<target>` landed by merge or
+fast-forward. A branch whose merge request the forge reports as merged landed too,
+and that is the only answer that survives a squash or a rebase - there the commits
+that landed carry different hashes, and no ancestry test will ever say yes again.
+
+A task's `done` is not one of those ways and never will be. It says a minion
+finished. It says nothing about whether anyone merged the result.
+
+Three things are kept whatever the forge says: a branch a minion is working on, the
+branch that minion was cut from, and any worktree holding uncommitted changes. And a
+forge it cannot reach answers "kept", never "landed", because where the consequence
+is a deletion, "I could not tell" and "yes" must not be the same answer.
+
+Run it without `--yes` first. It prints every branch and why it was kept.
+
 ## When the rigor is a gate
 
 Some projects deliver through a validation pipeline the minion drives, rather than a
@@ -459,8 +485,9 @@ they were away as one they had already approved.
 
 ## What is not wired yet
 
-Nothing runs `siana-publish` for you. It is yours to call when you reconcile, on a
-QA task that came back `done`. A watcher that published on its own would be deciding
+Nothing runs `siana-publish` or `siana-reap` for you. Both are yours to call when
+you reconcile: publish when a QA task comes back `done`, reap when you notice a
+project's branches piling up. A watcher that published on its own would be deciding
 that a verdict is enough, which is a decision and not mechanics.
 
 The captain's standing preferences have no store. They live in this file, which you
