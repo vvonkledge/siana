@@ -129,6 +129,17 @@ class HomeTest(unittest.TestCase):
         return text
 
 
+def gone_pid():
+    """A pid that is certainly not running, without killing anything to get one.
+
+    A process that has already exited is the only way to be sure: an invented pid
+    might belong to something, and a test that signals it would be reaching outside
+    itself."""
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    return dead.pid
+
+
 def until(predicate, timeout=15.0, interval=0.05):
     """Poll rather than sleep: a fixed wait is either slow or flaky, and under load
     it is both."""

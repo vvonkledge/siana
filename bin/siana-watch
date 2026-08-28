@@ -19,12 +19,18 @@ recovers the whole picture. Never make this the report.
 **Running this is the captain's autonomy grant.** SIANA reconciles and dispatches
 ready work when poked, so while this runs the fleet advances without the captain in
 the room. The grant is this process: it is given by starting it and withdrawn by
-stopping it, which is why it lives nowhere else. No flag, no registry field, and no
-record outlives it, so a grant can never be inherited by a session the captain did
-not choose to leave running.
+stopping it, and no flag and no registry field can confer it.
+
+What outlives the process is a status record at `$SIANA_HOME/watch`, and it is only
+ever evidence about a process. Nothing reads it as permission: `--status` asks the
+operating system whether the recorded process is still here and still this command
+before it calls anything running, so a record cannot hand a grant to a session the
+captain did not choose to leave running. What it adds is a name for what stopped,
+which a captain looking at a silent fleet cannot otherwise get.
 
 Usage:
     siana-watch [--interval S]
+    siana-watch --status
 
 It runs until interrupted. SIANA's session is found through `$SIANA_HOME/session`,
 written by `siana` at startup, so this must be started after SIANA is up.
@@ -33,7 +39,9 @@ written by `siana` at startup, so this must be started after SIANA is up.
 import argparse
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import time
 
@@ -93,15 +101,27 @@ class Herdr:
         self.path, self.timeout = os.path.expanduser(path), timeout
 
     def call(self, method, **params):
+        # A socket this cannot even construct is herdr being unreachable like any
+        # other: out of descriptors is exactly the state where a bare traceback
+        # would end the watcher without telling the captain what to do about it.
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(self.timeout)
-            s.connect(self.path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError as e:
             die(f"herdr is not reachable at {self.path}: {e}",
                 "the session SIANA runs in lives in herdr; start it first",
                 kind=Unreachable)
-        with s:
+        # Held by the `with`, so a connect that fails still closes it. This is the
+        # one path that repeats: while herdr is away, the loop reconnects every tick
+        # for the whole detection grace, and a descriptor left for the garbage
+        # collector on that path is the only place they accumulate.
+        with sock as s:
+            try:
+                s.settimeout(self.timeout)
+                s.connect(self.path)
+            except OSError as e:
+                die(f"herdr is not reachable at {self.path}: {e}",
+                    "the session SIANA runs in lives in herdr; start it first",
+                    kind=Unreachable)
             try:
                 s.sendall((json.dumps({"id": "siana-watch", "method": method,
                                        "params": params}) + "\n").encode())
@@ -152,6 +172,199 @@ def read_session(home):
             "nothing can wake a session herdr does not host; restart SIANA inside",
             "herdr if you want the fleet to advance while you are away")
     return pane
+
+
+# Where this process records that it is the grant. Not part of an install and never
+# written by anything else: `siana-watch` is the only writer, and `--status` is the
+# only reader that matters.
+GRANT = "watch"
+
+
+def stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def process_command(pid):
+    """What `ps` says that pid is running, or "" when it says nothing.
+
+    Identity, not liveness. Pids are reused, so a live pid is not a live grant: the
+    process wearing it has to still be the watcher that recorded it. `siana` asks
+    the same question of its own session pid, and asks it the same way."""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip()
+
+
+def read_grant(path):
+    """The recorded grant, or None when there is none.
+
+    A record that will not parse refuses rather than reading as absent. "No watcher"
+    and "a watcher whose record nobody can read" call for opposite things from the
+    captain, and guessing the first would report an uncovered fleet that may be
+    covered, or hand the record to a second watcher while the first still runs."""
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        die(f"the watcher status at {path} cannot be read: {e}",
+            "nothing here can say whether the fleet is being watched; read that",
+            "file, then remove it and start `siana-watch` again")
+    if not isinstance(rec, dict) or rec.get("state") not in ("running", "failed"):
+        die(f"the watcher status at {path} is not a record this wrote",
+            f"it says its state is {(rec or {}).get('state')!r} if it says anything;",
+            "read it, then remove it and start `siana-watch` again")
+    return rec
+
+
+def grant_alive(rec):
+    """Whether that record's process is still this watcher, and why not when it is
+    not. Two questions and never one: the pid answers whether something is there,
+    and the command answers whether it is the thing that recorded this."""
+    pid = rec.get("pid")
+    if not isinstance(pid, int):
+        return False, f"the record names no pid, only {pid!r}"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, f"pid {pid} is gone"
+    except PermissionError:
+        pass          # Alive and someone else's, which the command settles below.
+    except OSError as e:
+        return False, f"pid {pid} cannot be asked about: {e}"
+    was = rec.get("command") or ""
+    seen = process_command(pid)
+    if not was:
+        # Refused at claim time, so only a hand-edited record reaches this. Without
+        # the command there is nothing to separate the watcher from whatever else
+        # landed on that pid, and unverifiable is never healthy.
+        return False, f"the record cannot say what pid {pid} was, so nothing can say"
+    if seen != was:
+        return False, (f"pid {pid} is now {seen or 'a process ps will not name'}, "
+                       "not the watcher that recorded it")
+    return True, ""
+
+
+def _staged(path, record):
+    """The record written beside its destination, so it lands whole or not at all.
+    A status file caught half-written would read as a fault in a fleet that is
+    fine."""
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(record, f, indent=2)
+        f.write("\n")
+    return tmp
+
+
+def claim_grant(home, pane):
+    """Record this process as the grant, and refuse when another watcher holds it.
+
+    `os.link` refuses an existing destination, so two watchers started together
+    cannot both come away believing they are the only one. Two would poke SIANA
+    twice for every report, and this file could only ever describe one of them, so
+    the captain would be told about a watcher while another ran unaccounted for."""
+    path = os.path.join(home, GRANT)
+    command = process_command(os.getpid())
+    if not command:
+        die(f"`ps` says nothing about this process (pid {os.getpid()})",
+            "the record names what this process is so that a later process wearing",
+            "the same pid cannot be mistaken for a live grant; without it, nothing",
+            "could tell them apart, and a grant nobody can verify is worse than no",
+            "grant at all")
+    held = read_grant(path)
+    if held:
+        live, why = grant_alive(held)
+        if live:
+            die(f"a watcher is already running (pid {held['pid']})",
+                "two would poke SIANA twice for every report, and only one of them",
+                f"could be recorded; stop that one first, or read {path}")
+        # The record it left is the only account of what stopped it, so it is said
+        # here rather than quietly overwritten.
+        print(f"replaced a watcher record that had stopped: {why or 'no reason'}",
+              file=sys.stderr, flush=True)
+        os.unlink(path)
+    tmp = _staged(path, {"state": "running", "pid": os.getpid(), "command": command,
+                         "pane": pane, "started": stamp()})
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        die("another watcher claimed the record while this one was starting",
+            "nothing was started here; ask `just doctor` which one is running")
+    finally:
+        os.unlink(tmp)
+    return path
+
+
+def fail_grant(home, reason):
+    """Leave what stopped this watcher where `doctor` will find it.
+
+    The captain is away - that is the whole point of the watcher - so the refusal
+    printed on the way out goes to a screen nobody is reading. This is the same
+    words, in the one place someone will look when the fleet has gone quiet."""
+    path = os.path.join(home, GRANT)
+    try:
+        rec = read_grant(path)
+    except Refusal:
+        rec = None
+    rec = dict(rec or {})
+    rec.update(state="failed", stopped=stamp(), reason=reason)
+    os.replace(_staged(path, rec), path)
+
+
+def release_grant(home):
+    """Withdraw the grant by removing its record, because the grant was the process
+    and the process is stopping. A record left behind would read as a watcher that
+    died, and send the captain looking for something that never happened."""
+    try:
+        os.unlink(os.path.join(home, GRANT))
+    except FileNotFoundError:
+        pass
+
+
+def fault(lines):
+    """A problem in `doctor`'s own shape, on the stream `doctor` puts problems on."""
+    print(f"  stale   {lines[0]}", file=sys.stderr)
+    for line in lines[1:]:
+        print(f"          {line}", file=sys.stderr)
+    return 1
+
+
+def check_grant(home):
+    """Report whether the fleet is being watched. Reports, and never repairs.
+
+    Nothing here reads healthy off the file. The record names a process, and what
+    makes it a grant is that process still being alive and still being this command:
+    a status file is evidence about a watcher and never a substitute for one. That
+    is also why a stopped record is left exactly as it is. Removing it is deciding
+    the captain has read it, and only the captain can decide that."""
+    path = os.path.join(home, GRANT)
+    try:
+        rec = read_grant(path)
+    except Refusal as r:
+        return fault(r.lines)
+    if rec is None:
+        print("  ok      no watcher (the fleet does not advance unattended)")
+        return 0
+    if rec["state"] == "running":
+        live, why = grant_alive(rec)
+        if live:
+            print(f"  ok      watcher running (pid {rec['pid']}, pane "
+                  f"{rec.get('pane')}, since {rec.get('started')})")
+            return 0
+        return fault([
+            f"watcher stopped without saying why: {why}",
+            f"it recorded itself at {rec.get('started')} and left no reason, so it",
+            "was killed or the machine went down; the fleet stopped advancing then",
+            "and nothing said so",
+            f"read {path}, remove it, and start `siana-watch` again beside SIANA"])
+    said = (rec.get("reason") or "no reason recorded").splitlines()
+    return fault([f"watcher stopped at {rec.get('stopped')}: {said[0]}", *said[1:],
+                  f"remove {path} once you have read it, then start `siana-watch`",
+                  "again beside SIANA"])
 
 
 def pane_agent(h, pane):
@@ -237,20 +450,55 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--interval", type=float, default=2.0, metavar="S",
                     help="seconds between reads of the queue (default: 2)")
+    ap.add_argument("--status", action="store_true",
+                    help="report whether a watcher is running, and start nothing")
     args = ap.parse_args()
 
     home = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+    if args.status:
+        raise SystemExit(check_grant(home))
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(home, "tasks.jsonl")
     pane = read_session(home)
     h = Herdr(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
     confirm_alive(h, pane, home)
 
+    # A watcher left running in the background is stopped with `kill`, and that is
+    # the captain withdrawing the grant rather than a crash. Left on its default
+    # disposition, SIGTERM would end this before the record could be withdrawn, and
+    # `doctor` would report a watcher that died for every ordinary stop.
+    signal.signal(signal.SIGTERM, _interrupted)
+
+    # Recorded only once there is something to record: everything above refuses in
+    # front of the captain, who is still at the keyboard and can read it. What this
+    # file exists for is the failures that happen after they walk away.
+    grant = claim_grant(home, pane)
+    print(f"watching {tasks_file}\npoking   SIANA at {pane}\ngrant    {grant}",
+          flush=True)
+    try:
+        watch(h, pane, home, tasks_file, args.interval)
+    except KeyboardInterrupt:
+        release_grant(home)
+        raise
+    except BaseException as stop:
+        # Every other way out, a traceback included. The reason is left where doctor
+        # will find it, because the screen this printed on is one nobody is reading.
+        fail_grant(home, str(stop) if isinstance(stop, Refusal)
+                   else f"{type(stop).__name__}: {stop}")
+        raise
+
+
+def _interrupted(signum, frame):
+    raise KeyboardInterrupt
+
+
+def watch(h, pane, home, tasks_file, interval):
+    """The loop: read the queue, hold what it finds until SIANA can take it, and
+    stop the moment that pane is no longer SIANA's."""
     # Start at the end. Reports from before this began were SIANA's to reconcile in
     # the session that saw them, and replaying them would poke about work already
     # accounted for. The poke carries no content, so nothing is lost by not knowing
     # what happened while nothing was watching.
     offset = os.path.getsize(tasks_file) if os.path.exists(tasks_file) else 0
-    print(f"watching {tasks_file}\npoking   SIANA at {pane}", flush=True)
 
     # Reading the queue and delivering the poke are separate steps of one tick, so
     # neither can stall the other. Reports that land while SIANA is mid-turn keep
@@ -344,7 +592,7 @@ def main():
                     warned = True
                     print(f"waiting  SIANA has been mid-turn for {SETTLE_WARN_S:.0f}s; "
                           f"{len(pending)} report(s) held", file=sys.stderr, flush=True)
-        time.sleep(args.interval)
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

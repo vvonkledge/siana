@@ -417,9 +417,30 @@ id is the only durable handle back to a running minion: Herdr's labels are not
 unique, its workspace numbers shift when others close, and its pane metadata is
 wiped when its server restarts. Read the owner. Never search by label.
 
-The script stops and reports rather than guessing. A refused claim, an agent that
-never becomes ready, and a minion born blocked on a first-run trust dialog all come
-back to you with the task still held, so nothing is silently lost.
+Herdr's **agent names** are a third namespace, and unlike labels they are unique:
+the server enforces one live agent per name across every workspace, at
+`agent.start` and `agent.rename` alike, and a name can never be shaped like a pane
+id because it cannot contain `:`. Dispatch names the minion after its task and
+targets that name for the seconds between starting the agent and its prompt
+landing, which is safe because it holds the name for all of them: the name resolves
+to the agent it just started or to nothing, never to a different one. That is the
+whole of where a name is safe. It is not durable - it is freed when the agent
+exits and lost when the server restarts - so the pane id stays what the queue
+records and what you read a minion back by.
+
+One consequence for you: **a task id is also a Herdr agent name**, and Herdr's
+grammar is the narrower of the two. It allows `[a-z][a-z0-9_-]` up to 32
+characters where the queue allows 48. Dispatch refuses a longer id before it
+creates anything, so the fix is to re-add the task under a shorter one, which
+costs nothing at that point.
+
+The script stops and reports rather than guessing, and it says which side of the
+claim it stopped on. Before the agent is running, a refusal undoes itself: a claim
+the queue refuses and a start Herdr refuses both take the workspace back down and
+return the task to the queue, so re-dispatching is all it takes once you have fixed
+what the refusal named. After it is running, an agent that never becomes ready and
+a minion born blocked on a first-run trust dialog leave the task held, because by
+then the pane may hold work. Read it before you `reset` it.
 
 **Herdr tells you a process stopped, never that it succeeded.** Its `idle` covers
 both a minion that finished and a minion that asked a question in prose and stalled
@@ -462,16 +483,26 @@ graph now says is ready. Then report to the captain as you always do, in outcome
 A wake is not news. The captain never wants to hear that you were poked.
 
 The watcher only runs if the captain started it, and only for as long as they leave
-it running. Never assume it is running. If you have been woken, it is; if you have
-not, you cannot tell the difference between a quiet fleet and no watcher, so say
-nothing either way rather than implying the fleet is covered.
+it running. Never assume it is running: `just doctor` asks, and answers `watcher
+running`, `no watcher`, or a watcher that stopped with the reason it recorded on its
+way out. Ask before you tell the captain the fleet is covered, and ask when in-flight
+work has gone quiet, because a watcher that stopped looks exactly like a fleet with
+nothing to report.
+
+What that reading is worth is narrow. `watcher running` says a process was alive when
+doctor asked it, and that is evidence and never permission: it can stop a second
+later without anyone typing anything, and being woken is still the only proof it was
+running at the time. A watcher that stopped is a thing to report, not to fix. Its
+record is the only account of what happened while the captain was away, and removing
+it would be deciding they had read it.
 
 ## Authority while the captain is away
 
 Starting `siana-watch` is the captain's autonomy grant, and it is the only one there
-is. It is given by starting that process and withdrawn by stopping it, which is why
-it is recorded nowhere: a grant that outlived the process would be one the captain
-could leave behind by accident.
+is. It is given by starting that process and withdrawn by stopping it. The status
+record the watcher keeps is evidence about that process and never a grant of its own:
+every reader confirms the process before calling it running, so a grant cannot be
+inherited from a file or left behind by accident.
 
 **What it grants is narrow: dispatching work the queue already says is ready.** The
 task exists, its contract and its brief were written, and its dependencies are met.

@@ -16,14 +16,22 @@ and the line between those two is the project's whole design.
 - `tests/` is the suite. Standard-library `unittest`, no dependencies.
 - `VISION.md` says what the fleet is for. Read it before you argue with a design
   choice in here, because most of them are downstream of it.
+- `README.md` is the captain's install and operating guide. A change to what `init`
+  writes, to what a command is called, or to what a recipe refuses, changes it too.
 
 ## How your work is checked
 
     just test
 
-About 35 seconds. It drives the pure mechanics in-process and drives the commands as
+About a minute. It drives the pure mechanics in-process and drives the commands as
 real processes against a real `tasks` and `datafile`, because a stubbed store would
 only ever agree with the suite.
+
+Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
+and answers when it answers, so the answers that matter most - herdr slow, wrong, or
+gone - are the ones it could never be made to give on cue. Its transport is scripted
+and nothing else is: the commands still open a real socket and speak the real
+protocol. Script herdr there; never a store.
 
 If you change a behaviour a test names, change that test in the same commit and say
 why. If you add a behaviour worth having, add the test that fails without it. A test
@@ -46,6 +54,11 @@ machine that wrote it.
 - Minimum code that solves the problem. Nothing speculative.
 - Logic that can be exact belongs in a script; work that needs understanding belongs
   in an agent. Never mix them.
+
+The first two are exact, so `just test` checks them instead of trusting you to
+remember (`tests/test_conventions.py`). The column limit is for prose only: fenced
+and indented blocks are commands, and wrapping one changes what it does. The rest of
+this list is judgment and lives only here.
 
 ## Do not
 
