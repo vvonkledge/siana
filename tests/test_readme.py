@@ -27,23 +27,41 @@ ANCHOR = "Into the bindir"
 
 
 def linked_commands():
-    """The commands `just init` links, read out of the justfile.
+    """The commands `just init` links, read out of the justfile."""
+    with open(JUSTFILE, encoding="utf-8") as fh:
+        return parse_linked_commands(fh.read())
+
+
+def parse_linked_commands(justfile):
+    """The commands the `init` recipe of `justfile` links.
 
     Scoped to the `init` recipe because `uninstall` carries the same list, and the
     installing one is what the README is describing. A recipe ends where the next
     unindented line begins, which is how `just` itself reads one.
+
+    Takes the text rather than reading the path, so the guard below can be checked
+    against a justfile that violates it. A guard nothing exercises is how this
+    parser came to have one that did not guard.
     """
-    with open(JUSTFILE, encoding="utf-8") as fh:
-        lines = fh.read().splitlines()
+    lines = justfile.splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith("init:"))
     end = next((i for i, line in enumerate(lines[start + 1:], start + 1)
                 if line.strip() and not line[0].isspace()), len(lines))
     body = lines[start:end]
     loop = next(i for i, line in enumerate(body)
                 if re.match(r"\s*for c in siana\b", line))
-    # The loop that links, not some other loop over `c`. Checked rather than
-    # assumed, so a second one added above it cannot quietly take this over.
-    assert any("ln -sfn" in line for line in body[loop:]), body[loop]
+    # The loop that links, not some other loop over `c`. Scoped to this loop's own
+    # body - it ends at the `done` closing it, indented to match its `for` - because
+    # an `ln -sfn` anywhere later in the recipe would otherwise vouch for a loop that
+    # has none, which is precisely how a second loop added above would quietly take
+    # this over. A body that ends early, at a nested `done` or a reformat, fails this
+    # assert rather than passing on the wrong list.
+    indent = re.match(r"\s*", body[loop]).group()
+    close = next((i for i, line in enumerate(body[loop + 1:], loop + 1)
+                  if line == indent + "done"), len(body))
+    assert any("ln -sfn" in line for line in body[loop:close]), (
+        f"the first `for c in siana` loop in `init` does not link; point this "
+        f"parser at the one that does:\n{body[loop]}")
     names = re.search(r"for c in (.+?);\s*do", body[loop]).group(1)
     return names.split()
 
@@ -76,6 +94,34 @@ class Readme(unittest.TestCase):
         # substring search would find all eight in the word `siana-dispatch`.
         missing = [c for c in linked_commands() if f"`{c}`" not in paragraph]
         self.assertEqual(missing, [], f"\nnot named in README.md: {missing}")
+
+
+class LinkedCommands(unittest.TestCase):
+    """The parser's own guard, checked directly. It is meant to refuse a justfile
+    whose first `for c in siana` loop is not the linking one, and it landed on main
+    quietly accepting exactly that - the real loop further down answered for a decoy
+    above it. A guard is worth nothing if the answer is quietly "everything passes".
+    """
+
+    LINKING = ('    for c in siana siana-brief; do\n'
+               '        ln -sfn "$distro/bin/$c" "$bindir/$c"\n'
+               '    done\n')
+    DECOY = ('    for c in siana; do\n'
+             '        test -f "$distro/bin/$c"\n'
+             '    done\n')
+
+    def recipe(self, *blocks):
+        return "init:\n" + "".join(blocks) + "\nnext-recipe:\n    true\n"
+
+    def test_it_reads_the_names_off_the_linking_loop(self):
+        commands = parse_linked_commands(self.recipe(self.LINKING))
+        self.assertEqual(commands, ["siana", "siana-brief"])
+
+    def test_a_loop_that_does_not_link_is_refused(self):
+        # The regression: the decoy is measured instead, and the linking loop below
+        # vouches for it, so the README gets checked against one name in silence.
+        with self.assertRaises(AssertionError):
+            parse_linked_commands(self.recipe(self.DECOY, self.LINKING))
 
 
 if __name__ == "__main__":
