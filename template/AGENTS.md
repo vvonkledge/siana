@@ -283,6 +283,14 @@ which a push satisfies, while this asks whether the work landed. A branch whose
 worktree is still there is reported and skipped, so the two compose as retire then
 reap.
 
+**Remote branches are the forge's, not this fleet's.** Reap reads local refs only.
+Enable `delete_branch_on_merge` on the repository and the forge deletes the source
+branch when the pull request merges, server-side and with no worktree in the way.
+Asking the client side to do it does not work: git refuses to delete a branch a
+worktree still holds, so a `--delete-branch` at merge time fails whenever retire has
+not run yet. Three commands, one removal each: retire the worktree, reap the local
+branch, the forge the remote one.
+
 **Landed is the only thing that authorises a removal**, and it is asked two ways
 because one is not enough. A branch contained in `origin/<target>` landed by merge or
 fast-forward. A branch whose merge request the forge reports as merged landed too,
