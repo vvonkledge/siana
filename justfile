@@ -275,6 +275,18 @@ _contract-drift:
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    # No bytecode, from anything this recipe starts. It has to be set out here:
+    # discovery compiles a test module before a line of it runs, so the suite
+    # setting `sys.dont_write_bytecode` on itself is already too late for exactly
+    # the files that appeared. Exported rather than passed as `-B` so the commands
+    # the suite drives as processes inherit it too; a flag would stop at this
+    # interpreter.
+    #
+    # The litter is not untidiness. `siana-retire` refuses to remove a worktree
+    # holding ignored files, because git deletes those without a word and a `.pyc`
+    # and a `.env` look alike to it. That left every minion worktree on this project
+    # unretirable until a human cleared a `tests/__pycache__` by hand.
+    export PYTHONDONTWRITEBYTECODE=1
     # `-s tests` and no `-t` so the suite's own helpers import by name. Nothing is
     # installed to run these: they drive the commands where the mechanics are pure,
     # and drive them as processes against a real `tasks` and `datafile` where they
