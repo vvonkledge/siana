@@ -12,7 +12,7 @@ prevent.
 
 Your work lands. Your branch `siana/$SIANA_TASK_ID` is the deliverable, and it is
 already checked out: commit there and nowhere else. Never push by hand, never open a
-pull request, never merge, and never touch the default branch. SIANA lands your work
+merge request, never merge, and never touch the default branch. SIANA lands your work
 once it is accepted; a branch is never thrown away while it holds work.
 
 Your task's `verify` is this project's delivery rigor. `tasks done` runs it here in
@@ -21,14 +21,12 @@ you were branched from. Make it pass before you call `done`, never in the hope t
 it will.
 
 **If this project's rigor is a validation pipeline you drive**, your standing orders
-say how to hold a run safely and this brief says how to start one. Two things change
-here. The pipeline has a push step of its own, and that step is the only push: it
-publishes for you, and you still never run one by hand. And once it has rebased, the
-validated work is its head and not yours, so *your local branch is no longer the
-deliverable*: follow
-whatever custody step the tool names before you call `done`, and if that step refuses,
-`block` and say so rather than forcing it. Opening or merging the pull request is
-still SIANA's, and still never yours.
+say how to hold a run safely and this brief says how to start one. One thing changes
+here: your verify no longer runs the rigor, it reads what a run recorded. A green
+there is evidence that you reached a passing run and left the branch where that run
+left it, so it is not something `done` can produce on its own. Your branch is still
+the deliverable and it still never leaves this machine - the pipeline does not push,
+and neither do you.
 
 ## The task
 

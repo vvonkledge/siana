@@ -112,7 +112,8 @@ class Reports(HomeTest):
 
 
 class ReadSession(HomeTest):
-    """SIANA's pane id, which is the only durable handle back to its session."""
+    """SIANA's pane id and the harness in it: the only durable handle back to its
+    session, and the only record of which agent herdr should be seeing there."""
 
     def test_no_session_file_means_siana_is_not_running(self):
         with self.assertRaises(w.Refusal) as cm:
@@ -129,13 +130,21 @@ class ReadSession(HomeTest):
         self.assertIn("outside herdr", text)
         self.assertIn("4242", text)
 
-    def test_a_recorded_pane_is_returned(self):
+    def test_a_recorded_pane_and_harness_are_returned(self):
+        self.store("session", "SIANA_PID=4242", "SIANA_PANE=w3D:p2",
+                   "SIANA_HARNESS=claude")
+        self.assertEqual(w.read_session(self.home), ("w3D:p2", "claude"))
+
+    def test_a_session_written_before_there_was_a_choice_reads_as_pi(self):
+        # Not a default standing in for an unknown: the `siana` that wrote a file
+        # without the field could only ever have started pi, so that is what the
+        # file means rather than a guess at what it might have meant.
         self.store("session", "SIANA_PID=4242", "SIANA_PANE=w3D:p2")
-        self.assertEqual(w.read_session(self.home), "w3D:p2")
+        self.assertEqual(w.read_session(self.home), ("w3D:p2", "pi"))
 
     def test_whitespace_around_a_field_does_not_change_it(self):
-        self.store("session", "SIANA_PANE = w3D:p2 ")
-        self.assertEqual(w.read_session(self.home), "w3D:p2")
+        self.store("session", "SIANA_PANE = w3D:p2 ", "SIANA_HARNESS = claude ")
+        self.assertEqual(w.read_session(self.home), ("w3D:p2", "claude"))
 
 
 class GrantTest(HomeTest):
