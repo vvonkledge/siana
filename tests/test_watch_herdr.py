@@ -15,6 +15,7 @@ after the pane - which is exactly when it moves in life.
 import contextlib
 import io
 import os
+import signal
 import sys
 import time
 import unittest
@@ -50,6 +51,39 @@ class Watched:
         self.refusal, self.out, self.err = refusal, out, err
 
 
+class Signals:
+    """What the watcher installed, and one of those signals delivered where it lands.
+
+    Recorded rather than installed: `main` runs in this process, so a handler really
+    installed here would outlive the test that installed it and turn a later signal
+    to the suite into somebody else's KeyboardInterrupt."""
+
+    def __init__(self):
+        self.installed = {}
+
+    def install(self, signum, handler):
+        self.installed[signum] = handler
+        return signal.SIG_DFL
+
+    def deliver(self, signum):
+        """The signal arriving mid-sleep, which is where one sent to a background
+        watcher arrives.
+
+        A signal the watcher left on its default disposition installed nothing, and
+        the process it was sent to would end right here with no line of shutdown
+        run - so that is what this says, rather than letting the loop tick on as if
+        the signal had never been sent."""
+        name = signal.Signals(signum).name
+        handler = self.installed.get(signum)
+        if handler is None:
+            raise AssertionError(
+                f"{name} was left on its default disposition, so it ends the "
+                "watcher where it lands and nothing withdraws the grant")
+        handler(signum, None)
+        raise AssertionError(f"the {name} handler returned instead of stopping "
+                             "the watcher")
+
+
 class WatchTest(HomeTest):
     """A recorded SIANA session, and a herdr that answers on cue."""
 
@@ -59,6 +93,7 @@ class WatchTest(HomeTest):
         super().setUp()
         self.herdr = FakeHerdr().start()
         self.addCleanup(self.herdr.stop)
+        self.signals = Signals()
         self.store("session", "SIANA_PID=4242", f"SIANA_PANE={self.PANE}")
 
     def client(self):
@@ -68,7 +103,7 @@ class WatchTest(HomeTest):
         """A minion's terminal record landing in the queue, as `tasks` appends it."""
         return lambda: self.store("tasks.jsonl", {"id": task_id, "status": status})
 
-    def watch(self, grace=None, interval="0", interrupted=False):
+    def watch(self, grace=None, interval="0", interrupted=False, terminated=False):
         """One `siana-watch`, run until it stops.
 
         Every one of these ends in a refusal, because a watcher that returns is a
@@ -76,7 +111,11 @@ class WatchTest(HomeTest):
         script: a pane taken over, or a herdr that never comes back.
 
         `interrupted` is the other ending, the captain stopping it. The interrupt
-        lands where the loop sleeps, which is where a Ctrl-C lands in life."""
+        lands where the loop sleeps, which is where a Ctrl-C lands in life.
+
+        `terminated` is that same ending reached the way a background watcher is
+        stopped: the signal is delivered to whatever handler this run installed for
+        it, so a watcher that installed none stops the test rather than the loop."""
         out, err = io.StringIO(), io.StringIO()
         env = {"SIANA_HOME": self.home, "SIANA_TASKS_FILE": self.at("tasks.jsonl"),
                "HERDR_SOCKET_PATH": self.herdr.path}
@@ -86,6 +125,12 @@ class WatchTest(HomeTest):
                 sys, "argv", ["siana-watch", "--interval", interval]))
             if grace is not None:
                 stack.enter_context(mock.patch.object(w, "DETECT_GRACE_S", grace))
+            stack.enter_context(mock.patch.object(w.signal, "signal",
+                                                  self.signals.install))
+            if terminated:
+                stack.enter_context(mock.patch.object(
+                    w.time, "sleep",
+                    side_effect=lambda _s: self.signals.deliver(signal.SIGTERM)))
             if interrupted:
                 stack.enter_context(mock.patch.object(w.time, "sleep",
                                                       side_effect=KeyboardInterrupt))
@@ -97,7 +142,7 @@ class WatchTest(HomeTest):
             except w.Refusal as r:
                 refusal = r
             except KeyboardInterrupt:
-                if not interrupted:
+                if not (interrupted or terminated):
                     # The scripted herdr's backstop: this loop was never going to
                     # stop.
                     self.fail(f"the watcher never stopped, after "
@@ -405,6 +450,24 @@ class Grant(WatchTest):
         self.assertFalse(os.path.exists(self.at(w.GRANT)))
         code, said = self.status()
         self.assertEqual(code, 0)
+        self.assertIn("no watcher (the fleet does not advance unattended)", said)
+
+    def test_an_ordinary_kill_withdraws_the_grant_the_same_as_a_ctrl_c(self):
+        # `kill` with no signal is SIGTERM, and it is how a watcher left running in
+        # the background is stopped: the captain withdrawing the grant, never a
+        # crash. On its default disposition SIGTERM ends the process before the
+        # record can be withdrawn, and then every ordinary stop reads in `doctor` as
+        # a watcher that died - a false alarm on the most common path, in the one
+        # report this whole feature exists to make trustworthy. So the signal is
+        # delivered to what the watcher installed for it, and never to an interrupt
+        # of the test's own: with nothing installed, there is no shutdown to observe.
+        self.herdr.reply("agent.get", SIANA)
+
+        self.watch(terminated=True)
+
+        self.assertFalse(os.path.exists(self.at(w.GRANT)))
+        code, said = self.status()
+        self.assertEqual(code, 0, said)
         self.assertIn("no watcher (the fleet does not advance unattended)", said)
 
     def test_where_the_grant_is_recorded_is_said_at_the_start(self):

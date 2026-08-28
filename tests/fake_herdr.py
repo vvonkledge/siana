@@ -23,12 +23,21 @@ import socket
 import tempfile
 import threading
 
-# An `AF_UNIX` path is capped near 104 bytes, and a default macOS temp directory
-# already spends most of that. A home under `$TMPDIR` is therefore not somewhere a
-# socket can live: point `$TMPDIR` at anything nested and every herdr-facing test in
-# the suite errors in `setUp`, before a single behaviour is exercised. So the socket
-# gets its own short directory and nothing else moves.
-SOCKET_DIR = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+
+def socket_dir():
+    """A directory short enough for a socket to live in, whatever `$TMPDIR` says.
+
+    An `AF_UNIX` path is capped near 104 bytes, and a default macOS temp directory
+    already spends most of that. A home under `$TMPDIR` is therefore not somewhere a
+    socket can live: point `$TMPDIR` at anything nested and every herdr-facing test
+    in the suite errors in `setUp`, before a single behaviour is exercised. So the
+    socket gets its own short directory and nothing else moves.
+
+    Asked per socket rather than settled at import, so the answer is the one that
+    holds when a `FakeHerdr` is actually built - which is the only place the length
+    of `$TMPDIR` can hurt anyone, and the only place a test can hold this."""
+    return "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+
 
 # An answer meaning: take the request, then close without saying anything. It is how
 # herdr presents when its server stops mid-request, and it is the only way to reach
@@ -68,7 +77,8 @@ class FakeHerdr:
     MAX_CALLS = 500
 
     def __init__(self, path=None):
-        self._dir = None if path else tempfile.mkdtemp(prefix="herdr-", dir=SOCKET_DIR)
+        self._dir = (None if path else
+                     tempfile.mkdtemp(prefix="herdr-", dir=socket_dir()))
         self.path = path or os.path.join(self._dir, "herdr.sock")
         self.calls = []                       # (method, params), in order
         self._answers = {}
