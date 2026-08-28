@@ -34,8 +34,7 @@ Every pull request into `main` runs that same command on a clean runner, from
 ready to land until it is green, and a run that never started is not a pass. It
 installs what the suite drives - `just`, `uv`, `pi`, and pinned checkouts of `tasks`
 and `datafile` - so a green there says the suite passes somewhere other than the
-machine that wrote it. The check exists first on the branch that adds it, and will
-not appear on `main` until that branch lands.
+machine that wrote it.
 
 ## Conventions
 
