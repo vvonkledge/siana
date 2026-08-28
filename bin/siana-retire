@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""Retire a minion's worktree, once nothing is left in it that only it holds.
+
+A worktree outlives the minion that worked in it. Dispatch refuses to start a second
+minion while a stale one is still there, and it is right to: that tree is the one
+place uncommitted work can be sitting. So every re-dispatch and every finished task
+ends with the same manual step, and a manual `git worktree remove` is the wrong hand
+to leave it in. It deletes ignored files without a word (verified 2026-08-28: a
+`litter/` directory in a clean worktree is removed with exit 0), and ignored is where
+a `.env`, a local database and a tool's state directory live.
+
+This is mechanics, not judgment. SIANA has already decided the work in that tree is
+finished with. This only carries that decision out exactly, and refuses every way the
+decision could be wrong.
+
+Where the worktree is is never typed. The task says which project it belongs to, the
+captain's registry says where that project is, and the task id says which branch the
+minion was put on, so a path cannot be mistyped into a directory nobody meant. That
+is the same resolution a dispatch does, and it is deliberately not the whole of one:
+dispatch's own cleanup path assumes a worktree seconds old and therefore empty, and
+nothing here may inherit that assumption.
+
+Usage:
+    siana-retire <task-id>
+
+**The external anchor rule.** A `done` task's worktree is retired only when nothing
+on its branch exists in one place. Two questions answer that, and the first one is
+about what the branch added rather than what it holds.
+
+A task's record names the `base` its worktree was cut from. A branch holding no
+commit beyond that exact ref added nothing, and the base is therefore a second copy
+of every commit on it: removing the tree cannot lose work, whether the base is the
+default branch or another `siana/*` one. That is the whole of scout and QA work,
+which lands nothing and sits where it was cut from (verified 2026-08-28: the fleet's
+own `qa-<id>` branches are byte-identical to the ship head they were cut from). It
+says nothing about the work having merged or been published, because it is not asked
+about the base's own safety - only about whether this branch is holding anything the
+base is not.
+
+For whatever a branch did add, every one of those commits must be reachable from a
+ref outside `refs/heads/siana/*`. That anchor is the default branch, a tag, or any
+remote-tracking ref, so a pushed branch is anchored whether or not its pull request
+has merged - what is asked is whether a second copy exists, never whose hand put it
+there.
+
+Other `siana/*` branches are deliberately not anchors for commits a branch added. A
+QA task is dispatched with the ship branch as its base, so `siana/qa-<id>` is created
+at the ship head, and counting it would report every ship branch as anchored from the
+moment its review started - which is exactly when it has landed nowhere (verified
+2026-08-28: this project's own unlanded ship branch read as anchored by the QA branch
+cut from it). Work whose only copies are fleet branches is one `git branch -D` away
+from gone. The recorded base is not a hole in that: it is the one fleet ref this
+branch is known to have come from, rather than any ref that happens to sit at the
+same commit, and it answers only for commits this branch never made.
+
+The rule is only for `done`, because for a task going back out to a new minion the
+branch is not a last copy, it is the delivery mechanism: a worktree cut from an
+existing branch starts at that branch's own head, so committed work is in front of
+the next minion rather than lost.
+
+Nothing here ever touches the branch. Removing a worktree leaves it exactly where it
+was, which is what makes reset-and-re-dispatch safe, and it is why this command has
+no force override: every refusal below is either work that has no second copy, or a
+state this cannot read, and both are SIANA's to resolve rather than this script's to
+overrule.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching siana-dispatch."""
+
+    def __init__(self, message: str, hints=()):
+        self.message, self.hints = message, tuple(hints)
+        super().__init__(1)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def die(message: str, *hints: str):
+    raise Refusal(message, hints)
+
+
+def fold(store: str, key: str):
+    """Fold an append-only datafile store into {key: record}.
+
+    Read-only, exactly as siana-dispatch reads it: the last line for an id wins and a
+    tombstone is an absence, because a dropped record read as a record with every
+    field missing would resolve to a project with no path."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def git(path: str, *args: str):
+    """git, run in `path`. Returns (returncode, stdout, stderr), all decided by the
+    caller: several of these are questions whose "no" is a normal answer."""
+    p = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                       check=False)
+    return p.returncode, p.stdout, p.stderr.strip()
+
+
+def same_path(a: str, b: str) -> bool:
+    """realpath both sides. git reports a worktree by its real path while herdr
+    recorded the one it was created under, and on macOS those differ for anything
+    below /tmp or /var. Comparing them as typed reads a healthy pair as ambiguous."""
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def project_of(task: dict, home: str, tasks_file: str) -> dict:
+    """Task to project directory, through the captain's registry.
+
+    Narrower than siana-dispatch's resolve on purpose: orders and the two verify
+    commands say how to start a minion, and none of them says anything about whether
+    a tree can be torn down. What is shared is the part that matters here, that a
+    path is looked up and never guessed."""
+    handle = task.get("project")
+    if not handle:
+        die(f"{task['id']} carries no project",
+            "the project is what says where this minion's worktree lives, so",
+            "without one there is nothing to look in and nothing to remove")
+
+    registry = os.path.join(home, "projects.jsonl")
+    if not os.path.isfile(os.path.join(home, "schema-projects.yaml")):
+        die(f"no project registry at {registry}",
+            "the registry is what turns a project handle into a directory",
+            "run `just init` in the distro")
+    projects = fold(registry, "handle")
+    if handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {handle}",
+            f"known handles: {known}",
+            f"the captain adds projects to {registry}; a path is never guessed")
+    cfg = projects[handle]
+
+    path = os.path.abspath(os.path.expanduser(str(cfg["path"])))
+    if not os.path.isdir(path):
+        die(f"{handle} points at {path}, which is not a directory",
+            f"fix the `path` for {handle} in {registry}")
+
+    # Same default as dispatch, for the same reason: a record predating the field
+    # reads as isolated, because isolation withheld is the direction that loses work.
+    if not cfg.get("worktree", True):
+        die(f"{handle} has worktree isolation off, so {task['id']} never had one",
+            "its minion worked in the project tree itself, which is the captain's",
+            "checkout and is never torn down by anything in this fleet")
+
+    if git(path, "rev-parse", "--git-common-dir")[0] != 0:
+        die(f"{handle} is at {path}, which is not a git repository",
+            "the registry says its minions get worktrees, so either the record is",
+            f"wrong or the checkout is gone; look before touching {tasks_file}")
+    return {"handle": handle, "path": path}
+
+
+# Every local minion branch this fleet has ever cut. Not a namespace work can be
+# left in: see "the external anchor rule".
+FLEET = "refs/heads/siana/"
+
+
+def worktrees(repo: str):
+    """Every worktree git has registered for `repo`, in the order it lists them.
+
+    Parsed once because two different questions are asked of it - which tree holds a
+    branch, and what is in the tree the queue recorded - and the second only ever
+    gets asked because the first came back empty."""
+    rc, out, err = git(repo, "worktree", "list", "--porcelain")
+    if rc != 0:
+        die(f"cannot list the worktrees of {repo}: {err}")
+    blocks, current = [], {}
+    for line in out.splitlines():
+        if not line.strip():
+            if current:
+                blocks.append(current)
+                current = {}
+            continue
+        # `detached` and `bare` are flags on their own line, so they land as a key
+        # with an empty value: ask whether the key is there, never whether it is set.
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def on_branch(blocks, branch: str):
+    """The one worktree checked out on `branch`, and whether it is the main one.
+
+    git allows a branch in at most one worktree at a time, so this is a lookup and
+    never a choice. The first block `git worktree list` prints is the repository's
+    own checkout; a minion branch found there is the captain's tree with a minion's
+    branch in it, which is a state to report and never one to remove."""
+    for index, block in enumerate(blocks):
+        if block.get("branch") == f"refs/heads/{branch}":
+            return block.get("worktree"), index == 0
+    return None, False
+
+
+def recorded_tree(blocks, recorded: str):
+    """The registered worktree the queue says this task worked in.
+
+    Asked only once the lookup by branch has failed, and matched by path because that
+    is the state it exists to catch: a tree whose head has been moved off `siana/<id>`
+    - detached by a minion reading a commit, or moved by a pipeline - is invisible to
+    a lookup by branch while still sitting on disk holding whatever is in it. Without
+    this the branch lookup's empty answer reads as `already retired`, which is a
+    statement about the world that is not true."""
+    if not recorded:
+        return None
+    for block in blocks:
+        if block.get("worktree") and same_path(block["worktree"], recorded):
+            return block
+    return None
+
+
+def unanchored(repo: str, branch: str):
+    """Commits reachable from `branch` and from no ref outside the fleet.
+
+    Exclusion is what makes this fail closed: a ref this cannot see makes the answer
+    longer, never shorter, so the worst a missed ref does is refuse a retirement that
+    would have been safe. A repository whose only refs are fleet branches has nothing
+    to exclude, and every commit on this one counts, which is correct - work that
+    exists in one place is work that exists in one place."""
+    # Branches, remotes and tags: the three namespaces where work is deliberately
+    # kept. `refs/stash` is left out on purpose, because a stash entry is parented on
+    # the head it was taken from, so counting it would read unanchored work as
+    # anchored on the strength of something its own minion was in the middle of.
+    rc, out, err = git(repo, "for-each-ref", "--format=%(refname)",
+                       "refs/heads", "refs/remotes", "refs/tags")
+    if rc != 0:
+        die(f"cannot read the refs of {repo}: {err}")
+    # Dropping the whole of `refs/heads/siana/` drops this branch with it, which is
+    # the point: no minion branch anchors another, and this one anchors nothing.
+    # A remote-tracking ref under the same name is a different repository's copy and
+    # still counts.
+    others = [r for r in out.split() if not r.startswith(FLEET)]
+    rc, out, err = git(repo, "rev-list", "--max-count=1", branch, "--not", *others)
+    if rc != 0:
+        die(f"cannot tell whether {branch} is anchored anywhere: {err}")
+    return out.split()
+
+
+def beyond_base(repo: str, branch: str, base):
+    """Commits on `branch` that the ref it was cut from does not already hold.
+
+    `None` when that question cannot be asked, which is deliberately not the same as
+    an empty answer: no base recorded, a base this repository no longer has, a base
+    that is not a ref at all, or a base that is this branch itself. In each of those
+    "nothing was added" would mean something other than "the base holds it all", and
+    this limb of the rule may only ever shorten the work by proving a second copy is
+    there. A raw sha reads as no ref on purpose - a commit id keeps nothing, so a
+    branch sitting at one is still a branch sitting alone."""
+    if not base:
+        return None
+    rc, out, _ = git(repo, "rev-parse", "--symbolic-full-name", "--verify",
+                     "--quiet", base)
+    named = out.strip()
+    if rc != 0 or not named or named == f"refs/heads/{branch}":
+        return None
+    rc, out, err = git(repo, "rev-list", "--max-count=1", branch, "--not", named)
+    if rc != 0:
+        die(f"cannot tell what {branch} added to {base}: {err}")
+    return out.split()
+
+
+def loose_work(worktree: str):
+    """What removing this tree would destroy, split by how it would read to a human.
+
+    `git worktree remove` refuses on the first two and silently deletes the third,
+    so the third is the whole reason this check is here rather than left to git."""
+    # `--untracked-files=all` is not for the detail, it is because `git status`
+    # honours `status.showUntrackedFiles`, and a `no` in any config file - a common
+    # large-repo setting, valid globally or per repository - empties the untracked
+    # *and* the ignored bucket while still exiting 0 (verified 2026-08-28). Under
+    # that config this check saw nothing and removed the tree, which is the exact
+    # harm it exists to prevent. The flag overrides every config source there is.
+    rc, out, err = git(worktree, "status", "--porcelain", "--ignored",
+                       "--untracked-files=all")
+    if rc != 0:
+        die(f"cannot read the state of {worktree}: {err}")
+    tracked, untracked, ignored = [], [], []
+    for line in out.splitlines():
+        code, name = line[:2], line[3:]
+        bucket = ignored if code == "!!" else untracked if code == "??" else tracked
+        bucket.append(name)
+    return tracked, untracked, ignored
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("task_id", help="the task whose worktree is to be retired")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+    tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(home, "tasks.jsonl")
+
+    if not os.path.isfile(tasks_file):
+        die(f"no task store at {tasks_file}", "run `just init` in the distro")
+    task = fold(tasks_file, "id").get(args.task_id)
+    if task is None:
+        die(f"no such task: {args.task_id}",
+            f"run `tasks --file {tasks_file} list` to see the queue")
+
+    # A held task is the one status where the tree is somebody's desk. Reclaiming it
+    # is `tasks reset`, and that stays a separate decision because it is the moment
+    # SIANA is meant to look at the worktree, not the moment to have it removed.
+    status = task.get("status")
+    if status == "doing":
+        die(f"{args.task_id} is still held by {task.get('owner') or 'a minion'}",
+            "a minion is working in that tree, or was when the queue last heard",
+            "`siana-dispatch --check` says whether it is still alive; if it is gone,",
+            f"look at the tree, then `tasks --file {tasks_file} reset {args.task_id}`",
+            "and run this again")
+
+    project = project_of(task, home, tasks_file)
+    repo, branch = project["path"], f"siana/{args.task_id}"
+
+    if git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")[0] != 0:
+        die(f"{project['handle']} has no branch {branch}",
+            "there is no minion worktree to retire under that name: this task was",
+            "never dispatched with isolation, or the branch was landed and deleted",
+            "and its worktree went with it")
+
+    # The queue's own record of where that minion worked. Read before the lookup by
+    # branch is judged, because it is what tells a retired tree from a moved head.
+    recorded = task.get("cwd")
+    blocks = worktrees(repo)
+    path, is_main = on_branch(blocks, branch)
+    if path is None:
+        stray = recorded_tree(blocks, recorded)
+        if stray is not None:
+            where = (f"detached at {stray.get('HEAD') or 'a head it does not name'}"
+                     if "detached" in stray else
+                     f"checked out on {stray.get('branch') or 'nothing this can read'}")
+            die(f"{args.task_id} recorded its work in {stray['worktree']}, "
+                f"which git says is {where} and not on {branch}",
+                "that tree is still there, and this was asked about a different one",
+                "a commit made on a detached head is on no branch at all, so nothing",
+                "here can say what removing that tree would take with it, and moving",
+                "a head back is never this command's to do",
+                f"look at it with: git -C {stray['worktree']} status",
+                "nothing has been removed")
+        die(f"no worktree is checked out on {branch}",
+            "it has already been retired; the branch is still there and still holds",
+            "every commit made in it")
+    if is_main:
+        die(f"{branch} is checked out in {repo} itself",
+            "that is the captain's own checkout of this project and not a minion's",
+            "worktree; nothing in this fleet tears that down")
+    if not os.path.isdir(path):
+        die(f"git records a worktree for {branch} at {path}, which is not there",
+            "the tree is gone and only its registration is left; clear that with",
+            f"`git -C {repo} worktree prune`, which touches no working tree")
+
+    # Disagreement is not a detail to reconcile: one of the two is describing a tree
+    # this command was not asked about, and there is no way from here to tell which.
+    if recorded and not same_path(recorded, path):
+        die(f"{args.task_id} records its work in {recorded}, "
+            f"but {branch} is checked out at {path}",
+            "these cannot both be the tree this task was dispatched into, and",
+            "which one is stale is not something git or the queue can say",
+            "look at both before anything is removed")
+
+    findings = []
+    if status == "done":
+        # See "the external anchor rule" above. Only for `done`: work going back out
+        # to a new minion has the branch as its delivery mechanism, not a last copy.
+        # The base limb comes first because it is the cheaper truth: a branch that
+        # added nothing is held in full by the ref it was cut from, and asking the
+        # rest of the repository about it could only ever agree.
+        added = beyond_base(repo, branch, task.get("base"))
+        if (added is None or added) and unanchored(repo, branch):
+            # `--not <base>` only when the base answered, because a base this
+            # repository cannot resolve is exactly why `added` is None, and a hint
+            # that names it would hand SIANA a command git refuses to run.
+            reading = f"read it with: git -C {repo} log --oneline {branch}"
+            if added:
+                reading += f" --not {task['base']}"
+            findings.append((
+                f"{branch} holds commits reachable from no ref outside the fleet",
+                ["this task is done and what it built exists only on minion branches",
+                 "in this repository, so nothing outside the fleet holds a copy;",
+                 "land it or publish it, then retire the tree it was built in",
+                 "a sibling siana/* branch is not an anchor: QA is cut from the ship",
+                 "branch, so it holds the same commits and lands none of them",
+                 "only this task's own recorded base counts, and only for the commits",
+                 "this branch made on top of it",
+                 reading]))
+    tracked, untracked, ignored = loose_work(path)
+    if tracked:
+        findings.append((f"{len(tracked)} tracked file(s) modified in {path}",
+                         [f"  {n}" for n in tracked[:20]]
+                         + (["  ..."] if len(tracked) > 20 else [])))
+    if untracked:
+        findings.append((f"{len(untracked)} untracked file(s) in {path}",
+                         [f"  {n}" for n in untracked[:20]]
+                         + (["  ..."] if len(untracked) > 20 else [])))
+    if ignored:
+        findings.append((f"{len(ignored)} ignored path(s) in {path}",
+                         [f"  {n}" for n in ignored[:20]]
+                         + (["  ..."] if len(ignored) > 20 else [])
+                         + ["git would delete these without saying so, which is why",
+                            "they are listed: a `.env` and a build directory look the",
+                            "same to git and nothing else here can tell them apart"]))
+    if findings:
+        hints = []
+        for _, detail in findings:
+            hints += detail
+        hints += ["nothing has been removed",
+                  "each of these is work that exists only in that tree; deal with it",
+                  "there and run this again"]
+        die(f"{path} still holds work: "
+            + "; ".join(headline for headline, _ in findings), *hints)
+
+    rc, _, err = git(repo, "worktree", "remove", path)
+    if rc != 0:
+        # Everything git refuses on has already been checked, so a refusal here is
+        # something this command does not know about. Report git verbatim rather
+        # than reaching for --force, which is the one flag that turns an unread
+        # refusal into lost work.
+        die(f"git refused to remove {path}: {err}",
+            "every condition this command knows about was already clear, so this is",
+            "a state it cannot read; look before removing anything by hand")
+
+    print(f"retired  {path}")
+    print(f"  kept   {branch} (removing a worktree never touches its branch)")
+    if task.get("owner"):
+        print(f"  open   the Herdr workspace behind {task['owner']} is still there")
+        print("         closing it kills that agent, which is yours to decide")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Refusal as r:
+        print(f"error: {r.message}", file=sys.stderr)
+        for h in r.hints:
+            print(f"  {h}", file=sys.stderr)
+        raise SystemExit(1) from None

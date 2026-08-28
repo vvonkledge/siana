@@ -393,7 +393,8 @@ that minion was actually told.
 **Every minion is isolated in its own worktree.** Two minions on one project never
 share a working tree, so you can dispatch as many as the project has work for. The
 minion's branch is its deliverable: a worktree is never torn down while it holds
-unlanded work, and removing a finished one still leaves the branch behind.
+unlanded work, and removing a finished one still leaves the branch behind. Removing
+one is `siana-retire <id>`; see "Retiring a worktree".
 
 The claim retargets the task's `cwd` to that worktree, so `tasks done` runs the
 verify where the work actually happened. A green on an isolated ship task is
@@ -406,9 +407,10 @@ is working.
 **A task that came back `blocked` can be given to a new minion.** Its branch still
 holds whatever the last one committed, and a worktree cut from an existing branch
 starts at that branch's own head, so the work is in front of the new minion rather
-than lost. The sequence is `reset <id>`, remove the stale worktree, then dispatch as
+than lost. The sequence is `reset <id>`, `siana-retire <id>`, then dispatch as
 normal. Dispatch refuses while that worktree is still there, and it is right to:
-that is the one place uncommitted work could be sitting, so look before removing it.
+that is the one place uncommitted work could be sitting. `siana-retire` refuses for
+the same reason and names what it found, so the looking is done for you.
 If the minion that blocked is still alive, telling it is cheaper than replacing it,
 and it keeps everything it already knows.
 
@@ -468,6 +470,69 @@ also a reading of one moment rather than a verdict, because a Herdr that has jus
 restarted has not re-detected its agents yet and reads as `GONE` everywhere; the
 check says so, and rerunning it is how you tell the two apart. Look at the worktree
 before `reset`, and treat a refusal to discard as a finding to report.
+
+## Retiring a worktree
+
+`siana-retire <task-id>` removes a minion's worktree. It is the last step of a task
+and the middle step of a re-dispatch, and it is the only way either of those is done:
+never `git worktree remove` by hand, because that deletes ignored paths without
+saying so, and ignored is where a `.env`, a local database and a tool's state
+directory live.
+
+The task id is the whole command, exactly as it is for dispatch. The task names its
+project, the registry says where that project is, and the id says which branch, so a
+path is never typed and never mistyped.
+
+**It never touches the branch.** That is what makes it safe: the worktree goes, every
+commit made in it stays, and a new worktree cut from that branch starts at its head.
+So retiring is not landing, and a retired branch is still yours to land or to delete
+deliberately later.
+
+**What it checks for is a second copy, which is not a merge.** Before it retires
+finished work it asks two things in order. First, did that branch add anything to the
+`base` you queued it with? A branch sitting exactly where it was cut from is held in
+full by that base, so there is nothing to lose - which is every scout and every QA
+task, and why neither ever needs landing to be tidied away. Second, for whatever it
+did add: does a copy exist outside the fleet's own branches - on the default branch,
+on a tag, or on any remote-tracking ref? A gated ship task comes back published and
+unmerged, and that push is an anchor: the tree may be retired, and doing so says
+nothing about whether the pull request has landed. The merge is still yours, and still
+a separate decision.
+
+It refuses rather than guessing, and every refusal is a finding to act on:
+
+- a task still `doing` is a tree somebody is working in; `reset <id>` first, which
+  is the moment you are meant to look
+- tracked, untracked or ignored work in the tree, each named, because that is work
+  with no second copy anywhere
+- a `done` task whose branch added commits reachable from no ref outside
+  `refs/heads/siana/*`: what it built exists only on minion branches, each of them
+  one `git branch -D` from gone. Land it or publish it, then retire. Sibling
+  `siana/*` branches deliberately do not count, because you dispatch QA with the
+  ship branch as its base, so `siana/qa-<id>` sits at the ship head and would
+  otherwise anchor the very work it was sent to review. The task's own recorded
+  `base` is the one exception, and only for the commits the branch did not make: a
+  QA or scout branch that added nothing is retired without argument, and a ship
+  branch is never let through by the sibling cut from it
+- a tree whose head has been moved off `siana/<id>`, detached or onto another
+  branch. It names where the head actually is; it never moves one back
+- a queue and a git that disagree about where the tree is, a branch that does not
+  exist, a worktree already gone, or the branch checked out in the project's own
+  checkout
+
+There is no force flag, on purpose. Every refusal above is either work that exists in
+one place or a state the script cannot read, and both are yours to resolve.
+
+**A scout's tree will usually refuse the first time.** Its brief calls that worktree a
+laboratory and tells it to install and edit freely, so it comes back full of untracked
+and ignored paths. The list you get back is the point: read it, satisfy yourself that
+the report already holds everything worth keeping, clear the tree yourself, and run
+this again. Deciding that a build directory is litter and a stray `.env` is not takes
+understanding, which is why the script hands that decision to you instead of taking
+it.
+
+It leaves the Herdr workspace open and says so, naming the owner pane. Closing it
+kills that agent, which is a decision and not mechanics.
 
 ## Being woken
 
