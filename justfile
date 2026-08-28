@@ -271,6 +271,12 @@ doctor: _contract-drift
     else
         echo "  ok      SIANA running (pid $pid${pane:+, pane $pane})"
     fi
+    # Whether the fleet advances while the captain is away. The watcher owns its own
+    # record, so it is asked rather than parsed here: a file can say a watcher was
+    # started and never that one is running, and only the command that wrote it knows
+    # how to tell those apart. It reports and never repairs, because removing a
+    # stopped watcher's record is deciding the captain has read it.
+    SIANA_HOME="$home" "$PWD/bin/siana-watch" --status || true
     # Dispatch does the resolving and holds the pane bindings, so asking it means
     # this cannot drift from what a real dispatch would accept or from where a real
     # minion was put. It reports a dead owner and never reclaims one: `tasks reset`

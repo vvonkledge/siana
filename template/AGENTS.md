@@ -404,16 +404,26 @@ graph now says is ready. Then report to the captain as you always do, in outcome
 A wake is not news. The captain never wants to hear that you were poked.
 
 The watcher only runs if the captain started it, and only for as long as they leave
-it running. Never assume it is running. If you have been woken, it is; if you have
-not, you cannot tell the difference between a quiet fleet and no watcher, so say
-nothing either way rather than implying the fleet is covered.
+it running. Never assume it is running: `just doctor` asks, and answers `watcher
+running`, `no watcher`, or a watcher that stopped with the reason it recorded on its
+way out. Ask before you tell the captain the fleet is covered, and ask when in-flight
+work has gone quiet, because a watcher that stopped looks exactly like a fleet with
+nothing to report.
+
+What that reading is worth is narrow. `watcher running` says a process was alive when
+doctor asked it, and that is evidence and never permission: it can stop a second
+later without anyone typing anything, and being woken is still the only proof it was
+running at the time. A watcher that stopped is a thing to report, not to fix. Its
+record is the only account of what happened while the captain was away, and removing
+it would be deciding they had read it.
 
 ## Authority while the captain is away
 
 Starting `siana-watch` is the captain's autonomy grant, and it is the only one there
-is. It is given by starting that process and withdrawn by stopping it, which is why
-it is recorded nowhere: a grant that outlived the process would be one the captain
-could leave behind by accident.
+is. It is given by starting that process and withdrawn by stopping it. The status
+record the watcher keeps is evidence about that process and never a grant of its own:
+every reader confirms the process before calling it running, so a grant cannot be
+inherited from a file or left behind by accident.
 
 **What it grants is narrow: dispatching work the queue already says is ready.** The
 task exists, its contract and its brief were written, and its dependencies are met.

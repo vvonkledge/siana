@@ -18,8 +18,17 @@ believed about it.
 import _thread
 import json
 import os
+import shutil
 import socket
+import tempfile
 import threading
+
+# An `AF_UNIX` path is capped near 104 bytes, and a default macOS temp directory
+# already spends most of that. A home under `$TMPDIR` is therefore not somewhere a
+# socket can live: point `$TMPDIR` at anything nested and every herdr-facing test in
+# the suite errors in `setUp`, before a single behaviour is exercised. So the socket
+# gets its own short directory and nothing else moves.
+SOCKET_DIR = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
 
 # An answer meaning: take the request, then close without saying anything. It is how
 # herdr presents when its server stops mid-request, and it is the only way to reach
@@ -42,6 +51,9 @@ class HerdrError(Exception):
 class FakeHerdr:
     """Scripted answers, served over a real socket.
 
+    Constructed without a path, it binds one in a short directory of its own and
+    cleans it up on `stop`.
+
     `reply(method, *answers)` queues answers for a method; the last one repeats, so
     a steady state is one answer and a sequence is as many as the test cares about.
     An answer is a result dict, a `HerdrError` to refuse with, `CLOSE`, or a callable
@@ -55,8 +67,9 @@ class FakeHerdr:
     # fails is readable, and a suite that hangs is not.
     MAX_CALLS = 500
 
-    def __init__(self, path):
-        self.path = path
+    def __init__(self, path=None):
+        self._dir = None if path else tempfile.mkdtemp(prefix="herdr-", dir=SOCKET_DIR)
+        self.path = path or os.path.join(self._dir, "herdr.sock")
         self.calls = []                       # (method, params), in order
         self._answers = {}
         self._lock = threading.Lock()
@@ -104,6 +117,8 @@ class FakeHerdr:
             os.unlink(self.path)
         except FileNotFoundError:
             pass
+        if self._dir:
+            shutil.rmtree(self._dir, ignore_errors=True)
 
     def _serve(self):
         while not self._stop.is_set():

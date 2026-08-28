@@ -6,13 +6,16 @@ read. The two refusals under it are the ones that turn a typo into a fresh empty
 fleet, or a stale contract into a traceback at `add` time.
 """
 
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 
-from helpers import DISTRO, HomeTest
+from helpers import DISTRO, HomeTest, gone_pid, script
+
+w = script("siana-watch")
 
 
 def has(cmd):
@@ -68,6 +71,12 @@ class ContractDrift(Recipe):
 
 class Doctor(Recipe):
 
+    def watcher(self, **fields):
+        """A watcher status record, written the way the watcher writes one."""
+        with open(self.at(w.GRANT), "w") as fh:
+            json.dump(fields, fh)
+        return self.at(w.GRANT)
+
     def test_it_names_what_is_missing_from_an_empty_home(self):
         out = self.just("doctor")
         self.assertIn("missing AGENTS.md", out.stdout)
@@ -85,13 +94,52 @@ class Doctor(Recipe):
         self.assertIn("no SIANA running", self.just("doctor").stdout)
 
     def test_a_session_whose_process_is_gone_is_called_stale(self):
-        self.store("session", "SIANA_PID=1", "SIANA_PANE=w1:p1")
-        dead = subprocess.Popen(["true"])
-        dead.wait()
         with open(self.at("session"), "w") as fh:
-            fh.write(f"SIANA_PID={dead.pid}\n")
+            fh.write(f"SIANA_PID={gone_pid()}\n")
         out = self.just("doctor")
         self.assertIn("stale   session claims pid", out.stderr)
+
+    def test_no_watcher_is_said_out_loud_rather_than_left_to_be_assumed(self):
+        # The state the whole record exists for. A quiet fleet and a stopped watcher
+        # look identical, so silence here would be the captain assuming coverage.
+        out = self.just("doctor")
+        self.assertIn("no watcher (the fleet does not advance unattended)", out.stdout)
+
+    def test_a_watcher_whose_process_is_running_is_reported_as_running(self):
+        # This test's own process, because that is the only one here that is
+        # certainly alive: the record is evidence about a process, and doctor asks
+        # the operating system about it rather than believing the file.
+        self.watcher(state="running", pid=os.getpid(),
+                     command=w.process_command(os.getpid()), pane="w1:p1",
+                     started="2026-08-28T08:00:00Z")
+        out = self.just("doctor")
+        self.assertIn(f"ok      watcher running (pid {os.getpid()}", out.stdout)
+        self.assertNotIn("watcher", out.stderr)
+
+    def test_a_watcher_that_stopped_is_named_with_its_reason_and_what_to_do(self):
+        self.watcher(state="failed", pid=gone_pid(), command="/usr/bin/whatever",
+                     pane="w1:p1", started="2026-08-28T08:00:00Z",
+                     stopped="2026-08-28T09:00:00Z",
+                     reason="pane w1:p1 is not running SIANA: herdr sees claude")
+        out = self.just("doctor")
+        self.assertIn("stale   watcher stopped at", out.stderr)
+        self.assertIn("herdr sees claude", out.stderr)
+        self.assertIn("start `siana-watch`", out.stderr)
+
+    def test_a_watcher_that_died_without_saying_why_is_never_reported_healthy(self):
+        self.watcher(state="running", pid=gone_pid(), command="/usr/bin/whatever",
+                     pane="w1:p1", started="2026-08-28T08:00:00Z")
+        out = self.just("doctor")
+        self.assertIn("stale   watcher stopped without saying why", out.stderr)
+        self.assertNotIn("watcher running", out.stdout)
+
+    def test_a_stopped_watchers_record_is_reported_and_never_repaired(self):
+        # Removing it is deciding the captain has read it, and doctor changes
+        # nothing.
+        path = self.watcher(state="failed", pid=gone_pid(), command="x",
+                            reason="herdr went away")
+        self.just("doctor")
+        self.assertTrue(os.path.exists(path))
 
 
 @unittest.skipUnless(has("pi") and has("tasks") and has("datafile"),

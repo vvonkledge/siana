@@ -57,11 +57,11 @@ class HerdrTest(HomeTest):
 
     def setUp(self):
         super().setUp()
-        self.herdr = FakeHerdr(self.at("herdr.sock")).start()
+        self.herdr = FakeHerdr().start()
         self.addCleanup(self.herdr.stop)
 
     def socket_env(self):
-        return {"HERDR_SOCKET_PATH": self.at("herdr.sock")}
+        return {"HERDR_SOCKET_PATH": self.herdr.path}
 
 
 class DispatchTest(HerdrTest):
@@ -525,7 +525,7 @@ class Transport(HerdrTest):
     gets it wrong reports a live fleet as dead."""
 
     def herdr_client(self):
-        return d.Herdr(self.at("herdr.sock"), timeout=5.0)
+        return d.Herdr(self.herdr.path, timeout=5.0)
 
     def test_a_reply_too_big_for_one_read_is_assembled_before_it_is_parsed(self):
         self.herdr.reply("agent.get", {"agent": {"agent": "x" * 200_000}})
@@ -551,7 +551,7 @@ class Transport(HerdrTest):
         # timeout this parks inside `recv` for as long as that lasts.
         self.herdr.reply("agent.get", lambda _p: (time.sleep(0.3), {})[1])
         with self.assertRaises(d.Unreachable) as cm:
-            d.Herdr(self.at("herdr.sock"), timeout=0.05).call("agent.get")
+            d.Herdr(self.herdr.path, timeout=0.05).call("agent.get")
         self.assertIn("agent.get", cm.exception.message)
 
     def test_a_socket_that_is_not_there_is_unreachable(self):

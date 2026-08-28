@@ -57,32 +57,38 @@ class WatchTest(HomeTest):
 
     def setUp(self):
         super().setUp()
-        self.herdr = FakeHerdr(self.at("herdr.sock")).start()
+        self.herdr = FakeHerdr().start()
         self.addCleanup(self.herdr.stop)
         self.store("session", "SIANA_PID=4242", f"SIANA_PANE={self.PANE}")
 
     def client(self):
-        return w.Herdr(self.at("herdr.sock"), timeout=5.0)
+        return w.Herdr(self.herdr.path, timeout=5.0)
 
     def reported(self, task_id="t1", status="done"):
         """A minion's terminal record landing in the queue, as `tasks` appends it."""
         return lambda: self.store("tasks.jsonl", {"id": task_id, "status": status})
 
-    def watch(self, grace=None, interval="0"):
+    def watch(self, grace=None, interval="0", interrupted=False):
         """One `siana-watch`, run until it stops.
 
         Every one of these ends in a refusal, because a watcher that returns is a
         watcher that stopped watching. Which refusal ends it is the test's to
-        script: a pane taken over, or a herdr that never comes back."""
+        script: a pane taken over, or a herdr that never comes back.
+
+        `interrupted` is the other ending, the captain stopping it. The interrupt
+        lands where the loop sleeps, which is where a Ctrl-C lands in life."""
         out, err = io.StringIO(), io.StringIO()
         env = {"SIANA_HOME": self.home, "SIANA_TASKS_FILE": self.at("tasks.jsonl"),
-               "HERDR_SOCKET_PATH": self.at("herdr.sock")}
+               "HERDR_SOCKET_PATH": self.herdr.path}
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, env))
             stack.enter_context(mock.patch.object(
                 sys, "argv", ["siana-watch", "--interval", interval]))
             if grace is not None:
                 stack.enter_context(mock.patch.object(w, "DETECT_GRACE_S", grace))
+            if interrupted:
+                stack.enter_context(mock.patch.object(w.time, "sleep",
+                                                      side_effect=KeyboardInterrupt))
             stack.enter_context(redirect_stdout(out))
             stack.enter_context(redirect_stderr(err))
             try:
@@ -91,10 +97,20 @@ class WatchTest(HomeTest):
             except w.Refusal as r:
                 refusal = r
             except KeyboardInterrupt:
-                # The scripted herdr's backstop: this loop was never going to stop.
-                self.fail(f"the watcher never stopped, after "
-                          f"{len(self.herdr.calls)} calls to herdr")
+                if not interrupted:
+                    # The scripted herdr's backstop: this loop was never going to
+                    # stop.
+                    self.fail(f"the watcher never stopped, after "
+                              f"{len(self.herdr.calls)} calls to herdr")
+                refusal = None
         return Watched(refusal, out.getvalue(), err.getvalue())
+
+    def status(self):
+        """What `just doctor` would say about this home, and what it would exit."""
+        said = io.StringIO()
+        with redirect_stdout(said), redirect_stderr(said):
+            code = w.check_grant(self.home)
+        return code, said.getvalue()
 
     def pokes(self):
         return self.herdr.calls_to("agent.prompt")
@@ -186,6 +202,21 @@ class Poking(WatchTest):
         self.assertEqual(poke["text"], "The queue moved. Reconcile it.")
         self.assertIn("report   t1 done", result.out)
         self.assertIn("poked    1 report(s)", result.out)
+
+    def test_one_report_pokes_once_however_long_siana_stays_idle_after(self):
+        # The delivered reports have to be dropped, and nothing else here would
+        # notice if they were not: every other test scripts the pane being taken
+        # over as the answer right after the poke, so the loop dies before a second
+        # delivery tick can happen. This one leaves SIANA live and idle for four
+        # more ticks, which is what a watcher does for the rest of its life.
+        self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA),
+                         SIANA, SIANA, SIANA, SIANA, TAKEOVER)
+
+        result = self.watch()
+
+        self.assertEqual(len(self.pokes()), 1,
+                         "one report, one poke, however many ticks come after it")
+        self.assertEqual(result.out.count("poked"), 1)
 
     def test_reports_that_land_together_cost_one_poke_and_not_one_each(self):
         def two():
@@ -309,6 +340,78 @@ class Liveness(WatchTest):
         self.assertEqual(len(self.herdr.calls_to("agent.get")), 4)
 
 
+class Grant(WatchTest):
+    """The record that says whether the fleet is being watched.
+
+    It is written by the watcher and read by `just doctor`, and the whole of its
+    value is that the captain cannot get it wrong: a fleet that is quiet because
+    nobody is watching has to read differently from a fleet that is quiet because
+    there is nothing to report."""
+
+    def test_a_running_watcher_is_visible_while_it_runs(self):
+        # Checked from inside the loop, because after it stops the record says
+        # something else. The poke is the tick's own clock.
+        seen = []
+        self.herdr.reply("agent.get", SIANA,
+                         once(lambda: seen.append(self.status()), SIANA), TAKEOVER)
+
+        self.watch()
+
+        code, said = seen[0]
+        self.assertEqual(code, 0, said)
+        self.assertIn("watcher running", said)
+        self.assertIn(f"pane {self.PANE}", said)
+
+    def test_a_refusal_before_the_grant_exists_records_no_grant(self):
+        # Startup refuses in front of the captain, who can read it. A record here
+        # would say a watcher stopped when none ever started.
+        self.herdr.reply("agent.get", TAKEOVER)
+
+        self.watch()
+
+        self.assertFalse(os.path.exists(self.at(w.GRANT)))
+        self.assertIn("no watcher", self.status()[1])
+
+    def test_a_watcher_that_loses_sianas_pane_leaves_the_reason_behind(self):
+        # The one that matters: this happens while the captain is away, so the
+        # refusal goes to a screen nobody is reading. The record is the same words,
+        # left where someone will look when the fleet has gone quiet.
+        self.herdr.reply("agent.get", SIANA, TAKEOVER)
+
+        self.watch()
+
+        code, said = self.status()
+        self.assertEqual(code, 1)
+        self.assertIn("watcher stopped at", said)
+        self.assertIn("is not running SIANA: herdr sees claude", said)
+        self.assertIn("its pane was taken over", said)
+
+    def test_a_watcher_that_outlasts_herdr_leaves_the_reason_behind(self):
+        self.herdr.reply("agent.get", SIANA, CLOSE)
+
+        self.watch(grace=0.2, interval="0.01")
+
+        code, said = self.status()
+        self.assertEqual(code, 1)
+        self.assertIn("without herdr", said)
+
+    def test_the_captain_stopping_a_watcher_withdraws_the_grant_with_it(self):
+        # A record left behind would read as a watcher that died, and send the
+        # captain looking for a failure that never happened.
+        self.herdr.reply("agent.get", SIANA)
+
+        self.watch(interrupted=True)
+
+        self.assertFalse(os.path.exists(self.at(w.GRANT)))
+        code, said = self.status()
+        self.assertEqual(code, 0)
+        self.assertIn("no watcher (the fleet does not advance unattended)", said)
+
+    def test_where_the_grant_is_recorded_is_said_at_the_start(self):
+        self.herdr.reply("agent.get", SIANA, TAKEOVER)
+        self.assertIn(f"grant    {self.at(w.GRANT)}", self.watch().out)
+
+
 class Transport(WatchTest):
     """Same protocol as siana-dispatch, and the same distinction to get right."""
 
@@ -322,8 +425,35 @@ class Transport(WatchTest):
         # looks like a live autonomy grant and polls nothing.
         self.herdr.reply("agent.get", lambda _p: (time.sleep(0.3), {})[1])
         with self.assertRaises(w.Unreachable) as cm:
-            w.Herdr(self.at("herdr.sock"), timeout=0.05).call("agent.get")
+            w.Herdr(self.herdr.path, timeout=0.05).call("agent.get")
         self.assertIn("stopped answering during agent.get", str(cm.exception))
+
+    def test_a_socket_that_cannot_even_be_made_is_an_unreachable_herdr(self):
+        # Out of descriptors is exactly the state where a traceback would end the
+        # watcher without telling the captain what to do about it.
+        with mock.patch.object(w.socket, "socket",
+                               side_effect=OSError(24, "Too many open files")):
+            with self.assertRaises(w.Unreachable) as cm:
+                self.client().call("agent.get", target=self.PANE)
+        self.assertIn("herdr is not reachable", str(cm.exception))
+        self.assertIn("Too many open files", str(cm.exception))
+
+    def test_a_connect_that_fails_still_closes_the_socket_it_opened(self):
+        # This is the path that repeats: while herdr is away the loop reconnects
+        # every tick for the whole detection grace, so a descriptor left for the
+        # garbage collector here is the only place they accumulate - and running out
+        # of them is how the watcher stops being able to wake anyone.
+        opened = []
+        real = w.socket.socket
+
+        def spy(*a, **kw):
+            opened.append(real(*a, **kw))
+            return opened[-1]
+
+        with mock.patch.object(w.socket, "socket", spy):
+            with self.assertRaises(w.Unreachable):
+                w.Herdr(self.at("nothing-listens-here")).call("agent.get")
+        self.assertEqual([s.fileno() for s in opened], [-1], "the socket was left open")
 
     def test_a_refusal_is_not_an_unreachable(self):
         self.herdr.reply("agent.get", REFUSED)
