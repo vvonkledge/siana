@@ -16,6 +16,8 @@ and the line between those two is the project's whole design.
 - `tests/` is the suite. Standard-library `unittest`, no dependencies.
 - `VISION.md` says what the fleet is for. Read it before you argue with a design
   choice in here, because most of them are downstream of it.
+- `README.md` is the captain's install and operating guide. A change to what `init`
+  writes, to what a command is called, or to what a recipe refuses, changes it too.
 
 ## How your work is checked
 
@@ -45,6 +47,11 @@ named after a rule is how the next agent finds out the rule exists.
 - Minimum code that solves the problem. Nothing speculative.
 - Logic that can be exact belongs in a script; work that needs understanding belongs
   in an agent. Never mix them.
+
+The first two are exact, so `just test` checks them instead of trusting you to
+remember (`tests/test_conventions.py`). The column limit is for prose only: fenced
+and indented blocks are commands, and wrapping one changes what it does. The rest of
+this list is judgment and lives only here.
 
 ## Do not
 
