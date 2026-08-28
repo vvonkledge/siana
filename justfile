@@ -95,7 +95,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -286,7 +286,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"
