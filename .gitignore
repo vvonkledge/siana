@@ -4,3 +4,7 @@ __pycache__/
 
 # Linter cache.
 .ruff_cache/
+
+# CI checks `tasks` and `datafile` out here to install the stores the suite drives.
+# Ignored so reproducing the workflow by hand does not offer them up as new files.
+.ci-deps/
