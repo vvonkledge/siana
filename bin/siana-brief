@@ -230,21 +230,30 @@ mkdir -p "$home/briefs"
 sed -e "s|{SHIP_BRANCH}|$branch|g" "$template" > "$brief"
 
 # The substitution is checked, not assumed. Every command reads the branch back out
-# of this file by looking for an indented `branch <name>` line, and the home's copy
-# of this template is the captain's to evolve: `just init` keeps a diverged one on
-# purpose. A template that has lost the marker, or carries it in a sentence, writes a
-# brief recording no branch at all, and then the QA task queued below is cut from
-# siana/<type>/<id> while every reader answers siana/<id>. That split stays invisible
-# until a QA dispatch fails on a base nobody ever created, long after the ship work
-# is finished. So it fails here instead, with nothing written and nothing queued.
-if [ -n "$branch" ] &&
-   ! grep -q "^[[:space:]]\{1,\}branch[[:space:]]\{1,\}$branch[[:space:]]*$" "$brief"; then
+# of this file the same way: an indented `branch <name>` line, inside the brief's own
+# `## Delivery: ship` section and nowhere else. The home's copy of this template is
+# the captain's to evolve, and `just init` keeps a diverged one on purpose, so a
+# template that has lost the marker, carries it in a sentence, or has moved it under
+# a heading of its own writes a brief the readers find no branch in. The QA task
+# queued below would then be cut from siana/<type>/<id> while every reader answered
+# siana/<id>, and that split stays invisible until a QA dispatch fails on a base
+# nobody ever created, long after the ship work is finished.
+#
+# So what is checked is the section the readers read, and not the file: a check with
+# a wider reach than theirs passes exactly where they would have found nothing.
+delivery_section() {
+    awk '/^## / { taking = ($0 ~ /^## Delivery: ship[[:space:]]*$/); next } taking' "$1"
+}
+
+if [ -n "$branch" ] && ! delivery_section "$brief" |
+        grep -q "^[[:space:]]\{1,\}branch[[:space:]]\{1,\}$branch[[:space:]]*$"; then
     rm -f "$brief"
-    die "$template does not record the branch on a line of its own" \
+    die "$template does not record the branch where every command looks for it" \
         "$id would be briefed with no branch in it, and every command would read" \
         "siana/$id while the QA task behind it judged $branch" \
-        "the ship template needs an indented line of exactly:" \
+        "the '## Delivery: ship' section needs an indented line of exactly:" \
         "    branch  {SHIP_BRANCH}" \
+        "under any other heading it is prose, and no command reads it" \
         "nothing has been written and nothing has been queued"
 fi
 

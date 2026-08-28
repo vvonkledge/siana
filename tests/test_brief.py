@@ -178,7 +178,22 @@ class CommitType(Brief):
         with open(self.at("brief-ship.md"), "w") as fh:
             fh.write("# Brief\n\n## Delivery: ship\n\nCommit on {SHIP_BRANCH}.\n")
         out = self.brief(tid, "--ship", "--type", "feat")
-        self.assertRefused(out, "does not record the branch on a line of its own")
+        self.assertRefused(out, "does not record the branch where every command")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+        self.assertEqual(self.ids(), [tid])
+
+    def test_the_branch_line_under_another_heading_is_refused(self):
+        """The readers only look inside `## Delivery: ship`, so a template keeping
+        the exact line but moving it under a heading of its own is the same split
+        wearing a passing check: what this verifies has to be the line they find."""
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\nYour work lands.\n\n"
+                     "## Your branch\n\n    branch  {SHIP_BRANCH}\n")
+        out = self.brief(tid, "--ship", "--type", "feat")
+        self.assertRefused(out, "where every command looks for it",
+                           "under any other heading it is prose")
         self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
         self.assertEqual(self.ids(), [tid])
 
@@ -188,7 +203,7 @@ class CommitType(Brief):
         with open(self.at("brief-ship.md"), "w") as fh:
             fh.write("# Brief\n\n## Delivery: ship\n\nYour work lands.\n")
         self.assertRefused(self.brief(tid, "--ship", "--type", "feat"),
-                           "does not record the branch on a line of its own")
+                           "does not record the branch where every command")
         self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
 
     def test_a_scout_brief_names_no_branch(self):
