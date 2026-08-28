@@ -234,8 +234,10 @@ class Leadership(Siana):
                                           "SIANA_HARNESS": "pi"})
 
     def test_the_session_records_the_harness_that_actually_started(self):
-        # Not the set the home could have started: a watcher told "pi or claude"
-        # would keep poking a pane that has been taken over by the other one.
+        # Not the set the home could have started. A watcher told "pi or claude"
+        # would go on raising wakes for a pane the other harness has taken over,
+        # where nothing is reading them - and would take a claude SIANA for a pi
+        # one, which is the session it refuses to run against at all.
         self.integration("claude")
         p = self.hold(HERDR_PANE_ID="w3D:p2", SIANA_HARNESS="claude")
         self.assertEqual(self.session()["SIANA_HARNESS"], "claude")

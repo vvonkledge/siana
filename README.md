@@ -149,7 +149,8 @@ retype.
 ## Run SIANA
 
 SIANA runs inside a `herdr` session, because that is how it starts minions and how
-`siana-watch` wakes it. Start herdr, then start SIANA in a pane:
+`siana-watch` confirms the session it is watching for is still there. Start herdr,
+then start SIANA in a pane:
 
     herdr
     siana
@@ -159,7 +160,8 @@ open obligations appended to its system prompt. Talk to it there. You never talk
 a minion, and no minion talks to you.
 
 It starts outside herdr too, and says so when it does: with no pane there is nothing
-for `siana-watch` to wake, so the fleet only advances on your turns.
+for `siana-watch` to confirm it is watching for, so it refuses and the fleet only
+advances on your turns.
 
 **One SIANA leads the fleet.** Starting a second is refused, and the refusal tells
 you the pane the first is in so you can attach to it. Two would race each other for
