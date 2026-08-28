@@ -302,6 +302,21 @@ def main() -> None:
     # `siana/<ship-id>` is a name only legacy work has, and comparing against it
     # would refuse every typed QA verdict as if it were a ship task.
     judged = ship_branch(home, ship_id)
+    brief_path = os.path.join(home, "briefs", f"{ship_id}.md")
+    # A base under `siana/` ending in this ship task's own id is a branch cut for
+    # that task whatever type it carries. So when one of those does not match, and
+    # the brief the type would have been read from is not there, what is missing is
+    # the brief and not the task: "not a QA task" would put a false statement about
+    # the queue in place of a true one about a file, and the two are fixed
+    # differently. A base naming some other task stays the wrong-task refusal, which
+    # is what it is.
+    for_this_task = base.startswith("siana/") and base.rsplit("/", 1)[-1] == ship_id
+    if base != judged and for_this_task and not os.path.isfile(brief_path):
+        die(f"no brief at {brief_path}",
+            f"{args.task_id} was cut from {base}, and without that brief nothing",
+            f"here can say which branch {ship_id} built: the fallback is {judged},",
+            "which is the name only work briefed before commit types carries",
+            "a verdict about a branch this cannot identify authorises nothing")
     if base != judged:
         die(f"{args.task_id} is not a QA task",
             f"it waits on {ship_id} but was cut from {base}, and a QA task is cut",
@@ -314,7 +329,6 @@ def main() -> None:
     if ship is None:
         die(f"{args.task_id} depends on {ship_id}, which is not in the queue")
 
-    brief_path = os.path.join(home, "briefs", f"{ship_id}.md")
     if not os.path.isfile(brief_path):
         die(f"no brief at {brief_path}",
             "the brief is what says what was asked, and it is the only part of this",

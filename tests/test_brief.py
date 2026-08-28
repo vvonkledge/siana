@@ -167,6 +167,30 @@ class CommitType(Brief):
         self.assertNotIn("{SHIP_BRANCH}", text)
         self.assertNotIn("{SHIP_BRANCH}", out)
 
+    def test_a_ship_template_that_records_no_branch_is_refused(self):
+        """The home's copy of this template is the captain's to evolve, and `just
+        init` keeps a diverged one on purpose. One that has lost the marker writes a
+        brief recording no branch, so every reader answers `siana/<id>` while the QA
+        task queued behind it is cut from the typed branch. That split is invisible
+        until a QA dispatch fails on a base nobody created."""
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\nCommit on {SHIP_BRANCH}.\n")
+        out = self.brief(tid, "--ship", "--type", "feat")
+        self.assertRefused(out, "does not record the branch on a line of its own")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+        self.assertEqual(self.ids(), [tid])
+
+    def test_a_ship_template_that_lost_the_marker_entirely_is_refused(self):
+        self.project("proj")
+        tid = self.add("Build a thing")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\nYour work lands.\n")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "feat"),
+                           "does not record the branch on a line of its own")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
     def test_a_scout_brief_names_no_branch(self):
         # Its name is a role in this fleet and not a category of change, so there is
         # nothing to record and `siana/<task-id>` is what every command falls to.
