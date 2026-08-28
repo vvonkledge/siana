@@ -24,6 +24,13 @@ a push satisfies, while this asks whether the work landed. A branch whose worktr
 is still there is reported and skipped, so the two commands compose as retire then
 reap rather than racing over the same directory.
 
+It reads `refs/heads` only, and that is a boundary rather than an omission: the
+remote branch is the forge's. `delete_branch_on_merge` on the repository deletes the
+source branch when its merge request merges, server-side, where no worktree can be in
+the way. From here it cannot be done reliably at all - git refuses to delete a branch
+a worktree still holds, so asking the forge for it at merge time fails whenever
+retire has not run yet.
+
 Removal is off by default. A branch is the deliverable in this fleet, so a wrong
 reap is the one mistake here that loses work.
 """
