@@ -38,6 +38,12 @@ fields:
     required: false
     description: independent validation of ship work; set it to put a QA minion
       behind every ship task in this project
+  target:
+    type: str
+    required: false
+    description: the branch a merge request targets. Setting it is what turns
+      publishing on, so a project without one is never published and needs no
+      second field to say so
   orders:
     type: str
     required: false

@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Remove the worktrees and branches whose work has landed, and nothing else.
+
+Every rejection adds a link. A ship branch, the QA branch that read it, a fix branch
+cut from the ship branch, and the QA branch that reads the fix - four for one piece
+of work, and `siana-dispatch` refuses onto a worktree that is already there, so this
+eventually blocks work rather than merely accumulating.
+
+Landed is the only thing that authorises a removal here, and landed is asked rather
+than assumed. Two ways it can be true, because one of them is not enough:
+
+  - the branch is contained in `origin/<target>`, which is a merge or a fast-forward
+  - the forge says its merge request is merged, which is the only answer that
+    survives a squash or a rebase, where the commits that landed have different
+    hashes and no ancestry test will ever say yes again
+
+A task's status is not one of them. `done` says a minion finished; it says nothing
+about whether anyone merged the result, and reaping on it would delete work that was
+never published.
+
+Removal is off by default. A branch is the deliverable in this fleet, so a wrong
+reap is the one mistake here that loses work.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def die(message: str, *hints: str):
+    print(f"error: {message}", file=sys.stderr)
+    for hint in hints:
+        print(f"  {hint}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def fold(store: str, key: str):
+    """The last record for each key in an append-only store. Reads only."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def git(path: str, *args):
+    return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True)
+
+
+def merged_on_forge(remote_url: str, path: str, branch: str) -> bool:
+    """Whether the forge says this branch's merge request is merged.
+
+    The only test that survives a squash or a rebase. Asked per branch, and a forge
+    that cannot be reached returns False, because "I could not tell" and "it landed"
+    must never be the same answer where the consequence is a deletion."""
+    if "gitlab" in remote_url:
+        out = subprocess.run(
+            ["glab", "mr", "list", "--source-branch", branch, "--all", "--output", "json"],
+            cwd=path, capture_output=True, text=True)
+        key = "state"
+        wanted = "merged"
+    elif "github" in remote_url:
+        out = subprocess.run(
+            ["gh", "pr", "list", "--head", branch, "--state", "merged", "--json", "state"],
+            cwd=path, capture_output=True, text=True)
+        key = "state"
+        wanted = "MERGED"
+    else:
+        return False
+    if out.returncode != 0:
+        return False
+    try:
+        found = json.loads(out.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+    return any(str(item.get(key, "")).lower() == wanted.lower() for item in found)
+
+
+def worktrees(path: str):
+    """Branch to checkout path, for the worktrees git knows about."""
+    out = git(path, "worktree", "list", "--porcelain")
+    found, current = {}, {}
+    for line in out.stdout.splitlines() + [""]:
+        if not line.strip():
+            if current.get("branch"):
+                found[current["branch"]] = current["worktree"]
+            current = {}
+            continue
+        if line.startswith("worktree "):
+            current["worktree"] = line.split(" ", 1)[1]
+        elif line.startswith("branch "):
+            current["branch"] = line.split(" ", 1)[1].removeprefix("refs/heads/")
+    return found
+
+
+def herdr_workspace(path: str, checkout: str):
+    """The herdr workspace holding a checkout, when there is one.
+
+    `siana-dispatch` creates worktrees through herdr, so removing one behind herdr's
+    back leaves a workspace pointing at a directory that is gone."""
+    out = subprocess.run(["herdr", "worktree", "list"], cwd=path,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    try:
+        listing = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+    wanted = os.path.realpath(checkout)
+    for entry in listing.get("result", {}).get("worktrees", []):
+        # Resolved both sides: on macOS /var is a symlink to /private/var, so git's
+        # real path and herdr's can name one directory and not compare equal. A miss
+        # here leaves a herdr workspace pointing at a directory that is gone.
+        if entry.get("path") and os.path.realpath(entry["path"]) == wanted:
+            return entry.get("open_workspace_id")
+    return None
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Remove the worktrees and branches whose work has landed.")
+    ap.add_argument("handle", help="the project to reap")
+    ap.add_argument("--yes", action="store_true",
+                    help="actually remove; without it nothing is touched")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    tasks_file = os.environ.get("SIANA_TASKS_FILE", os.path.join(home, "tasks.jsonl"))
+    registry = os.path.join(home, "projects.jsonl")
+
+    projects = fold(registry, "handle")
+    if args.handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {args.handle}", f"known handles: {known}")
+    project = projects[args.handle]
+
+    target = project.get("target")
+    if not target:
+        die(f"{args.handle} has no `target`",
+            "the target is what a branch has to be contained in to count as landed;",
+            "without one there is nothing to measure against, and a project that",
+            "never publishes has nothing to reap")
+
+    path = os.path.abspath(os.path.expanduser(str(project["path"])))
+    if git(path, "rev-parse", "--git-dir").returncode != 0:
+        die(f"{args.handle} is at {path}, which is not a git repository")
+
+    remote = git(path, "remote", "get-url", "origin")
+    remote_url = remote.stdout.strip() if remote.returncode == 0 else ""
+
+    # Without this the remote-tracking ref is whatever it was at the last fetch, and
+    # a branch that landed since then reads as unlanded. Failing to fetch is not
+    # fatal; it only means fewer branches qualify, which is the safe direction.
+    fetched = git(path, "fetch", "origin", target)
+    if fetched.returncode != 0:
+        print(f"warning: could not fetch origin/{target}; judging against the local "
+              f"copy, which may be stale", file=sys.stderr)
+
+    ref = f"origin/{target}"
+    if git(path, "rev-parse", "--verify", ref).returncode != 0:
+        ref = target
+        if git(path, "rev-parse", "--verify", ref).returncode != 0:
+            die(f"{path} has no {target} or origin/{target}",
+                "there is nothing to measure landing against")
+
+    # A branch a minion still holds is live work whatever the forge says about it.
+    # Both its own branch and the one it was cut from: a fix minion reading its base
+    # while that base is deleted underneath it is the same surprise either way.
+    tasks = fold(tasks_file, "id")
+    held = set()
+    for tid, task in tasks.items():
+        if task.get("status") != "doing":
+            continue
+        held.add(f"siana/{tid}")
+        if task.get("base"):
+            held.add(task["base"])
+
+    checkouts = worktrees(path)
+    branches = [b for b in git(path, "for-each-ref", "refs/heads/siana",
+                               "--format=%(refname:short)").stdout.split()]
+    if not branches:
+        print(f"{args.handle}: no siana/ branches")
+        return
+
+    reaped, kept = [], []
+    for branch in sorted(branches):
+        if branch in held:
+            kept.append((branch, "a minion is working on it"))
+            continue
+
+        contained = git(path, "merge-base", "--is-ancestor", branch, ref).returncode == 0
+        if not contained and not merged_on_forge(remote_url, path, branch):
+            kept.append((branch, f"not landed: not in {ref}, and no merged merge request"))
+            continue
+
+        checkout = checkouts.get(branch)
+        if checkout:
+            dirty = git(checkout, "status", "--porcelain")
+            if dirty.stdout.strip():
+                kept.append((branch, f"worktree at {checkout} has uncommitted changes"))
+                continue
+
+        how = "contained" if contained else "merged on the forge"
+        if not args.yes:
+            reaped.append((branch, f"would reap ({how})"))
+            continue
+
+        if checkout:
+            workspace = herdr_workspace(path, checkout)
+            if workspace:
+                subprocess.run(["herdr", "worktree", "remove", "--workspace", workspace],
+                               cwd=path, capture_output=True, text=True)
+            removed = git(path, "worktree", "remove", checkout)
+            if removed.returncode != 0 and os.path.isdir(checkout):
+                kept.append((branch, f"worktree at {checkout} would not remove: "
+                                     f"{(removed.stderr or removed.stdout).strip()}"))
+                continue
+        gone = git(path, "branch", "-D", branch)
+        if gone.returncode != 0:
+            kept.append((branch, (gone.stderr or gone.stdout).strip()))
+            continue
+        reaped.append((branch, f"reaped ({how})"))
+
+    for branch, why in reaped:
+        print(f"  {branch}  {why}")
+    for branch, why in kept:
+        print(f"  {branch}  kept: {why}")
+    verb = "reaped" if args.yes else "reapable"
+    print(f"{args.handle}: {len(reaped)} {verb}, {len(kept)} kept")
+    if reaped and not args.yes:
+        print("  nothing was removed; pass --yes to remove them")
+
+
+if __name__ == "__main__":
+    main()

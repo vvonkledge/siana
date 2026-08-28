@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Publish the branch a QA minion accepted: push it, and open the merge request.
+
+Opening a merge request is exact. The branch is named on the QA task, the target
+is named on the project, the contract comes from the ship task's own brief, and the
+forge is whatever `origin` points at. No step of it needs understanding, so it lives
+in a script rather than in instructions an agent has to be trusted to follow.
+
+What is deliberately not here: merging. The boundary this script reaches is the push
+target. What lands is the captain's, in person, every time.
+
+It takes the QA task and never the ship task. A rejected ship task is repaired on a
+new branch cut from the old one, so after one rejection `siana/<ship-id>` is no
+longer the branch worth publishing and a script starting there would have a chain to
+walk. A QA task's `base` is the branch that QA actually read, so reading it publishes
+exactly the head a second minion accepted, and makes publishing something QA never
+saw unrepresentable rather than merely discouraged.
+
+Re-running is safe and is the intended recovery. Publishing happens outside the
+store, so a SIANA that restarts between a QA verdict and this call cannot know
+whether the merge request exists; asking the forge is cheaper than inventing
+somewhere to record it, so an existing merge request is reported and exits zero.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def die(message: str, *hints: str):
+    print(f"error: {message}", file=sys.stderr)
+    for hint in hints:
+        print(f"  {hint}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def fold(store: str, key: str):
+    """The last record for each key in an append-only store.
+
+    Reads only. Every write still goes through `tasks` or `datafile`, so what is on
+    disk has already passed its contract. A tombstone is a last line like any other:
+    a dropped record must read as absent, not as a record with every field missing.
+
+    A store with no writes yet has no file at all, which is empty rather than a
+    fault."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def section(brief: str, heading: str):
+    """One `## ` section of a brief, as prose fit to read outside the fleet.
+
+    The `<!-- SIANA: ... -->` blocks are instructions for whoever filled the brief
+    in, not content, so they never travel to the forge. An unfilled `{...}`
+    placeholder is returned as-is for the caller to refuse on: a merge request
+    describing the work as `{TASK}` is worse than no merge request, because it looks
+    like a description and is not one.
+
+    Returns None when the section is absent, which several of them are allowed to
+    be."""
+    lines = brief.splitlines()
+    body, taking, in_comment = [], False, False
+    for line in lines:
+        if line.startswith("## "):
+            if taking:
+                break
+            taking = line[3:].strip().lower() == heading.lower()
+            continue
+        if not taking:
+            continue
+        if "<!--" in line:
+            in_comment = "-->" not in line
+            continue
+        if in_comment:
+            in_comment = "-->" not in line
+            continue
+        body.append(line)
+    if not taking and not body:
+        return None
+    text = "\n".join(body).strip()
+    return text or None
+
+
+def git(path: str, *args, check=True):
+    out = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True)
+    if check and out.returncode != 0:
+        die(f"git {' '.join(args)} failed in {path}", (out.stderr or out.stdout).strip())
+    return out
+
+
+def forge_of(remote_url: str):
+    """Which forge `origin` lives on.
+
+    Derived rather than configured: a field would be one more thing to set and one
+    more thing to go stale against a remote that moved. An unrecognised host stops
+    here instead of guessing a CLI, because guessing wrong means either a command
+    that does not exist or one that publishes somewhere nobody asked for."""
+    if "gitlab" in remote_url:
+        return "gitlab"
+    if "github" in remote_url:
+        return "github"
+    return None
+
+
+def existing(forge: str, path: str, branch: str):
+    """The open merge request for this branch, or None.
+
+    Asked before every create, so re-running after an interrupted publish reports
+    what is already there rather than opening a second one."""
+    if forge == "gitlab":
+        out = subprocess.run(
+            ["glab", "mr", "list", "--source-branch", branch, "--output", "json"],
+            cwd=path, capture_output=True, text=True)
+        if out.returncode != 0:
+            return None
+        try:
+            found = json.loads(out.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        return found[0].get("web_url") if found else None
+    out = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url"],
+        cwd=path, capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    try:
+        found = json.loads(out.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    return found[0].get("url") if found else None
+
+
+def create(forge: str, path: str, branch: str, target: str, title: str, body: str):
+    if forge == "gitlab":
+        argv = ["glab", "mr", "create", "--source-branch", branch,
+                "--target-branch", target, "--title", title,
+                "--description", body, "--yes", "--no-editor"]
+    else:
+        argv = ["gh", "pr", "create", "--head", branch, "--base", target,
+                "--title", title, "--body", body]
+    out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    if out.returncode != 0:
+        die(f"{forge} refused to open the merge request for {branch}",
+            (out.stderr or out.stdout).strip(),
+            "the branch is pushed either way, so nothing is lost by fixing this",
+            "and running this command again")
+    for word in (out.stdout + " " + out.stderr).split():
+        if word.startswith("http"):
+            return word.strip()
+    return out.stdout.strip()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Push and open the merge request for the branch a QA task accepted.")
+    ap.add_argument("task_id", help="the QA task whose verdict authorises this")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the branch, target, title and body, and change nothing")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    tasks_file = os.environ.get("SIANA_TASKS_FILE", os.path.join(home, "tasks.jsonl"))
+    registry = os.path.join(home, "projects.jsonl")
+
+    task = fold(tasks_file, "id").get(args.task_id)
+    if task is None:
+        die(f"no task {args.task_id} in {tasks_file}",
+            "publishing is authorised by a verdict, so a task that is not in the",
+            "queue authorises nothing")
+
+    # Every refusal below is a way the branch could be published without a second
+    # minion having accepted it, which is the one thing this script exists to make
+    # impossible.
+    if task.get("status") != "done":
+        die(f"{args.task_id} is {task.get('status')}, not done",
+            "a verdict that has not come back is not a pass, and `blocked` is a",
+            "finding: queue the fix with `--base` on the branch it judged")
+
+    branch = base = task.get("base")
+    if not branch:
+        die(f"{args.task_id} names no base, so it judged no branch",
+            "a QA task carries the branch it was cut from; a task without one is",
+            "ship or scout work, and neither authorises a publish")
+
+    handle = task.get("project")
+    if not handle:
+        die(f"{args.task_id} names no project",
+            "the project is what says where the repository is and what a merge",
+            "request targets")
+
+    if not os.path.isfile(os.path.join(home, "schema-projects.yaml")):
+        die(f"no project registry at {registry}", "run `just init` in the distro")
+    projects = fold(registry, "handle")
+    if handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {handle}", f"known handles: {known}")
+    project = projects[handle]
+
+    target = project.get("target")
+    if not target:
+        die(f"publishing is off for {handle}",
+            "`target` is the branch a merge request targets, and setting it is what",
+            "turns publishing on:",
+            f"  datafile -f {registry} get {handle}   # then put it back",
+            "  ... --set target=<branch>")
+
+    # The ship task is what the merge request is about. A QA task depends on exactly
+    # the task it judges, so the dependency is the pointer and nothing has to be
+    # threaded onto the record.
+    deps = task.get("deps") or []
+    if not deps:
+        die(f"{args.task_id} depends on nothing, so it names no ship task",
+            "a QA task is queued with `--dep <ship-id>`; without it there is no",
+            "brief to describe the work and no title to give the merge request")
+    ship_id = deps[0]
+
+    # `base` means two opposite things depending on what the task is. On a QA task it
+    # is the branch being judged; on a ship task cut from existing work it is the
+    # branch the minion started from and then committed past. Publishing the second
+    # one ships the state before the work rather than after it, and the record alone
+    # cannot tell them apart - the live queue holds `done` ship tasks carrying both a
+    # base and a dep, in exactly the shape a QA task has.
+    #
+    # What separates them is that a QA task is cut from the branch of the very task
+    # it waits on. A fix task waits on the QA verdict that found the defect while
+    # being cut from the ship branch, so the two never line up.
+    if base != f"siana/{ship_id}":
+        die(f"{args.task_id} is not a QA task",
+            f"it waits on {ship_id} but was cut from {base}, and a QA task is cut",
+            f"from the branch of the task it judges (siana/{ship_id})",
+            "on a ship task `base` is where the minion started, not what it built,",
+            "so publishing it would ship the state before the work",
+            "pass the QA task whose verdict authorises this instead")
+
+    ship = fold(tasks_file, "id").get(ship_id)
+    if ship is None:
+        die(f"{args.task_id} depends on {ship_id}, which is not in the queue")
+
+    brief_path = os.path.join(home, "briefs", f"{ship_id}.md")
+    if not os.path.isfile(brief_path):
+        die(f"no brief at {brief_path}",
+            "the brief is what says what was asked, and it is the only part of this",
+            "fleet's record that belongs in a merge request; a minion refuses to",
+            "work without one, so its absence here means something else went wrong")
+    brief = open(brief_path).read()
+
+    # Only these two sections travel. The rest of a brief is background, scope and
+    # the minion's own standing limits: written for one agent in this fleet, not for
+    # whoever reviews the merge request. The QA report never travels at all.
+    asked = section(brief, "The task")
+    done_when = section(brief, "Done when")
+    if not asked:
+        die(f"{brief_path} has no `## The task` section",
+            "there is nothing to describe the work with, and a merge request whose",
+            "description is empty is worse than one that was never opened")
+    for part in (asked, done_when):
+        if part and "{" in part and "}" in part:
+            die(f"{brief_path} still carries an unfilled placeholder",
+                "a merge request describing the work as `{TASK}` looks like a",
+                "description and is not one")
+
+    title = str(ship.get("title") or ship_id)
+    body = [asked, ""]
+    if done_when:
+        body += ["## Done when", "", done_when, ""]
+    body += ["---", f"Shipped by `{ship_id}`, accepted by `{args.task_id}`."]
+    body = "\n".join(body)
+
+    # The queue's refusals are all above: they say this verdict does not authorise a
+    # publish. What follows asks whether the world can carry one out, which is a
+    # different failure and worth reaching in a different order.
+    path = os.path.abspath(os.path.expanduser(str(project["path"])))
+    if not os.path.isdir(path):
+        die(f"{handle} points at {path}, which is not a directory",
+            f"fix the `path` for {handle} in {registry}")
+
+    if git(path, "rev-parse", "--git-dir", check=False).returncode != 0:
+        die(f"{handle} is at {path}, which is not a git repository",
+            "there is no branch to push and nothing to open a merge request from")
+
+    if git(path, "rev-parse", "--verify", branch, check=False).returncode != 0:
+        die(f"{path} has no branch {branch}",
+            "the work this verdict accepted is not there under that name; it may",
+            "have been landed and deleted, or the worktree removed with it",
+            "look before deciding: a verdict about a branch nobody can find is",
+            "not evidence about anything that exists now")
+
+    remote = git(path, "remote", "get-url", "origin", check=False)
+    if remote.returncode != 0:
+        die(f"{handle} has no `origin` remote at {path}",
+            "there is nowhere to push, so there is no merge request to open")
+    remote_url = remote.stdout.strip()
+    forge = forge_of(remote_url)
+    if forge is None:
+        die(f"cannot tell which forge {remote_url} is",
+            "only gitlab and github are recognised, and the wrong guess publishes",
+            "somewhere nobody asked for; open this one by hand")
+
+    if args.dry_run:
+        print(f"branch:  {branch}")
+        print(f"target:  {target}")
+        print(f"forge:   {forge} ({remote_url})")
+        print(f"title:   {title}")
+        print("body:")
+        for line in body.splitlines():
+            print(f"  {line}")
+        return
+
+    push = subprocess.run(["git", "-C", path, "push", "--set-upstream", "origin", branch],
+                          capture_output=True, text=True)
+    if push.returncode != 0:
+        die(f"pushing {branch} to origin failed",
+            (push.stderr or push.stdout).strip(),
+            "nothing was opened, so fixing this and running again is safe")
+
+    open_mr = existing(forge, path, branch)
+    if open_mr:
+        print(f"already open: {open_mr}")
+        print(f"pushed {branch} (no second merge request opened)")
+        return
+
+    url = create(forge, path, branch, target, title, body)
+    print(f"opened   {url}")
+    print(f"  branch {branch} -> {target}")
+    print("  merging is the captain's, and still done by hand")
+
+
+if __name__ == "__main__":
+    main()

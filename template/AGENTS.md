@@ -59,6 +59,9 @@ Every project carries its own configuration there:
 - `qa` is that project's independent validation command. Setting it is the
   captain saying ship work there is not accepted on the word of the minion that
   did it, and it puts a QA task behind every ship task you brief.
+- `target` is the branch a merge request targets, and setting it is what turns
+  publishing on. A project without one is never published, so no second field has
+  to say so. See "Publishing".
 - `orders` names extra standing orders every minion on that project receives,
   appended after `orders.md`. That is where a project's build command, its
   conventions, and its untouchable files belong, so you never have to repeat
@@ -231,8 +234,64 @@ Skipping QA for one task is `tasks drop <qa-id>`. It is a decision you report to
 the captain, never a tidy-up: the registry field is their standing answer for that
 project, and dropping the pair overrides them for one piece of work.
 
-None of this lands anything. A green QA says the work holds up; whether it lands,
-and through what, is still the captain's call and still done by hand.
+A green QA is what authorises publishing, and nothing else is. See "Publishing".
+It still lands nothing: what merges is the captain's call, made in person.
+
+## Publishing
+
+    siana-publish <qa-task-id>
+
+A green QA is what authorises this, and nothing else is. In a project whose registry
+record carries a `target`, run it when a QA task comes back `done`: it pushes the
+branch that QA read and opens the merge request against `target`. It never merges.
+
+**It takes the QA task, never the ship task.** A rejected ship task is repaired on a
+new branch cut from the old one, so after one rejection `siana/<ship-id>` is no
+longer the branch worth publishing. A QA task's `base` is the branch that QA actually
+read, so passing the verdict publishes exactly the head a second minion accepted, and
+publishing something QA never saw is not a mistake you can make.
+
+**Re-running is safe, and is how you recover.** Publishing happens outside the store,
+so a restart between a verdict and this call leaves you unable to say whether the
+merge request exists. Do not go looking: run it again. It asks the forge, reports what
+is already open, and exits without opening a second one.
+
+**Only two sections of the ship brief travel**: `## The task` and `## Done when`. The
+rest of a brief is background, scope, and a minion's standing limits, written for one
+agent in this fleet. The QA report never travels at all - it is written for you, and
+it stays in `$SIANA_HOME`.
+
+`--dry-run` prints the branch, the target, the title and the body, and changes
+nothing. Worth one look before a project's first publish.
+
+Then it stops, and the merge is the captain's. Report the merge request; do not merge
+it because the checks are green.
+
+## Reaping
+
+    siana-reap <handle>          # report only, nothing is touched
+    siana-reap <handle> --yes    # remove what has landed
+
+Every rejection adds a link: the ship branch, the QA branch that rejected it, the fix
+branch cut from the ship branch, and the QA branch that reads the fix. Dispatch
+refuses onto a worktree that is already there, so left alone this blocks work rather
+than merely accumulating.
+
+**Landed is the only thing that authorises a removal**, and it is asked two ways
+because one is not enough. A branch contained in `origin/<target>` landed by merge or
+fast-forward. A branch whose merge request the forge reports as merged landed too,
+and that is the only answer that survives a squash or a rebase - there the commits
+that landed carry different hashes, and no ancestry test will ever say yes again.
+
+A task's `done` is not one of those ways and never will be. It says a minion
+finished. It says nothing about whether anyone merged the result.
+
+Three things are kept whatever the forge says: a branch a minion is working on, the
+branch that minion was cut from, and any worktree holding uncommitted changes. And a
+forge it cannot reach answers "kept", never "landed", because where the consequence
+is a deletion, "I could not tell" and "yes" must not be the same answer.
+
+Run it without `--yes` first. It prints every branch and why it was kept.
 
 ## When the rigor is a gate
 
@@ -258,17 +317,16 @@ identically. The minion is told not to move its own branch. **You are the only o
 one who can**: never land, rebase, or force-update `siana/<task-id>` while a run is
 parked on it. Nothing else in the fleet can give that guarantee.
 
-Where the boundary sits is the captain's standing ruling:
+**The pipeline does not push.** It once did, under an earlier ruling, and that
+ruling is superseded: nothing leaves the machine before a QA minion has accepted it,
+and a pipeline runs inside the ship task, which is before. So a driven pipeline here
+is review, test and lint, and the branch is where it ends. `siana-publish` carries
+everything downstream of that, and it is yours.
 
-- **The push happens under the gate, on the minion's side of the line.** The minion
-  never pushes by hand; the pipeline's own push step does it. That is what lets the
-  gate reach its push, pull request and CI steps, which are most of what it was
-  built to do.
-- **SIANA merges the pull request.** The gate's boundary ends at the push target;
-  yours ends at what lands, and merge authority is still the captain's.
-
-So a gated ship task comes back with work published and unmerged, and the merge is
-the same hand-done decision it always was.
+**It must leave `siana/<task-id>` at exactly the head it validated**, before the
+minion calls `done`. The QA worktree is cut from that branch afterwards, so a
+pipeline that rebases and does not return the branch hands the second minion a head
+nobody validated. This is the requirement, not an open question.
 
 A gated run is not fire and forget. The minion is parked for the whole of it - tens
 of minutes, several returns, and escalations at more than one step, not only at
@@ -427,11 +485,18 @@ they were away as one they had already approved.
 
 ## What is not wired yet
 
-QA behind a gated project is unsettled. A QA task's worktree is cut from
-`siana/<ship-id>`, and a gate that rebases leaves the validated head somewhere that
-branch does not point at, so the second minion could judge a head nobody shipped.
-Setting both `qa` and a gated `ship` on one project is a decision to take to the
-captain, not one to resolve by dispatching and hoping.
+Nothing runs `siana-publish` or `siana-reap` for you. Both are yours to call when
+you reconcile: publish when a QA task comes back `done`, reap when you notice a
+project's branches piling up. A watcher that published on its own would be deciding
+that a verdict is enough, which is a decision and not mechanics.
+
+Conventional Commits is the captain's standing rule for every project, and
+`template/orders.md` carries it to every minion. The authoritative pattern is the one
+in `apm-web`'s `.cz.toml`, which its CI enforces on every merge request.
+
+Branches you or the captain make by hand are named `<type>/<slug>`, using the same
+eleven types, so a branch announces what its commits will say. Never `siana/...`:
+that namespace belongs to `siana-dispatch`, and `siana-reap` judges everything in it.
 
 The captain's standing preferences have no store. They live in this file, which you
 can edit, and `just upgrade` preserves your copy with a diff beside it when the
