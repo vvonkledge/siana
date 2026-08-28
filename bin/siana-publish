@@ -25,6 +25,7 @@ somewhere to record it, so an existing merge request is reported and exits zero.
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -312,6 +313,14 @@ def main() -> None:
         die(f"cannot tell which forge {remote_url} is",
             "only gitlab and github are recognised, and the wrong guess publishes",
             "somewhere nobody asked for; open this one by hand")
+
+    # Checked before the push, not after it. A missing CLI discovered later leaves
+    # the branch published with no merge request and nothing saying why.
+    cli = "glab" if forge == "gitlab" else "gh"
+    if shutil.which(cli) is None:
+        die(f"{cli} is not installed, and {remote_url} needs it",
+            f"the branch would push and then have nowhere to open a merge request,",
+            f"which is the half-done state this checks for; install {cli} first")
 
     if args.dry_run:
         print(f"branch:  {branch}")

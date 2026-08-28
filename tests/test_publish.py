@@ -230,6 +230,13 @@ class DryRun(HomeTest):
         out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
         self.assertRefused(out, "unfilled placeholder")
 
+    def test_a_missing_forge_cli_is_caught_before_the_push(self):
+        # Discovered after the push, this leaves the branch published with no merge
+        # request and nothing on the record saying why.
+        out = self.run_bin("siana-publish", "qa-add-json", "--dry-run",
+                           env={"PATH": "/usr/bin:/bin"})
+        self.assertRefused(out, "glab is not installed", "nowhere to open a merge request")
+
     def test_a_branch_that_is_no_longer_there(self):
         subprocess.run(["git", "-C", self.repo, "checkout", "main"],
                        capture_output=True, text=True)

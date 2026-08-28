@@ -132,6 +132,17 @@ class Reap(HomeTest):
         self.assertEqual(found.get("siana/one"), os.path.realpath(checkout))
         self.assertEqual(found.get("main"), os.path.realpath(self.repo))
 
+    def test_a_machine_without_herdr_or_a_forge_cli_still_reaps(self):
+        """CI found this: `subprocess.run` raises rather than returning non-zero when
+        the binary is absent, so a clean runner crashed the whole sweep. Absent has
+        to read as "no herdr workspace" and "could not tell", never as a traceback."""
+        self.branch("siana/landed", landed=True)
+        self.project("demo", path=self.repo, target="main")
+        text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes",
+                                                env={"PATH": "/usr/bin:/bin"}))
+        self.assertIn("reaped (contained)", text)
+        self.assertEqual(self.git("branch", "--list", "siana/landed").strip(), "")
+
     def test_a_repo_with_no_siana_branches(self):
         self.project("demo", path=self.repo, target="main")
         text = self.assertAccepted(self.run_bin("siana-reap", "demo"))
