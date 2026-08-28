@@ -8,16 +8,33 @@ a turn, and everything downstream of it waits that long for no reason.
 This watches the queue, not the fleet. Herdr says a process stopped, never that it
 succeeded, and its `idle` covers both a minion that finished and one that asked a
 question in prose and stalled forever. The queue is the only report that counts, so
-a terminal record appended to `tasks.jsonl` is the only thing that pokes anyone.
+a terminal record appended to `tasks.jsonl` is the only thing that wakes anyone.
 
-**The poke carries no content.** It says the queue moved and nothing else, because
+**The wake carries no content.** It says the queue moved and nothing else, because
 anything it summarised would be a second source of truth able to disagree with the
-store SIANA is about to read anyway. That is also why a missed poke costs only
-timeliness: the store still holds everything, and the next poke or the next turn
+store SIANA is about to read anyway. That is also why a missed wake costs only
+timeliness: the store still holds everything, and the next wake or the next turn
 recovers the whole picture. Never make this the report.
 
+**Nothing here writes into SIANA's pane.** It used to, with herdr's `agent.prompt`,
+and that wrote into the same input editor the captain types in: a draft sitting
+there was concatenated with the wake and submitted as one user message under the
+captain's own name. Herdr has no conditional write and no idea what is in that
+editor, so no check before the write could ever have closed that race.
+
+So this raises a counter at `$SIANA_HOME/wake/pending` and stops there. Delivery
+belongs to a pi extension inside SIANA's own session, which can read the editor and
+send in one synchronous block and therefore excludes the captain rather than racing
+them. This is the only writer of `pending`; the extension is the only writer of
+`consumed` and of the `consumer` record that says a session is reading them.
+
+That extension exists for pi and there is no equivalent for claude, so a SIANA in
+claude is refused at startup rather than served by the old path. Reinstating
+`agent.prompt` as a fallback for it would quietly reinstate the bug this exists to
+remove.
+
 **Running this is the captain's autonomy grant.** SIANA reconciles and dispatches
-ready work when poked, so while this runs the fleet advances without the captain in
+ready work when woken, so while this runs the fleet advances without the captain in
 the room. The grant is this process: it is given by starting it and withdrawn by
 stopping it, and no flag and no registry field can confer it.
 
@@ -50,9 +67,10 @@ import time
 # guessing from owners. A `done` SIANA typed itself costs one wasted reconcile.
 TERMINAL = {"done", "blocked"}
 
-# How long SIANA may stay mid-turn before this says so. It is a warning and never a
-# deadline: a report is held until it can be delivered, however long that takes,
-# because SIANA can be blocked waiting on the captain and the captain can be away.
+# How long SIANA may leave a raised wake untaken before this says so. It is a
+# warning and never a deadline: the counter is durable, so a wake is held until it
+# can be delivered however long that takes, and SIANA can be blocked waiting on the
+# captain while the captain is away.
 SETTLE_WARN_S = 300.0
 
 # How long a pane may answer "no agent here" before this calls the session gone.
@@ -151,7 +169,7 @@ def read_session(home):
     Herdr's labels are not unique and its pane metadata is wiped when its server
     restarts, so this reads what `siana` recorded and never searches for an agent
     that looks about right. A stale file names a pane that is gone or now holds
-    something else, and both are refusals rather than a poke sent into whatever
+    something else, and both are refusals rather than a wake raised for whatever
     happens to be there now.
 
     The harness travels with the pane because herdr answers with the name of the
@@ -188,6 +206,23 @@ def read_session(home):
 # written by anything else: `siana-watch` is the only writer, and `--status` is the
 # only reader that matters.
 GRANT = "watch"
+
+# The mailbox. One writer per file in each direction, which is why there is no write
+# race here to reason about at all: this only ever writes `pending` and only ever
+# reads `consumed` and `consumer`, and the pi extension only ever does the reverse.
+# Neither ever truncates the other's file.
+WAKE = "wake"
+PENDING, CONSUMED, CONSUMER = "pending", "consumed", "consumer"
+
+# The harness the wake extension exists for. A SIANA in the other one has no
+# collision-free path to its session at all, so it is refused rather than served by
+# the terminal write this was built to remove. `template/wake.ts` says why that
+# write was the bug.
+CONSUMING_HARNESS = "pi"
+
+
+def wake_dir(home):
+    return os.path.join(home, WAKE)
 
 
 def stamp():
@@ -231,10 +266,15 @@ def read_grant(path):
     return rec
 
 
-def grant_alive(rec):
-    """Whether that record's process is still this watcher, and why not when it is
-    not. Two questions and never one: the pid answers whether something is there,
-    and the command answers whether it is the thing that recorded this."""
+def still_running(rec):
+    """Whether that record's process is still the process that wrote it, and why not
+    when it is not. Two questions and never one: the pid answers whether something is
+    there, and the command answers whether it is the thing that recorded this.
+
+    Asked of the watcher's own grant record and of the pi session's consumer record,
+    which are written by different programs and are alike in the one way that
+    matters: both name a pid and what `ps` called it, so neither can be stood in for
+    by whatever lands on that pid next."""
     pid = rec.get("pid")
     if not isinstance(pid, int):
         return False, f"the record names no pid, only {pid!r}"
@@ -255,27 +295,30 @@ def grant_alive(rec):
         return False, f"the record cannot say what pid {pid} was, so nothing can say"
     if seen != was:
         return False, (f"pid {pid} is now {seen or 'a process ps will not name'}, "
-                       "not the watcher that recorded it")
+                       "not the process that recorded it")
     return True, ""
 
 
-def _staged(path, record):
-    """The record written beside its destination, so it lands whole or not at all.
-    A status file caught half-written would read as a fault in a fleet that is
-    fine."""
+def _staged_text(path, text):
+    """Written beside its destination, so it lands whole or not at all. A status
+    file caught half-written would read as a fault in a fleet that is fine, and a
+    counter caught half-written would read as a number that was never true."""
     tmp = f"{path}.{os.getpid()}"
     with open(tmp, "w") as f:
-        json.dump(record, f, indent=2)
-        f.write("\n")
+        f.write(text)
     return tmp
+
+
+def _staged(path, record):
+    return _staged_text(path, json.dumps(record, indent=2) + "\n")
 
 
 def claim_grant(home, pane):
     """Record this process as the grant, and refuse when another watcher holds it.
 
     `os.link` refuses an existing destination, so two watchers started together
-    cannot both come away believing they are the only one. Two would poke SIANA
-    twice for every report, and this file could only ever describe one of them, so
+    cannot both come away believing they are the only one. Two would raise two
+    wakes for every report, and this file could only ever describe one of them, so
     the captain would be told about a watcher while another ran unaccounted for."""
     path = os.path.join(home, GRANT)
     command = process_command(os.getpid())
@@ -287,10 +330,10 @@ def claim_grant(home, pane):
             "grant at all")
     held = read_grant(path)
     if held:
-        live, why = grant_alive(held)
+        live, why = still_running(held)
         if live:
             die(f"a watcher is already running (pid {held['pid']})",
-                "two would poke SIANA twice for every report, and only one of them",
+                "two would raise two wakes for every report, and only one of them",
                 f"could be recorded; stop that one first, or read {path}")
         # The record it left is the only account of what stopped it, so it is said
         # here rather than quietly overwritten.
@@ -335,6 +378,124 @@ def release_grant(home):
         pass
 
 
+def read_counter(path):
+    """The number in a counter file, or None when there is no readable number there.
+
+    An absent file is the zero and never a fault: no wake has been raised yet, or
+    none has been taken yet. Anything else that will not read is None rather than
+    zero, because the two callers want opposite things from it and only they know
+    which - a `pending` that reads as zero would throw away every wake this watcher
+    ever raised."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+    try:
+        n = int(text.strip())
+    except ValueError:
+        return None
+    return n if n >= 0 else None
+
+
+def read_pending(home):
+    """The count of wakes raised so far, which this watcher continues from.
+
+    Continued and never restarted, so the counter is monotonic across a restart. A
+    watcher that began again at zero would leave `pending` below the `consumed`
+    mark the extension already holds, and every wake it raised after that would look
+    to the extension like one already delivered - a fleet that never wakes again,
+    with a watcher running and reporting itself healthy the whole time.
+
+    So an unreadable one is a refusal rather than a zero, and it is made in front of
+    the captain before the grant is claimed."""
+    path = os.path.join(wake_dir(home), PENDING)
+    n = read_counter(path)
+    if n is None:
+        die(f"the wake counter at {path} does not hold a number",
+            "this watcher continues the count rather than restarting it, so it",
+            "cannot start without knowing where the count is; read that file, and",
+            "set it to the number in `consumed` beside it if you have to")
+    return n
+
+
+def raise_wake(home, count, pending):
+    """Raise the wake counter by `count`, and answer with where it now stands.
+
+    Written whole with a rename, like the grant record and for the same reason: the
+    pi extension reads this file while this writes it, and a reader that caught it
+    half-written would take a number that was never true as a high-water mark."""
+    path = os.path.join(wake_dir(home), PENDING)
+    pending += count
+    os.replace(_staged_text(path, f"{pending}\n"), path)
+    return pending
+
+
+def read_consumer(home):
+    """The pi session recorded as reading the wake counter, or None when none is.
+
+    A record that will not parse refuses rather than reading as absent, the same way
+    the grant record does: "no consumer" and "a consumer whose record nobody can
+    read" call for opposite things from the captain."""
+    path = os.path.join(wake_dir(home), CONSUMER)
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        die(f"the wake consumer record at {path} cannot be read: {e}",
+            "nothing here can say whether SIANA is reading its wakes; read that",
+            "file, remove it, and restart SIANA so its session writes a new one")
+    if not isinstance(rec, dict):
+        die(f"the wake consumer record at {path} is not a record pi wrote",
+            "read it, remove it, and restart SIANA so its session writes a new one")
+    return rec
+
+
+def confirm_consumer(home, harness):
+    """That something in SIANA's session is reading the wakes this raises.
+
+    Checked at startup, where the captain is at the keyboard and a rerun costs them
+    a second. Nothing else in this process can tell: a wake is a number in a file,
+    so raising one always succeeds, and a watcher with no consumer would sit there
+    counting for an afternoon looking exactly like a fleet with nothing to report.
+    That silence is the failure the whole grant exists to prevent, so this refuses
+    rather than starting.
+
+    There is no fallback to the old terminal write for a session this cannot find a
+    consumer for. That write is the bug: it concatenated the captain's unsubmitted
+    draft with the wake and submitted both. A fallback would reinstate it in exactly
+    the state nobody is watching."""
+    path = os.path.join(wake_dir(home), CONSUMER)
+    if harness != CONSUMING_HARNESS:
+        die(f"SIANA is running in {harness}, which has no collision-free wake path",
+            "the wake is delivered inside SIANA's session by a pi extension, which",
+            f"is the only place that can see the editor; nothing can start a turn in",
+            "a running claude session without typing into the one the captain types",
+            "in, and that is the collision this watcher was rewritten to remove",
+            "restart SIANA with `siana --harness pi` to have the fleet advance while",
+            "you are away")
+    rec = read_consumer(home)
+    if rec is None:
+        die(f"no pi session is reading SIANA's wakes: nothing at {path}",
+            "the wake is a counter in that directory and the pi extension `just",
+            "init` installs at $SIANA_HOME/.pi/extensions/wake.ts is what reads it;",
+            "with nothing reading, every wake this raised would be counted and never",
+            "delivered",
+            "start SIANA with `siana` before starting this, and run `just init` in",
+            "the distro if this is a home from before that extension")
+    live, why = still_running(rec)
+    if not live:
+        die(f"the pi session recorded at {path} is not reading wakes: {why}",
+            "it was killed before it could withdraw its record, so nothing in that",
+            "session is delivering anything",
+            "start SIANA again; its session rewrites this record as it comes up")
+    return rec
+
+
 def fault(lines):
     """A problem in `doctor`'s own shape, on the stream `doctor` puts problems on."""
     print(f"  stale   {lines[0]}", file=sys.stderr)
@@ -360,7 +521,7 @@ def check_grant(home):
         print("  ok      no watcher (the fleet does not advance unattended)")
         return 0
     if rec["state"] == "running":
-        live, why = grant_alive(rec)
+        live, why = still_running(rec)
         if live:
             print(f"  ok      watcher running (pid {rec['pid']}, pane "
                   f"{rec.get('pane')}, since {rec.get('started')})")
@@ -400,8 +561,8 @@ def confirm_alive(h, pane, home, harness):
     for the refusal and stopping is the fleet quietly halting.
 
     `harness` is the one SIANA recorded at startup, and not the set it could have
-    started in: a pane running the other one is a pane SIANA is not in, and the
-    difference between those two readings is a poke typed into a minion."""
+    started in: a pane running the other one is a pane SIANA is not in, and reading
+    those two the same way is a watcher raising wakes nobody will ever take."""
     agent = pane_agent(h, pane)
     if agent and agent.get("agent") == harness:
         return agent
@@ -418,7 +579,7 @@ def reports(path, offset):
     The store is an append-only log of whole records, so a byte offset is the whole
     of the state this needs. A log shorter than the offset was rewritten underneath
     us, so this resumes from the end and reports once: something certainly happened,
-    and the poke carries no content that could be wrong about what."""
+    and the wake carries no content that could be wrong about what."""
     try:
         size = os.path.getsize(path)
     except FileNotFoundError:
@@ -475,6 +636,15 @@ def main():
     pane, harness = read_session(home)
     h = Herdr(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
     confirm_alive(h, pane, home, harness)
+    # Before the grant, because a watcher with nowhere to deliver is not a grant at
+    # all. Every refusal above and below happens in front of the captain, who can
+    # still read it; what the record exists for is the failures after they walk away.
+    confirm_consumer(home, harness)
+    pending = read_pending(home)
+    # The extension makes this directory as its session comes up, and the consumer
+    # record it just answered with is in it. Made here anyway so that the one thing
+    # standing between a report and a wake is never a missing directory.
+    os.makedirs(wake_dir(home), exist_ok=True)
 
     # A watcher left running in the background is stopped with `kill`, and that is
     # the captain withdrawing the grant rather than a crash. Left on its default
@@ -486,10 +656,11 @@ def main():
     # front of the captain, who is still at the keyboard and can read it. What this
     # file exists for is the failures that happen after they walk away.
     grant = claim_grant(home, pane)
-    print(f"watching {tasks_file}\npoking   SIANA at {pane}\ngrant    {grant}",
-          flush=True)
+    print(f"watching {tasks_file}\n"
+          f"waking   SIANA at {pane} through {wake_dir(home)}\n"
+          f"grant    {grant}", flush=True)
     try:
-        watch(h, pane, home, tasks_file, harness, args.interval)
+        watch(h, pane, home, tasks_file, harness, pending, args.interval)
     except KeyboardInterrupt:
         release_grant(home)
         raise
@@ -505,24 +676,25 @@ def _interrupted(signum, frame):
     raise KeyboardInterrupt
 
 
-def watch(h, pane, home, tasks_file, harness, interval):
-    """The loop: read the queue, hold what it finds until SIANA can take it, and
-    stop the moment that pane is no longer SIANA's.
+def watch(h, pane, home, tasks_file, harness, pending, interval):
+    """The loop: read the queue, raise a wake for what it finds, and stop the moment
+    that pane is no longer SIANA's.
 
     `harness` is the agent SIANA recorded at startup, and the only name herdr can
-    report in that pane without it having been taken over."""
+    report in that pane without it having been taken over. `pending` is where the
+    wake count already stood, which this continues rather than restarts."""
     # Start at the end. Reports from before this began were SIANA's to reconcile in
-    # the session that saw them, and replaying them would poke about work already
-    # accounted for. The poke carries no content, so nothing is lost by not knowing
+    # the session that saw them, and replaying them would wake it about work already
+    # accounted for. The wake carries no content, so nothing is lost by not knowing
     # what happened while nothing was watching.
     offset = os.path.getsize(tasks_file) if os.path.exists(tasks_file) else 0
 
-    # Reading the queue and delivering the poke are separate steps of one tick, so
-    # neither can stall the other. Reports that land while SIANA is mid-turn keep
-    # accumulating and leave together, because SIANA reads the whole queue and a poke
-    # per report would only spend turns saying the same thing.
-    pending, waiting_since, warned = [], None, False
-    undetected_since, poke_held_since = None, None
+    consumed_path = os.path.join(wake_dir(home), CONSUMED)
+    # When the count first ran ahead of what SIANA had taken, or None while the two
+    # agree. It is the clock for the held warning and for the line that says the
+    # wake landed.
+    behind_since = None
+    undetected_since = None
     while True:
         # Liveness every tick, not only when there is something to deliver. This
         # process is the captain's autonomy grant, so it must never keep running
@@ -533,10 +705,12 @@ def watch(h, pane, home, tasks_file, harness, interval):
         # than a dead session, so it is held for DETECT_GRACE_S rather than acted on.
         # A restart is one event however it presents - herdr refusing the socket,
         # herdr answering that no agent is there, or herdr answering with a pane it
-        # has not re-detected yet - so all three run the same clock. While it runs no
-        # poke goes out: a pane this cannot identify is precisely the pane a poke must
-        # not be typed into, and a report waiting costs timeliness where a poke into a
-        # stranger's session costs the stranger.
+        # has not re-detected yet - so all three run the same clock.
+        #
+        # Wakes keep being raised throughout it. The old write was typed into a pane
+        # and had to be held while nobody could say whose pane it was; a counter in
+        # SIANA's own home cannot be read by somebody else's agent, so holding it
+        # would only cost timeliness and buy nothing.
         unsure = None
         try:
             agent = pane_agent(h, pane)
@@ -547,8 +721,7 @@ def watch(h, pane, home, tasks_file, harness, interval):
         if unsure:
             if undetected_since is None:
                 undetected_since = time.time()
-                print(f"unsure   {unsure}; every poke is held",
-                      file=sys.stderr, flush=True)
+                print(f"unsure   {unsure}", file=sys.stderr, flush=True)
             if time.time() - undetected_since > DETECT_GRACE_S:
                 die(f"pane {pane} has gone {DETECT_GRACE_S:.0f}s without herdr",
                     f"confirming SIANA is in it: {unsure}",
@@ -556,59 +729,45 @@ def watch(h, pane, home, tasks_file, harness, interval):
                     "so this is a session that has exited or a herdr that is not",
                     f"coming back; restarting SIANA rewrites {home}/session with the",
                     "pane it lands in")
-            status = None
         elif agent.get("agent") != harness:
-            # Not a gap. Something else holds that pane now, so every poke from here
-            # would be typed into somebody else's session. No window makes that safer.
+            # Not a gap. Something else holds that pane now, so SIANA has exited and
+            # the wakes this raises would sit in the mailbox with nobody reading them.
             die(f"pane {pane} is not running SIANA: herdr sees {agent.get('agent')}",
                 "that session has exited and its pane was taken over; restarting",
                 f"SIANA rewrites {home}/session with the pane it lands in")
-        else:
-            if undetected_since is not None:
-                undetected_since = None
-                print(f"detected herdr sees SIANA at {pane} again; pokes resume",
-                      flush=True)
-            status = agent.get("agent_status")
+        elif undetected_since is not None:
+            undetected_since = None
+            print(f"detected herdr sees SIANA at {pane} again", flush=True)
+
         found, offset = reports(tasks_file, offset)
         if found:
             print(f"report   {', '.join(found)}", flush=True)
-            pending += found
-        if pending:
-            # A prompt sent into a working agent is typed into a turn already in
-            # flight, and one sent into a blocked agent is typed into whatever
-            # blocked it, the same hazard dispatch guards against at birth. So wait
-            # for a settled state rather than forcing one, however long that takes.
-            if status in ("idle", "done"):
-                # Delivery failing is a fact about this attempt, not about the
-                # session, and ending this process is ending the grant. So hold the
-                # reports - not clearing `pending` already retries next tick - and
-                # let the next tick's liveness check be the thing that decides
-                # whether that pane is still SIANA's.
-                try:
-                    h.call("agent.prompt", target=pane,
-                           text="The queue moved. Reconcile it.")
-                except Refusal as r:
-                    # Said again on the settle cadence for as long as it keeps
-                    # failing. A herdr that answers `agent.get` and refuses
-                    # `agent.prompt` passes the liveness check every tick, so
-                    # nothing else here would ever mention it, and reports piling
-                    # up behind a silent process is the one state this must not be.
-                    if (poke_held_since is None
-                            or time.time() - poke_held_since > SETTLE_WARN_S):
-                        poke_held_since = time.time()
-                        print(f"held     herdr took no poke: {str(r).splitlines()[0]}; "
-                              f"{len(pending)} report(s) held",
-                              file=sys.stderr, flush=True)
-                else:
-                    poke_held_since = None
-                    print(f"poked    {len(pending)} report(s)", flush=True)
-                    pending, waiting_since, warned = [], None, False
-            elif unsure is None:
-                waiting_since = waiting_since or time.time()
-                if not warned and time.time() - waiting_since > SETTLE_WARN_S:
-                    warned = True
-                    print(f"waiting  SIANA has been mid-turn for {SETTLE_WARN_S:.0f}s; "
-                          f"{len(pending)} report(s) held", file=sys.stderr, flush=True)
+            # Raised as one, however many landed together. The wake carries no
+            # content, so a second one would only spend a turn saying the same thing.
+            pending = raise_wake(home, len(found), pending)
+            print(f"raised   {len(found)} wake(s); {pending} in all", flush=True)
+
+        # What SIANA's session says it has taken. Unreadable reads as nothing taken,
+        # which is the safe direction: it can only ever produce the warning below,
+        # never a wake dropped on the strength of a file nobody could parse.
+        consumed = read_counter(consumed_path)
+        if consumed is None:
+            consumed = 0
+        if pending > consumed:
+            # A warning on the settle cadence and never a deadline. The count is on
+            # disk, so a session that comes back drains it at startup however long it
+            # was away - but held silently, a captain reading a watcher that is
+            # plainly running has no way to know nothing has moved.
+            if behind_since is None:
+                behind_since = time.time()
+            elif time.time() - behind_since > SETTLE_WARN_S:
+                behind_since = time.time()
+                print(f"held     SIANA has taken {consumed} of {pending} wake(s) in "
+                      f"{SETTLE_WARN_S:.0f}s; nothing in its session is reading them",
+                      file=sys.stderr, flush=True)
+        elif behind_since is not None:
+            behind_since = None
+            print(f"woken    SIANA has taken all {consumed} wake(s)", flush=True)
         time.sleep(interval)
 
 

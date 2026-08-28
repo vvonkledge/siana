@@ -87,6 +87,16 @@ class Workflow(unittest.TestCase):
             self.assertRegex(text(), rf"{ref}:\s*[0-9a-f]{{40}}\b",
                              f"{ref} is not pinned to a commit")
 
+    def test_it_installs_a_node_that_can_run_the_wake_extension(self):
+        # The extension is TypeScript and `tests/test_wake.py` skips itself on a
+        # node that cannot strip types. A runner whose node happened to be too old
+        # would not turn this workflow red; it would turn the whole extension half
+        # of the wake path green by never running it. So the version is pinned like
+        # the stores are, and this is what says it has to be.
+        self.assertIn("uses: actions/setup-node", "\n".join(block("jobs")))
+        self.assertRegex(text(), r'NODE_VERSION:\s*"\d+\.\d+\.\d+"',
+                         "NODE_VERSION is not pinned to an exact version")
+
     def test_it_tests_the_submitted_commit_and_not_githubs_merge_commit(self):
         # On a pull request the default ref is a merge commit GitHub synthesises.
         # Nobody submitted it and nobody can check it out again, so a red run on it

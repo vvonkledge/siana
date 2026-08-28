@@ -1,11 +1,14 @@
-"""siana-watch's other half: the pane it pokes, and the loop that decides when to.
+"""siana-watch's other half: the loop, and everything it refuses before it starts.
 
-`test_watch.py` covers what it reads off the queue. This covers what it does with
-that, which is the part the captain is trusting when they walk away. The watcher is
-the autonomy grant, so it has three ways to fail quietly and each is worse than
-stopping: a poke typed into a pane that is no longer SIANA's, a poke that herdr
-refused and nobody heard about, and a process that keeps running long after the
-session it grants for has gone.
+`test_watch.py` covers what it reads off the queue and `test_watch_wake.py` covers
+the counter it raises. This covers what it does with a report once it has one, which
+is the part the captain is trusting when they walk away.
+
+Nothing here types into SIANA's pane any more, and the first test in `Waking` is the
+whole of that regression: herdr is asked about the pane and asked nothing else, ever.
+What is left for herdr to decide is liveness - a watcher is the autonomy grant, so it
+must never keep running after the session it grants for is gone, and must never call
+a live session gone because herdr restarted underneath it.
 
 The commands' `while True` is driven here in-process, with herdr scripted. Herdr's
 answers are also the only clock a test has, so the queue moves when the loop asks
@@ -14,6 +17,7 @@ after the pane - which is exactly when it moves in life.
 
 import contextlib
 import io
+import json
 import os
 import signal
 import sys
@@ -23,7 +27,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from fake_herdr import CLOSE, FakeHerdr, HerdrError
-from helpers import HomeTest, script
+from helpers import HomeTest, gone_pid, script
 
 w = script("siana-watch")
 
@@ -95,6 +99,30 @@ class WatchTest(HomeTest):
         self.addCleanup(self.herdr.stop)
         self.signals = Signals()
         self.store("session", "SIANA_PID=4242", f"SIANA_PANE={self.PANE}")
+        self.wake = w.wake_dir(self.home)
+        os.makedirs(self.wake, exist_ok=True)
+        self.consumer()
+
+    def consumer(self, **fields):
+        """The record a live pi session leaves to say it is reading the wakes.
+
+        This process, because it is the only one here that is certainly alive: the
+        watcher asks the operating system about the recorded pid rather than
+        believing the file, so a live consumer is a record that names something
+        running."""
+        rec = {"pid": os.getpid(), "command": w.process_command(os.getpid()),
+               "started": "2026-08-29T08:00:00Z", **fields}
+        with open(os.path.join(self.wake, w.CONSUMER), "w") as fh:
+            json.dump(rec, fh)
+
+    def pending(self):
+        return w.read_counter(os.path.join(self.wake, w.PENDING))
+
+    def taken(self, count):
+        """SIANA's session recording that it has delivered `count` wakes."""
+        path = os.path.join(self.wake, w.CONSUMED)
+        with open(path, "w") as fh:
+            fh.write(f"{count}\n")
 
     def client(self):
         return w.Herdr(self.herdr.path, timeout=5.0)
@@ -157,8 +185,18 @@ class WatchTest(HomeTest):
             code = w.check_grant(self.home)
         return code, said.getvalue()
 
-    def pokes(self):
-        return self.herdr.calls_to("agent.prompt")
+    def herdr_methods(self):
+        """Every method this watcher called on herdr, once each and in order.
+
+        The regression, in one list. Every herdr write - `agent.prompt`,
+        `agent.send_keys`, `pane.send_text`, `pane.send_input` - lands in the same
+        input editor the captain types in, so the rule is not "never prompt" but
+        "never write", and asserting on the whole set is the only way to hold it."""
+        seen = []
+        for method, _params in self.herdr.calls:
+            if method not in seen:
+                seen.append(method)
+        return seen
 
 
 class PaneAgent(WatchTest):
@@ -212,7 +250,7 @@ class ConfirmAlive(WatchTest):
     def test_the_other_harness_in_that_pane_is_a_takeover_and_not_a_siana(self):
         # The recorded harness is checked, never the pair of them. A claude SIANA
         # whose pane now holds pi is a pane SIANA has left, and reading "either one
-        # will do" would type the captain's pokes into whatever took it.
+        # will do" would leave the watcher raising wakes for a session that left.
         self.herdr.reply("agent.get", SIANA)
         with self.assertRaises(w.Refusal) as cm:
             w.confirm_alive(self.client(), self.PANE, self.home, "claude")
@@ -240,47 +278,95 @@ class Startup(WatchTest):
         self.herdr.reply("agent.get", TAKEOVER)
         result = self.watch()
         self.assertIn("is not running SIANA", str(result.refusal))
-        self.assertEqual(self.pokes(), [])
+        self.assertEqual(self.herdr_methods(), ["agent.get"])
 
-    def test_what_it_is_watching_and_who_it_will_poke_are_said_at_the_start(self):
+    def test_what_it_is_watching_and_where_the_wake_goes_are_said_at_the_start(self):
         self.herdr.reply("agent.get", SIANA, TAKEOVER)
         result = self.watch()
         self.assertIn(f"watching {self.at('tasks.jsonl')}", result.out)
-        self.assertIn(f"poking   SIANA at {self.PANE}", result.out)
+        self.assertIn(f"waking   SIANA at {self.PANE} through {self.wake}",
+                      result.out)
+
+    def test_a_watcher_with_nothing_reading_its_wakes_never_starts(self):
+        # Raising a wake into a home nothing consumes always succeeds, so a watcher
+        # that started anyway would count for an afternoon while looking exactly
+        # like a fleet with nothing to report. There is no fallback to the terminal
+        # write, because that write is the bug.
+        os.unlink(os.path.join(self.wake, w.CONSUMER))
+        self.herdr.reply("agent.get", SIANA)
+
+        result = self.watch()
+
+        self.assertIn("no pi session is reading SIANA's wakes", str(result.refusal))
+        self.assertEqual(self.herdr_methods(), ["agent.get"])
+
+    def test_a_watcher_whose_consumer_was_killed_never_starts(self):
+        self.consumer(pid=gone_pid())
+        self.herdr.reply("agent.get", SIANA)
+
+        result = self.watch()
+
+        self.assertIn("is not reading wakes", str(result.refusal))
+        self.assertIn("start SIANA again", str(result.refusal))
+
+    def test_a_claude_siana_is_refused_rather_than_served_by_the_old_write(self):
+        # A claude session cannot be reached without typing into the editor the
+        # captain types in. So there is no watcher for one, and the refusal says so
+        # rather than quietly reinstating the collision while nobody is watching.
+        self.store("session", "SIANA_HARNESS=claude")
+        self.herdr.reply("agent.get", TAKEOVER)
+
+        result = self.watch()
+
+        self.assertIn("no collision-free wake path", str(result.refusal))
+        self.assertIn("siana --harness pi", str(result.refusal))
+
+    def test_a_refusal_before_the_grant_leaves_no_record_of_a_watcher(self):
+        # Startup refuses in front of the captain, who can read it. A record here
+        # would say a watcher stopped when none ever started.
+        os.unlink(os.path.join(self.wake, w.CONSUMER))
+        self.herdr.reply("agent.get", SIANA)
+
+        self.watch()
+
+        self.assertFalse(os.path.exists(self.at(w.GRANT)))
 
 
-class Poking(WatchTest):
-    """A terminal record is the only thing that pokes anyone, and the poke says the
-    queue moved and nothing else: anything it summarised would be a second source of
-    truth able to disagree with the store SIANA is about to read anyway."""
+class Waking(WatchTest):
+    """A terminal record is the only thing that raises a wake, and the wake is a
+    number in a file: it says the queue moved and nothing else, because anything it
+    summarised would be a second source of truth able to disagree with the store
+    SIANA is about to read anyway."""
 
-    def test_a_terminal_record_wakes_siana_with_a_poke_that_carries_no_content(self):
+    def test_a_terminal_record_raises_a_wake_and_never_writes_into_the_pane(self):
+        # The regression this whole rewrite exists for. Every herdr write lands in
+        # the editor the captain types in, so the assertion is that herdr was asked
+        # about the pane and asked nothing else at all.
         self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA), TAKEOVER)
 
         result = self.watch()
 
-        poke, = self.pokes()
-        self.assertEqual(poke["target"], self.PANE)
-        self.assertEqual(poke["text"], "The queue moved. Reconcile it.")
+        self.assertEqual(self.herdr_methods(), ["agent.get"])
+        self.assertEqual(self.pending(), 1)
         self.assertIn("report   t1 done", result.out)
-        self.assertIn("poked    1 report(s)", result.out)
+        self.assertIn("raised   1 wake(s); 1 in all", result.out)
 
-    def test_one_report_pokes_once_however_long_siana_stays_idle_after(self):
-        # The delivered reports have to be dropped, and nothing else here would
-        # notice if they were not: every other test scripts the pane being taken
-        # over as the answer right after the poke, so the loop dies before a second
-        # delivery tick can happen. This one leaves SIANA live and idle for four
-        # more ticks, which is what a watcher does for the rest of its life.
+    def test_one_report_raises_one_wake_however_long_the_watcher_runs_after(self):
+        # The counter has to stop moving once the report is spent, and nothing else
+        # here would notice if it did not: every other test scripts the pane being
+        # taken over right after, so the loop dies before a second tick can happen.
         self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA),
                          SIANA, SIANA, SIANA, SIANA, TAKEOVER)
 
         result = self.watch()
 
-        self.assertEqual(len(self.pokes()), 1,
-                         "one report, one poke, however many ticks come after it")
-        self.assertEqual(result.out.count("poked"), 1)
+        self.assertEqual(self.pending(), 1)
+        self.assertEqual(result.out.count("raised"), 1)
 
-    def test_reports_that_land_together_cost_one_poke_and_not_one_each(self):
+    def test_reports_that_land_together_are_one_wake_carrying_all_of_them(self):
+        # The wake carries no content, so a second would only spend a turn saying
+        # the same thing. The count still moves by both, because the mark it hands
+        # the extension is a high-water mark and not a doorbell.
         def two():
             self.store("tasks.jsonl", {"id": "t1", "status": "done"},
                        {"id": "t2", "status": "blocked"})
@@ -288,67 +374,88 @@ class Poking(WatchTest):
 
         result = self.watch()
 
-        self.assertEqual(len(self.pokes()), 1)
-        self.assertIn("poked    2 report(s)", result.out)
+        self.assertEqual(self.pending(), 2)
+        self.assertEqual(result.out.count("raised"), 1)
+        self.assertIn("raised   2 wake(s); 2 in all", result.out)
 
-    def test_nothing_terminal_in_the_queue_pokes_nobody(self):
-        # SIANA's own writes - add, start, dep - must never poke SIANA.
+    def test_nothing_terminal_in_the_queue_raises_nothing(self):
+        # SIANA's own writes - add, start, dep - must never wake SIANA.
         started = lambda: self.store("tasks.jsonl", {"id": "t1", "status": "doing"})
         self.herdr.reply("agent.get", SIANA, once(started, SIANA), TAKEOVER)
 
         result = self.watch()
 
-        self.assertEqual(self.pokes(), [])
-        self.assertNotIn("poked", result.out)
+        self.assertEqual(self.pending(), 0)
+        self.assertNotIn("raised", result.out)
 
-    def test_a_report_that_lands_mid_turn_is_held_rather_than_typed_into_the_turn(self):
-        # A prompt sent into a working agent is typed into a turn already in flight.
+    def test_a_report_that_lands_mid_turn_is_raised_all_the_same(self):
+        # It used to be held, because a prompt sent into a working agent was typed
+        # into a turn already in flight. Nothing is typed anywhere now, and the
+        # extension is what decides when a raised wake is safe to deliver - so
+        # holding it here would only delay the fleet and buy nothing.
         self.herdr.reply("agent.get", SIANA, once(self.reported(), BUSY), TAKEOVER)
 
         result = self.watch()
 
-        self.assertEqual(self.pokes(), [])
-        self.assertIn("report   t1 done", result.out)
-        self.assertNotIn("poked", result.out)
+        self.assertEqual(self.pending(), 1)
+        self.assertIn("raised   1 wake(s)", result.out)
 
-    def test_a_held_report_goes_out_as_soon_as_siana_settles(self):
-        self.herdr.reply("agent.get", SIANA, once(self.reported(), BUSY), SIANA,
-                         TAKEOVER)
+    def test_a_watcher_started_again_continues_the_count_rather_than_restarting(self):
+        # A count restarted at zero would sit below the mark the extension already
+        # holds, and every wake after it would look like one already delivered: a
+        # fleet that never wakes again, with a healthy watcher running the while.
+        self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA), TAKEOVER)
+        self.watch()
+        # The captain reading the stopped watcher's record and clearing it, which is
+        # the whole of what stands between one watcher and the next.
+        os.unlink(self.at(w.GRANT))
+        self.herdr.reply("agent.get", SIANA,
+                         once(self.reported("t2", "blocked"), SIANA), TAKEOVER)
 
         result = self.watch()
 
-        self.assertEqual(len(self.pokes()), 1)
-        self.assertIn("poked    1 report(s)", result.out)
+        self.assertEqual(self.pending(), 2)
+        self.assertIn("raised   1 wake(s); 2 in all", result.out)
 
-    def test_a_report_held_a_long_time_is_said_out_loud_once(self):
-        # A warning and never a deadline: the report is still held, however long
-        # SIANA stays mid-turn. But held silently, a captain reading a watcher that
-        # is plainly running has no way to know nothing has moved.
-        self.herdr.reply("agent.get", SIANA, once(self.reported(), BUSY), BUSY, BUSY,
-                         TAKEOVER)
+    def test_a_wake_nothing_takes_is_said_out_loud_on_the_settle_cadence(self):
+        # A warning and never a deadline: the count is on disk, so a session that
+        # comes back drains it however long it was away. But held silently, a
+        # captain reading a watcher that is plainly running has no way to know
+        # nothing has moved.
+        self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA), SIANA,
+                         SIANA, TAKEOVER)
 
         with mock.patch.object(w, "SETTLE_WARN_S", 0.01):
             result = self.watch(interval="0.02")
 
-        self.assertIn("SIANA has been mid-turn", result.err)
-        self.assertIn("1 report(s) held", result.err)
-        self.assertEqual(result.err.count("mid-turn"), 1, "said once, not every tick")
-        self.assertEqual(self.pokes(), [])
+        self.assertIn("held     SIANA has taken 0 of 1 wake(s)", result.err)
+        self.assertIn("nothing in its session is reading them", result.err)
+        # And it says so rather than falling back to writing into the pane, which
+        # is the failure this whole path was rewritten to remove.
+        self.assertEqual(self.herdr_methods(), ["agent.get"])
 
-    def test_a_poke_herdr_refuses_is_said_out_loud_and_tried_again(self):
-        # A herdr that answers `agent.get` and refuses `agent.prompt` passes the
-        # liveness check every tick, so without this nothing would ever mention it
-        # and the reports would pile up behind a process that looks fine.
-        self.herdr.reply("agent.prompt", HerdrError("no_pane", "cannot type there"), {})
-        self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA), SIANA,
-                         TAKEOVER)
+    def test_a_wake_that_is_taken_is_said_out_loud_and_the_warning_stops(self):
+        self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA),
+                         once(lambda: self.taken(1), SIANA), SIANA, TAKEOVER)
 
         result = self.watch()
 
-        self.assertEqual(len(self.pokes()), 2)
-        self.assertIn("held     herdr took no poke", result.err)
-        self.assertIn("1 report(s) held", result.err)
-        self.assertIn("poked    1 report(s)", result.out)
+        self.assertIn("woken    SIANA has taken all 1 wake(s)", result.out)
+        self.assertNotIn("held", result.err)
+
+    def test_a_consumed_mark_nobody_can_read_warns_and_never_stops_the_watcher(self):
+        # Only the extension writes that file, so this watcher must not end the
+        # grant over it. Reading it as nothing taken can only ever produce the
+        # warning, which is the safe direction.
+        self.taken("not a number")
+        self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA), SIANA,
+                         SIANA, TAKEOVER)
+
+        with mock.patch.object(w, "SETTLE_WARN_S", 0.01):
+            result = self.watch(interval="0.02")
+
+        self.assertIn("held     SIANA has taken 0 of 1 wake(s)", result.err)
+        self.assertIn("is not running SIANA", str(result.refusal))
 
 
 class Liveness(WatchTest):
@@ -357,8 +464,9 @@ class Liveness(WatchTest):
     re-detected after a herdr restart."""
 
     def test_a_pane_taken_over_by_another_agent_stops_the_watcher_at_once(self):
-        # Not a gap: something else holds that pane now, so every poke from here
-        # would be typed into somebody else's session. No window makes that safer.
+        # Not a gap: SIANA has left that pane, so nothing is reading the wakes this
+        # would go on raising. A watcher that cannot wake anybody is the fleet
+        # quietly stopping and no one being told.
         self.herdr.reply("agent.get", SIANA, TAKEOVER)
 
         result = self.watch()
@@ -366,18 +474,20 @@ class Liveness(WatchTest):
         self.assertIn("is not running SIANA: herdr sees claude", str(result.refusal))
         self.assertIn("its pane was taken over", str(result.refusal))
 
-    def test_a_pane_herdr_cannot_identify_holds_every_poke_until_it_can(self):
-        # The pane this cannot identify is precisely the pane a poke must not be
-        # typed into. A report waiting costs timeliness; a poke into a stranger's
-        # session costs the stranger.
+    def test_a_pane_herdr_cannot_identify_still_has_its_wakes_raised(self):
+        # This used to hold every poke while nobody could say whose pane it was,
+        # because a poke was typed into one. A counter in SIANA's own home cannot be
+        # read by somebody else's agent, so holding it would cost timeliness and buy
+        # nothing - and the grace is still what keeps a herdr restart from being
+        # read as a dead session.
         self.herdr.reply("agent.get", SIANA, once(self.reported(), REFUSED), SIANA,
                          TAKEOVER)
 
         result = self.watch()
 
-        self.assertIn("every poke is held", result.err)
+        self.assertIn(f"unsure   herdr sees no agent in {self.PANE}", result.err)
         self.assertIn(f"detected herdr sees SIANA at {self.PANE} again", result.out)
-        self.assertEqual(len(self.pokes()), 1)
+        self.assertEqual(self.pending(), 1)
 
     def test_a_herdr_that_never_comes_back_ends_the_grant(self):
         # A watcher parked against a herdr that is not returning is the one thing
@@ -389,8 +499,10 @@ class Liveness(WatchTest):
 
         self.assertIn("without herdr", str(result.refusal))
         self.assertIn("confirming SIANA is in it", str(result.refusal))
-        # Not one poke went out while the pane could not be identified.
-        self.assertEqual(self.pokes(), [])
+        # The report was still counted. Nothing was written anywhere but the
+        # counter, which is what a herdr that never answers cannot make unsafe.
+        self.assertEqual(self.herdr_methods(), ["agent.get"])
+        self.assertEqual(self.pending(), 1)
 
     def test_liveness_is_checked_every_tick_and_not_only_when_there_is_news(self):
         # A watcher that only looked when it had something to deliver would sit for
@@ -412,7 +524,7 @@ class Grant(WatchTest):
 
     def test_a_running_watcher_is_visible_while_it_runs(self):
         # Checked from inside the loop, because after it stops the record says
-        # something else. The poke is the tick's own clock.
+        # something else. Herdr being asked is the tick's own clock.
         seen = []
         self.herdr.reply("agent.get", SIANA,
                          once(lambda: seen.append(self.status()), SIANA), TAKEOVER)

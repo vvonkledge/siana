@@ -101,6 +101,9 @@ Into the home:
   installing it project-locally. For `claude`, `.claude/settings.json` carrying the
   SessionStart hook and `.claude/skills/agent-tasks/`. Both are written when you
   have both. See [The queue integration](#the-queue-integration).
+- `.pi/extensions/wake.ts`, when you have `pi`. It is what delivers `siana-watch`'s
+  wake into SIANA's session, and the watcher refuses to start without it. See
+  [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl` - are
 not written here. `datafile` creates each on its first append, so a contract with no
@@ -194,10 +197,11 @@ to say otherwise for a single start. Everything after the flag is the session's:
 A name that is neither is refused rather than guessed at, because falling back to the
 default would open a session you did not ask for and say nothing about it.
 
-`siana` records the harness it started alongside the pane, and `siana-watch` pokes
-that pane only while herdr still reports that same agent in it. So the watcher
-follows whichever harness you chose, and a pane that has been taken over by the
-other one is a stop rather than a poke typed into somebody else's session.
+`siana` records the harness it started alongside the pane, and `siana-watch` runs
+only while herdr still reports that same agent in it. So a pane that has been taken
+over by the other harness stops the watcher rather than leaving it raising wakes for
+a session that has gone. It also runs only for `pi`, for the reason under
+[Leave it running](#leave-it-running).
 
 ### Register a project
 
@@ -239,7 +243,7 @@ branch once the work has landed.
 
     siana-watch
 
-`siana-watch` watches the queue and pokes SIANA when a minion reports, so the fleet
+`siana-watch` watches the queue and wakes SIANA when a minion reports, so the fleet
 does not idle between your turns. Start it after SIANA is up: it finds the session
 through the home.
 
@@ -247,6 +251,31 @@ through the home.
 ready work without you in the room. The grant is the process: you give it by starting
 this and withdraw it by stopping it with Ctrl-C. Nothing outlives it, so no session
 can inherit an autonomy you did not choose to leave running.
+
+**It never types into SIANA's pane.** It raises a counter under `~/.siana/wake/`, and
+the `wake.ts` extension `init` installed into SIANA's pi session is what reads it and
+delivers the wake. That split is the whole point: the extension can read the input
+editor and send in the same breath, so a wake can never arrive in the middle of
+something you are half way through typing. The watcher used to write the wake into
+that editor through herdr, which concatenated your unsubmitted draft with it and
+submitted both as one message under your name.
+
+So the watcher checks that SIANA's session is reading before it starts, and refuses
+with what to do about it when it is not:
+
+- **Nothing is reading.** The session is not up yet, or the home predates the
+  extension. Start SIANA first, and run `just init` in the distro if `just doctor`
+  reports `.pi/extensions/wake.ts` missing.
+- **The recorded session is gone.** A pi killed hard enough leaves its record
+  behind. Start SIANA again; it rewrites the record as it comes up.
+- **SIANA is running in Claude Code.** There is no collision-free path into a
+  running claude session, so there is no watcher for one either, and no fallback to
+  the old write. Restart SIANA with `siana --harness pi`, or accept that the fleet
+  advances only on your turns.
+
+A wake raised while SIANA is down is not lost: the counter is on disk, and the
+session drains it as it starts. If SIANA stops reading while the watcher runs, the
+watcher says so on its stderr every five minutes and keeps counting.
 
 ### A rigor the minion drives
 

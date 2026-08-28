@@ -225,8 +225,9 @@ class Leadership(Siana):
     def test_the_session_records_the_pid_the_pane_and_the_harness(self):
         # The pane comes from the environment herdr sets, never from searching for
         # an agent that looks about right: herdr's labels are not unique. The
-        # harness goes with it because `siana-watch` will not poke a pane herdr
-        # reports a different agent in, and herdr answers with the agent's name.
+        # harness goes with it because `siana-watch` will not run against a pane
+        # herdr reports a different agent in, and herdr answers with the agent's
+        # name.
         p = self.hold(HERDR_PANE_ID="w3D:p2")
         self.assertEqual(self.session(), {"SIANA_PID": str(p.pid),
                                           "SIANA_PANE": "w3D:p2",
