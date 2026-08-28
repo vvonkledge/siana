@@ -275,23 +275,30 @@ _contract-drift:
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    # No bytecode, from anything this recipe starts. It has to be set out here:
-    # discovery compiles a test module before a line of it runs, so the suite
-    # setting `sys.dont_write_bytecode` on itself is already too late for exactly
-    # the files that appeared. Exported rather than passed as `-B` so the commands
-    # the suite drives as processes inherit it too; a flag would stop at this
-    # interpreter.
+    # No bytecode from this interpreter, and `-B` rather than the suite setting
+    # `sys.dont_write_bytecode` on itself: discovery compiles a test module before a
+    # line of it runs, so the in-suite guard is already too late for exactly the
+    # files that appeared. The flag covers the `bin/` loads in this process too; the
+    # guard in tests/helpers.py covers those when the suite is run without `just`.
+    #
+    # Not exported. PYTHONDONTWRITEBYTECODE would reach the commands the suite drives
+    # as processes, which write no bytecode into the worktree anyway: a script run
+    # directly never writes its own, and the `bin/` commands import stdlib only. What
+    # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
+    # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
+    # on a cold runner against the 40s baseline in .github/workflows/ci.yml. Invisible
+    # locally, where the captain's uv cache is already warm.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`
     # and a `.env` look alike to it. That left every minion worktree on this project
     # unretirable until a human cleared a `tests/__pycache__` by hand.
-    export PYTHONDONTWRITEBYTECODE=1
+    #
     # `-s tests` and no `-t` so the suite's own helpers import by name. Nothing is
     # installed to run these: they drive the commands where the mechanics are pure,
     # and drive them as processes against a real `tasks` and `datafile` where they
     # are not, because a stubbed store would only ever agree with this suite.
-    python3 -m unittest discover -s tests {{args}}
+    python3 -B -m unittest discover -s tests {{args}}
 
 # Report SIANA's state without changing anything
 doctor: _contract-drift

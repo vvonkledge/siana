@@ -28,10 +28,10 @@ import unittest
 # this suite and nothing else. Set before any load, because the loader decides
 # whether to write one at compile time.
 #
-# `just test` exports PYTHONDONTWRITEBYTECODE, which covers this and the test
-# modules discovery compiles before this line can run. This stays for the suite
-# driven straight through `python3 -m unittest`, where a load below is the one
-# thing still writing into bin/.
+# `just test` runs `python3 -B`, which covers this and the test modules discovery
+# compiles before this line can run. This stays for the suite driven straight
+# through `python3 -m unittest`, where a load below is the one thing still writing
+# into bin/.
 sys.dont_write_bytecode = True
 
 DISTRO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
