@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove the worktrees and branches whose work has landed, and nothing else.
+"""Remove the branches whose work has landed, and nothing else.
 
 Every rejection adds a link. A ship branch, the QA branch that read it, a fix branch
 cut from the ship branch, and the QA branch that reads the fix - four for one piece
@@ -24,7 +24,7 @@ a push satisfies, while this asks whether the work landed. A branch whose worktr
 is still there is reported and skipped, so the two commands compose as retire then
 reap rather than racing over the same directory.
 
-It reads `refs/heads` only, and that is a boundary rather than an omission: the
+It reads local refs only, and that is a boundary rather than an omission: the
 remote branch is the forge's. `delete_branch_on_merge` on the repository deletes the
 source branch when its merge request merges, server-side, where no worktree can be in
 the way. From here it cannot be done reliably at all - git refuses to delete a branch
@@ -125,7 +125,7 @@ def worktrees(path: str):
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Remove the worktrees and branches whose work has landed.")
+        description="Remove the branches whose work has landed.")
     ap.add_argument("handle", help="the project to reap")
     ap.add_argument("--yes", action="store_true",
                     help="actually remove; without it nothing is touched")
