@@ -51,14 +51,23 @@ def parse_linked_commands(justfile):
     loop = next(i for i, line in enumerate(body)
                 if re.match(r"\s*for c in siana\b", line))
     # The loop that links, not some other loop over `c`. Scoped to this loop's own
-    # body - it ends at the `done` closing it, indented to match its `for` - because
-    # an `ln -sfn` anywhere later in the recipe would otherwise vouch for a loop that
-    # has none, which is precisely how a second loop added above would quietly take
-    # this over. A body that ends early, at a nested `done` or a reformat, fails this
-    # assert rather than passing on the wrong list.
+    # body - the lines indented under its `for` - because an `ln -sfn` anywhere later
+    # in the recipe would otherwise vouch for a loop that has none, which is precisely
+    # how a second loop added above would quietly take this over.
+    #
+    # The body ends at the first line that is not indented under the `for`, and that
+    # line has to be this loop's own `done`. Anything else there is a loop shape this
+    # parser cannot scope - closed on the `for` line, or never closed at all - and the
+    # failure runs the wrong way round: the scope ends late, not early, swallowing the
+    # real loop's `ln -sfn` and passing on the decoy's list. So not finding the `done`
+    # is the loud case, asserted before anything asks what the body contains.
     indent = re.match(r"\s*", body[loop]).group()
     close = next((i for i, line in enumerate(body[loop + 1:], loop + 1)
-                  if line == indent + "done"), len(body))
+                  if line.strip() and not line.startswith(indent + " ")), None)
+    assert close is not None and body[close].strip() == "done", (
+        f"the first `for c in siana` loop in `init` is not closed by a `done` at "
+        f"its own indent; this parser reads a loop written across lines:\n"
+        f"{body[loop]}")
     assert any("ln -sfn" in line for line in body[loop:close]), (
         f"the first `for c in siana` loop in `init` does not link; point this "
         f"parser at the one that does:\n{body[loop]}")
@@ -109,6 +118,12 @@ class LinkedCommands(unittest.TestCase):
     DECOY = ('    for c in siana; do\n'
              '        test -f "$distro/bin/$c"\n'
              '    done\n')
+    # The same decoy in two formattings whose `done` is not a bare line at the `for`'s
+    # own indent. Both used to leave the scope running on into the linking loop below.
+    ONE_LINE_DECOY = '    for c in siana; do test -f "$distro/bin/$c"; done\n'
+    TRAILING_SPACE_DECOY = ('    for c in siana; do\n'
+                            '        test -f "$distro/bin/$c"\n'
+                            '    done \n')
 
     def recipe(self, *blocks):
         return "init:\n" + "".join(blocks) + "\nnext-recipe:\n    true\n"
@@ -122,6 +137,20 @@ class LinkedCommands(unittest.TestCase):
         # vouches for it, so the README gets checked against one name in silence.
         with self.assertRaises(AssertionError):
             parse_linked_commands(self.recipe(self.DECOY, self.LINKING))
+
+    def test_a_loop_closed_on_its_own_line_is_refused(self):
+        # `justfile:228` writes a short loop on one line, so this is a formatting the
+        # repository uses today. Its `done` never appears at the `for`'s indent, so
+        # the scope ran on to the linking loop below and was vouched for by it.
+        with self.assertRaisesRegex(AssertionError, "not closed by a `done`"):
+            parse_linked_commands(self.recipe(self.ONE_LINE_DECOY, self.LINKING))
+
+    def test_a_done_with_trailing_whitespace_still_ends_the_body(self):
+        # One space after `done` is invisible in review and to `test_conventions`,
+        # and it used to widen the scope over the linking loop. The decoy is refused
+        # here for the reason it is actually wrong: it does not link.
+        with self.assertRaisesRegex(AssertionError, "does not link"):
+            parse_linked_commands(self.recipe(self.TRAILING_SPACE_DECOY, self.LINKING))
 
 
 if __name__ == "__main__":
