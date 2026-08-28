@@ -409,12 +409,16 @@ commit made in it stays, and a new worktree cut from that branch starts at its h
 So retiring is not landing, and a retired branch is still yours to land or to delete
 deliberately later.
 
-**What it checks for is an external safety anchor, which is not a merge.** Before it
-retires finished work it asks whether a copy of that work exists outside the fleet's
-own branches - on the default branch, on a tag, or on any remote-tracking ref. A
-gated ship task comes back published and unmerged, and that push is an anchor: the
-tree may be retired, and doing so says nothing about whether the pull request has
-landed. The merge is still yours, and still a separate decision.
+**What it checks for is a second copy, which is not a merge.** Before it retires
+finished work it asks two things in order. First, did that branch add anything to the
+`base` you queued it with? A branch sitting exactly where it was cut from is held in
+full by that base, so there is nothing to lose - which is every scout and every QA
+task, and why neither ever needs landing to be tidied away. Second, for whatever it
+did add: does a copy exist outside the fleet's own branches - on the default branch,
+on a tag, or on any remote-tracking ref? A gated ship task comes back published and
+unmerged, and that push is an anchor: the tree may be retired, and doing so says
+nothing about whether the pull request has landed. The merge is still yours, and still
+a separate decision.
 
 It refuses rather than guessing, and every refusal is a finding to act on:
 
@@ -422,13 +426,15 @@ It refuses rather than guessing, and every refusal is a finding to act on:
   is the moment you are meant to look
 - tracked, untracked or ignored work in the tree, each named, because that is work
   with no second copy anywhere
-- a `done` task whose branch holds commits reachable from no ref outside
+- a `done` task whose branch added commits reachable from no ref outside
   `refs/heads/siana/*`: what it built exists only on minion branches, each of them
   one `git branch -D` from gone. Land it or publish it, then retire. Sibling
   `siana/*` branches deliberately do not count, because you dispatch QA with the
   ship branch as its base, so `siana/qa-<id>` sits at the ship head and would
-  otherwise anchor the very work it was sent to review. Scout and QA branches land
-  nothing and sit at their base, so this never stops them
+  otherwise anchor the very work it was sent to review. The task's own recorded
+  `base` is the one exception, and only for the commits the branch did not make: a
+  QA or scout branch that added nothing is retired without argument, and a ship
+  branch is never let through by the sibling cut from it
 - a tree whose head has been moved off `siana/<id>`, detached or onto another
   branch. It names where the head actually is; it never moves one back
 - a queue and a git that disagree about where the tree is, a branch that does not

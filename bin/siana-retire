@@ -23,20 +23,35 @@ nothing here may inherit that assumption.
 Usage:
     siana-retire <task-id>
 
-**The external anchor rule.** A `done` task's worktree is retired only when its
-branch holds no commit that exists only inside the fleet: every commit reachable from
-`siana/<task-id>` is also reachable from a ref outside `refs/heads/siana/*`. That
-anchor is the default branch, a tag, or any remote-tracking ref, so a pushed branch is
-anchored whether or not its pull request has merged - what is asked is whether a
-second copy exists, never whose hand put it there. Scout and QA work lands nothing, so
-its branch still sits where it was cut from and the base is its anchor.
+**The external anchor rule.** A `done` task's worktree is retired only when nothing
+on its branch exists in one place. Two questions answer that, and the first one is
+about what the branch added rather than what it holds.
 
-Other `siana/*` branches are deliberately not anchors. A QA task is dispatched with
-the ship branch as its base, so `siana/qa-<id>` is created at the ship head, and
-counting it would report every ship branch as anchored from the moment its review
-started - which is exactly when it has landed nowhere (verified 2026-08-28: this
-project's own unlanded ship branch read as anchored by the QA branch cut from it).
-Work whose only copies are fleet branches is one `git branch -D` away from gone.
+A task's record names the `base` its worktree was cut from. A branch holding no
+commit beyond that exact ref added nothing, and the base is therefore a second copy
+of every commit on it: removing the tree cannot lose work, whether the base is the
+default branch or another `siana/*` one. That is the whole of scout and QA work,
+which lands nothing and sits where it was cut from (verified 2026-08-28: the fleet's
+own `qa-<id>` branches are byte-identical to the ship head they were cut from). It
+says nothing about the work having merged or been published, because it is not asked
+about the base's own safety - only about whether this branch is holding anything the
+base is not.
+
+For whatever a branch did add, every one of those commits must be reachable from a
+ref outside `refs/heads/siana/*`. That anchor is the default branch, a tag, or any
+remote-tracking ref, so a pushed branch is anchored whether or not its pull request
+has merged - what is asked is whether a second copy exists, never whose hand put it
+there.
+
+Other `siana/*` branches are deliberately not anchors for commits a branch added. A
+QA task is dispatched with the ship branch as its base, so `siana/qa-<id>` is created
+at the ship head, and counting it would report every ship branch as anchored from the
+moment its review started - which is exactly when it has landed nowhere (verified
+2026-08-28: this project's own unlanded ship branch read as anchored by the QA branch
+cut from it). Work whose only copies are fleet branches is one `git branch -D` away
+from gone. The recorded base is not a hole in that: it is the one fleet ref this
+branch is known to have come from, rather than any ref that happens to sit at the
+same commit, and it answers only for commits this branch never made.
 
 The rule is only for `done`, because for a task going back out to a new minion the
 branch is not a last copy, it is the delivery mechanism: a worktree cut from an
@@ -244,6 +259,29 @@ def unanchored(repo: str, branch: str):
     return out.split()
 
 
+def beyond_base(repo: str, branch: str, base):
+    """Commits on `branch` that the ref it was cut from does not already hold.
+
+    `None` when that question cannot be asked, which is deliberately not the same as
+    an empty answer: no base recorded, a base this repository no longer has, a base
+    that is not a ref at all, or a base that is this branch itself. In each of those
+    "nothing was added" would mean something other than "the base holds it all", and
+    this limb of the rule may only ever shorten the work by proving a second copy is
+    there. A raw sha reads as no ref on purpose - a commit id keeps nothing, so a
+    branch sitting at one is still a branch sitting alone."""
+    if not base:
+        return None
+    rc, out, _ = git(repo, "rev-parse", "--symbolic-full-name", "--verify",
+                     "--quiet", base)
+    named = out.strip()
+    if rc != 0 or not named or named == f"refs/heads/{branch}":
+        return None
+    rc, out, err = git(repo, "rev-list", "--max-count=1", branch, "--not", named)
+    if rc != 0:
+        die(f"cannot tell what {branch} added to {base}: {err}")
+    return out.split()
+
+
 def loose_work(worktree: str):
     """What removing this tree would destroy, split by how it would read to a human.
 
@@ -347,7 +385,17 @@ def main() -> None:
     if status == "done":
         # See "the external anchor rule" above. Only for `done`: work going back out
         # to a new minion has the branch as its delivery mechanism, not a last copy.
-        if unanchored(repo, branch):
+        # The base limb comes first because it is the cheaper truth: a branch that
+        # added nothing is held in full by the ref it was cut from, and asking the
+        # rest of the repository about it could only ever agree.
+        added = beyond_base(repo, branch, task.get("base"))
+        if (added is None or added) and unanchored(repo, branch):
+            # `--not <base>` only when the base answered, because a base this
+            # repository cannot resolve is exactly why `added` is None, and a hint
+            # that names it would hand SIANA a command git refuses to run.
+            reading = f"read it with: git -C {repo} log --oneline {branch}"
+            if added:
+                reading += f" --not {task['base']}"
             findings.append((
                 f"{branch} holds commits reachable from no ref outside the fleet",
                 ["this task is done and what it built exists only on minion branches",
@@ -355,7 +403,9 @@ def main() -> None:
                  "land it or publish it, then retire the tree it was built in",
                  "a sibling siana/* branch is not an anchor: QA is cut from the ship",
                  "branch, so it holds the same commits and lands none of them",
-                 f"read it with: git -C {repo} log --oneline {branch}"]))
+                 "only this task's own recorded base counts, and only for the commits",
+                 "this branch made on top of it",
+                 reading]))
     tracked, untracked, ignored = loose_work(path)
     if tracked:
         findings.append((f"{len(tracked)} tracked file(s) modified in {path}",

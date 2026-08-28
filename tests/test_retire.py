@@ -73,15 +73,42 @@ class Retire(HomeTest):
         return self.assertAccepted(
             self.run_cmd(["tasks", "--file", self.at("tasks.jsonl"), *args]))
 
-    def dispatched(self, task_id="make-thing", project="proj", cwd=None):
+    def dispatched(self, task_id="make-thing", project="proj", cwd=None,
+                   base=None, deps=()):
         """A task in the state a real dispatch leaves it in: `doing`, its own
-        worktree on `siana/<id>`, and the queue pointing at that tree."""
+        worktree on `siana/<id>`, and the queue pointing at that tree.
+
+        `base` is passed to both halves the way `siana-dispatch` does, to the queue
+        as the task's record and to git as what the worktree is cut from. A test
+        that set only one of them would be testing a shape the fleet cannot
+        produce, which is how the base-only regression got past this suite."""
         self.tasks("add", task_id.replace("-", " "), "--verify", "true",
-                   *(["--project", project] if project else []))
+                   *(["--project", project] if project else []),
+                   *(["--base", base] if base else []),
+                   *sum((["--dep", d] for d in deps), []))
         worktree = self.at("wt", task_id)
-        self.git("worktree", "add", "-q", "-b", f"siana/{task_id}", worktree)
+        self.git("worktree", "add", "-q", "-b", f"siana/{task_id}", worktree,
+                 *([base] if base else []))
         self.tasks("start", task_id, "--owner", "claude@w1:p1",
                    "--cwd", cwd or worktree)
+        return worktree
+
+    def shipped(self, task_id="make-thing"):
+        """A ship task that built something and came back: one commit of its own,
+        on its branch, landed nowhere."""
+        worktree = self.dispatched(task_id)
+        head = self.commit_in(worktree)
+        self.tasks("done", task_id, "--reason", "built it")
+        return worktree, head
+
+    def qa_of(self, ship="make-thing"):
+        """What a real QA dispatch leaves on disk and in the queue: a task that
+        depends on the ship task, records the ship branch as its `base`, and works
+        in a tree cut from it - so `siana/qa-<id>` and `siana/<id>` are the same
+        commit and the QA branch holds nothing of its own."""
+        worktree = self.dispatched(f"qa-{ship}", base=f"siana/{ship}", deps=[ship])
+        self.assertEqual(self.git("rev-parse", f"siana/qa-{ship}").strip(),
+                         self.git("rev-parse", f"siana/{ship}").strip())
         return worktree
 
     def commit_in(self, worktree, name="b.txt", text="work\n"):
@@ -343,15 +370,71 @@ class TheExternalAnchorRule(Retire):
         # dispatches QA with the ship branch as its base, so `siana/qa-<id>` is
         # created at the ship head. Counting any `refs/heads` ref made every ship
         # branch read as landed from the moment its own review started - which is
-        # to say from before it had landed anywhere at all.
-        worktree = self.dispatched()
-        self.commit_in(worktree)
-        self.tasks("done", "make-thing", "--reason", "built it")
-        self.git("worktree", "add", "-q", "-b", "siana/qa-make-thing",
-                 self.at("wt", "qa-make-thing"), "siana/make-thing")
+        # to say from before it had landed anywhere at all. The ship task's own
+        # base is `main`, which holds none of what it built, so the sibling sitting
+        # at its head is the only other ref there is and it still does not count.
+        worktree, _ = self.shipped()
+        self.qa_of()
         self.assertRefused(self.retire(), "reachable from no ref outside the fleet",
                            "QA is cut from the ship")
         self.assertTrue(os.path.isdir(worktree))
+
+    def test_a_qa_worktree_holding_nothing_of_its_own_is_retired(self):
+        # The regression this rule was repaired for (QA, 2026-08-28). Excluding the
+        # whole of `refs/heads/siana/` also excluded a QA task's own base, so the
+        # command refused every QA and every chained tree the fleet creates and told
+        # SIANA to land work QA never built. A QA branch adds no commit to the ship
+        # branch it was cut from, so that branch holds every commit on it and the
+        # tree can go without anything being landed or published.
+        ship, head = self.shipped()
+        qa = self.qa_of()
+        self.tasks("done", "qa-make-thing", "--reason", "judged")
+        self.assertAccepted(self.retire("qa-make-thing"))
+        self.assertFalse(os.path.exists(qa))
+        # Both branches survive, and the ship work is exactly where it was: this
+        # says nothing about the ship task having landed, and must not.
+        self.assertEqual(self.assertBranch("qa-make-thing"), head)
+        self.assertEqual(self.assertBranch(), head)
+        self.assertTrue(os.path.isdir(ship))
+
+    def test_a_branch_that_added_commits_to_a_fleet_base_still_needs_an_anchor(self):
+        # The chained shape: a task cut from another minion's branch that then
+        # builds on it. Its base holds what it started from and nothing it made, so
+        # the commits it added are still in one place and the rule still says so.
+        self.shipped()
+        follow = self.dispatched("extend-thing", base="siana/make-thing",
+                                 deps=["make-thing"])
+        self.commit_in(follow, "more.txt", "the next layer\n")
+        self.tasks("done", "extend-thing", "--reason", "built on it")
+        self.assertRefused(self.retire("extend-thing"),
+                           "reachable from no ref outside the fleet",
+                           "--not siana/make-thing")
+        self.assertTrue(os.path.isdir(follow))
+
+    def test_a_base_this_repository_no_longer_has_is_not_an_anchor(self):
+        # A base the queue names and git cannot find answers nothing, so the
+        # question falls back to the rest of the repository. Failing open here
+        # would make a deleted branch the easiest way to get a tree retired.
+        self.shipped()
+        qa = self.qa_of()
+        self.tasks("done", "qa-make-thing", "--reason", "judged")
+        self.git("branch", "-D", "siana/make-thing")
+        text = self.assertRefused(self.retire("qa-make-thing"),
+                                  "reachable from no ref outside the fleet")
+        # The base is gone, so the hint must not offer a `--not` git would refuse.
+        self.assertNotIn("--not", text)
+        self.assertTrue(os.path.isdir(qa))
+
+    def test_a_base_recorded_as_a_commit_id_is_not_an_anchor(self):
+        # A commit id keeps nothing. A branch sitting at one is still the only
+        # thing holding it, so the base limb only ever answers for a named ref.
+        worktree, head = self.shipped()
+        follow = self.dispatched("extend-thing", base=head)
+        self.tasks("done", "extend-thing", "--reason", "nothing to add")
+        self.assertRefused(self.retire("extend-thing"),
+                           "reachable from no ref outside the fleet")
+        self.assertTrue(os.path.isdir(follow))
+
 
     def test_a_branch_outside_the_fleet_namespace_is_an_anchor(self):
         # What is excluded is `refs/heads/siana/*` and not `refs/heads`. A branch
@@ -401,8 +484,10 @@ class TheExternalAnchorRule(Retire):
         self.assertTrue(os.path.isdir(worktree))
 
     def test_work_that_lands_nothing_is_retired_without_argument(self):
-        # Scout and QA branches sit at whatever they were cut from, so the base
-        # anchors them and neither needs landing to be tidied away.
+        # A branch with no commits at all is held by every ref there is, base or
+        # not. The shape the fleet actually creates, a QA tree cut from a fleet
+        # branch, is `test_a_qa_worktree_holding_nothing_of_its_own_is_retired`;
+        # this fixture branches from `main` and so never exercised that rule.
         worktree = self.finished()
         self.assertAccepted(self.retire())
         self.assertFalse(os.path.exists(worktree))
@@ -441,6 +526,52 @@ class TheExternalAnchorRule(Retire):
         self.tasks("reset", "make-thing", "--reason", "its minion is gone")
         self.assertRefused(self.retire(), "untracked file(s)", "notes.md")
         self.assertTrue(os.path.isdir(worktree))
+
+
+class WhatABaseAnswers(Retire):
+    """`beyond_base` on its own, against a real repository.
+
+    Driven in-process because what it returns is a three-way answer the command
+    only ever shows as retired-or-refused: `[]` is "the base holds it all", a list
+    is "these are new", and `None` is "that base cannot answer", and the last of
+    those must never be read as the first."""
+
+    def base_of(self, branch, base):
+        return r.beyond_base(self.repo, branch, base)
+
+    def setUp(self):
+        super().setUp()
+        worktree, self.head = self.shipped()
+        self.qa = self.qa_of()
+
+    def test_a_base_holding_every_commit_answers_with_nothing_added(self):
+        self.assertEqual(self.base_of("siana/qa-make-thing", "siana/make-thing"), [])
+
+    def test_a_base_missing_what_the_branch_made_names_a_commit(self):
+        self.assertEqual(self.base_of("siana/make-thing", "main"), [self.head])
+
+    def test_no_recorded_base_is_no_answer(self):
+        # The default for a task written before the field existed, and for one
+        # dispatched into the project's own checkout.
+        self.assertIsNone(self.base_of("siana/make-thing", None))
+
+    def test_a_base_this_repository_does_not_have_is_no_answer(self):
+        self.assertIsNone(self.base_of("siana/qa-make-thing", "siana/landed-away"))
+
+    def test_a_base_that_is_not_a_ref_is_no_answer(self):
+        # A commit id resolves and keeps nothing, so it is not a second copy of
+        # anything. `git rev-parse --symbolic-full-name` exits 0 on one and prints
+        # an empty line, which is why this asks for the name and not the status.
+        self.assertIsNone(self.base_of("siana/make-thing", self.head))
+
+    def test_a_base_that_is_the_branch_itself_is_no_answer(self):
+        # A branch is never its own second copy. `siana-dispatch` cannot produce
+        # this record - it would have to cut a branch from itself - but the whole
+        # premise of this limb is that the base is somewhere else, so it is checked
+        # here rather than assumed by the caller.
+        self.assertIsNone(self.base_of("siana/make-thing", "siana/make-thing"))
+        self.assertIsNone(
+            self.base_of("siana/make-thing", "refs/heads/siana/make-thing"))
 
 
 class WhatItSays(Retire):
