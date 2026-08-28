@@ -181,6 +181,87 @@ def fold(store: str, key: str):
     return out
 
 
+# The one line in a ship brief that a script reads. Indented and a single token, so
+# prose about the branch cannot be mistaken for the record of it.
+BRANCH_LINE = re.compile(r"^[ \t]+branch[ \t]+(\S+)[ \t]*$", re.M)
+
+# Only a ship brief names a ship branch. A QA brief carries the branch it judges in
+# the same shape, and reading that as the QA task's own would put its minion on the
+# branch it was meant to be cut from rather than beside it.
+SHIP_SECTION = re.compile(r"^## Delivery: ship[ \t]*$(.*?)(?=^## |\Z)", re.M | re.S)
+
+# `siana/<task-id>`, or `siana/<type>/<task-id>`. Shape only: which types are allowed
+# is `siana-brief`'s to say, because that is the one place a type is ever stated, and
+# a second opinion here would be a second place to change when that list moves.
+BRANCH_NAME = re.compile(r"siana/[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9_-]*)?")
+
+
+def ship_branch(home: str, task_id: str) -> str:
+    """The branch this task's work lives on.
+
+    Ship work is briefed with an explicit Conventional Commit type, and `siana-brief`
+    writes the `siana/<type>/<task-id>` that follows from it into the brief's own
+    delivery section. That line is the fleet's only record of the type, because the
+    type is stated and never inferred: rebuilding a branch name here out of a title,
+    a diff or a commit is the guess the whole convention exists to prevent.
+
+    A brief that names no branch answers `siana/<task-id>`. That covers scout and QA
+    work, whose branch names are fleet roles rather than commit types, and every task
+    briefed before this existed, so nothing already in flight has to be migrated to
+    stay dispatchable.
+
+    A line this cannot read refuses instead of falling back. Every caller is asking
+    which branch holds the work, and answering `siana/<task-id>` when the brief says
+    otherwise would put a worktree, a review or a publish on a branch nobody named.
+    """
+    path = os.path.join(home, "briefs", f"{task_id}.md")
+    try:
+        with open(path) as fh:
+            section = SHIP_SECTION.search(fh.read())
+    except OSError:
+        return f"siana/{task_id}"
+    named = sorted(set(BRANCH_LINE.findall(section.group(1)))) if section else []
+    if not named:
+        return f"siana/{task_id}"
+    if len(named) > 1:
+        die(f"{path} names more than one branch: {', '.join(named)}",
+            "a brief records exactly one, and which of them holds the work is not",
+            "something a script may choose between; fix the brief")
+    if not BRANCH_NAME.fullmatch(named[0]):
+        die(f"{path} records the branch as {named[0]!r}",
+            "a fleet branch is `siana/<type>/<task-id>` for ship work and",
+            "`siana/<task-id>` otherwise; nothing here may guess at what was meant")
+    return named[0]
+
+
+def colliding_refs(repo: str, branch: str):
+    """The existing branches that make `refs/heads/<branch>` impossible to create.
+
+    git stores a ref as a file path, so `siana/docs` and `siana/docs/teach-it` can
+    never both exist. Typed ship branches put a second segment under `siana/`, which
+    is the same namespace scout and QA work still take a single name in, so a task
+    whose id happens to be a commit type collides with every ship branch of that type.
+
+    Asked here rather than left to git, because git's answer arrives back through
+    herdr as a lock failure, after a workspace exists and with nothing in it that
+    names the other branch. This runs before a worktree or a claim is made, so a
+    collision costs a refusal and nothing else.
+
+    A repository this cannot read answers empty. Whether the project is a git
+    repository at all is `worktree.create`'s refusal to give, and it gives a better
+    one than this could.
+    """
+    out = subprocess.run(["git", "-C", repo, "for-each-ref",
+                          "--format=%(refname:short)", "refs/heads"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return []
+    parts = branch.split("/")
+    parents = {"/".join(parts[:i]) for i in range(1, len(parts))}
+    return sorted(r for r in out.stdout.split()
+                  if r in parents or r.startswith(branch + "/"))
+
+
 def load_registry(store: str, schema: str):
     """The captain's registry. Absent is a stop: dispatching without it means
     dispatching to a path nobody wrote down.
@@ -466,7 +547,16 @@ def main() -> None:
         work_cwd = cwd
         root_pane = pane_id = ws["root_pane"]["pane_id"]
     else:
-        branch = f"siana/{args.task_id}"
+        branch = ship_branch(home, args.task_id)
+        blocking = colliding_refs(cwd, branch)
+        if blocking:
+            die(f"{cwd} cannot hold a branch called {branch}",
+                f"git stores a ref as a path, and these are in the way: "
+                f"{', '.join(blocking)}",
+                "a branch and a directory of branches cannot share a name, so one of",
+                "these has to go before the other can exist; a landed one is",
+                "`siana-reap`'s to remove, and a live one is a task still running",
+                "nothing has been created for this dispatch")
         try:
             ws = h.call("worktree.create", cwd=cwd, branch=branch, base=base,
                         label=label, focus=False)

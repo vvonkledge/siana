@@ -38,6 +38,7 @@ reap is the one mistake here that loses work.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -68,6 +69,59 @@ def fold(store: str, key: str):
             else:
                 out[rid] = rec
     return out
+
+
+# The one line in a ship brief that a script reads. Indented and a single token, so
+# prose about the branch cannot be mistaken for the record of it.
+BRANCH_LINE = re.compile(r"^[ \t]+branch[ \t]+(\S+)[ \t]*$", re.M)
+
+# Only a ship brief names a ship branch. A QA brief carries the branch it judges in
+# the same shape, and reading that as the QA task's own would put its minion on the
+# branch it was meant to be cut from rather than beside it.
+SHIP_SECTION = re.compile(r"^## Delivery: ship[ \t]*$(.*?)(?=^## |\Z)", re.M | re.S)
+
+# `siana/<task-id>`, or `siana/<type>/<task-id>`. Shape only: which types are allowed
+# is `siana-brief`'s to say, because that is the one place a type is ever stated, and
+# a second opinion here would be a second place to change when that list moves.
+BRANCH_NAME = re.compile(r"siana/[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9_-]*)?")
+
+
+def ship_branch(home: str, task_id: str) -> str:
+    """The branch this task's work lives on.
+
+    Ship work is briefed with an explicit Conventional Commit type, and `siana-brief`
+    writes the `siana/<type>/<task-id>` that follows from it into the brief's own
+    delivery section. That line is the fleet's only record of the type, because the
+    type is stated and never inferred: rebuilding a branch name here out of a title,
+    a diff or a commit is the guess the whole convention exists to prevent.
+
+    A brief that names no branch answers `siana/<task-id>`. That covers scout and QA
+    work, whose branch names are fleet roles rather than commit types, and every task
+    briefed before this existed, so nothing already in flight has to be migrated to
+    stay dispatchable.
+
+    A line this cannot read refuses instead of falling back. Every caller is asking
+    which branch holds the work, and answering `siana/<task-id>` when the brief says
+    otherwise would put a worktree, a review or a publish on a branch nobody named.
+    """
+    path = os.path.join(home, "briefs", f"{task_id}.md")
+    try:
+        with open(path) as fh:
+            section = SHIP_SECTION.search(fh.read())
+    except OSError:
+        return f"siana/{task_id}"
+    named = sorted(set(BRANCH_LINE.findall(section.group(1)))) if section else []
+    if not named:
+        return f"siana/{task_id}"
+    if len(named) > 1:
+        die(f"{path} names more than one branch: {', '.join(named)}",
+            "a brief records exactly one, and which of them holds the work is not",
+            "something a script may choose between; fix the brief")
+    if not BRANCH_NAME.fullmatch(named[0]):
+        die(f"{path} records the branch as {named[0]!r}",
+            "a fleet branch is `siana/<type>/<task-id>` for ship work and",
+            "`siana/<task-id>` otherwise; nothing here may guess at what was meant")
+    return named[0]
 
 
 def git(path: str, *args):
@@ -170,15 +224,21 @@ def main() -> None:
             die(f"{path} has no {target} or origin/{target}",
                 "there is nothing to measure landing against")
 
+    # Which task each fleet branch belongs to, so a branch found here can be spoken
+    # about as the task that owns it. Every task and not only the live ones, because
+    # the one thing this says about a branch it will not remove is which
+    # `siana-retire` to run, and that task is `done` by then.
+    tasks = fold(tasks_file, "id")
+    owner_of = {ship_branch(home, tid): tid for tid in sorted(tasks)}
+
     # A branch a minion still holds is live work whatever the forge says about it.
     # Both its own branch and the one it was cut from: a fix minion reading its base
     # while that base is deleted underneath it is the same surprise either way.
-    tasks = fold(tasks_file, "id")
     held = set()
     for tid, task in tasks.items():
         if task.get("status") != "doing":
             continue
-        held.add(f"siana/{tid}")
+        held.add(ship_branch(home, tid))
         if task.get("base"):
             held.add(task["base"])
 
@@ -206,8 +266,14 @@ def main() -> None:
         # of that safety check - one that read a tree holding a `.env` as clean,
         # because `git status --porcelain` does not show ignored files.
         if branch in checkouts:
-            kept.append((branch, f"worktree still at {checkouts[branch]}: "
-                                 f"`siana-retire {branch.removeprefix('siana/')}` first"))
+            # Named by its task, not by the branch with `siana/` cut off it: a ship
+            # branch carries a commit type that no task id has, so trimming the
+            # prefix would prescribe `siana-retire <type>/<id>`, which retires
+            # nothing and reads like a typo the captain made.
+            owner = owner_of.get(branch)
+            first = (f"`siana-retire {owner}` first" if owner else
+                     "retire its worktree first; no task in the queue claims it")
+            kept.append((branch, f"worktree still at {checkouts[branch]}: {first}"))
             continue
 
         how = "contained" if contained else "merged on the forge"

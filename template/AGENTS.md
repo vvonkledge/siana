@@ -155,8 +155,10 @@ against, not the last word.
 
 `--base` is the ref the minion's worktree is cut from. Leave it off and the minion
 starts from whatever the project is checked out to, which is what new work wants.
-Set it when the work has to start from an existing branch: a QA task judging
-`siana/<ship-id>`, or a fix that has to build on one.
+Set it when the work has to start from an existing branch: a QA task judging a ship
+branch, or a fix that has to build on one. Read that branch off the ship task's own
+brief, which names it on one line; never assemble it from the task id, because a
+ship branch carries a commit type the id does not.
 
 ## Briefing a minion
 
@@ -164,7 +166,8 @@ The task record carries the checkable half of a contract: the project, the direc
 the verify command, the pointers. The other half is the brief, and it is yours to
 write.
 
-    siana-brief <task-id> --ship | --scout
+    siana-brief <task-id> --ship --type <type>
+    siana-brief <task-id> --scout
 
 That copies the template for that kind to `briefs/<task-id>.md` in this directory.
 You then fill every `{...}` placeholder in it. Scaffold it after `add`, because `add`
@@ -177,10 +180,10 @@ which costs you a whole dispatch. Fill it properly the first time.
 The kind is never defaulted, and the script refuses to choose it for you, because a
 scout that starts shipping is the exact blur you are here to prevent:
 
-- `--ship` lands. The minion commits on `siana/<task-id>` and that branch is the
-  deliverable. Its verify is the project's `ship` command from the registry. Where
-  that project is `pipeline`, the brief has to carry how the pipeline is driven,
-  because the verify no longer expresses it.
+- `--ship` lands. The minion commits on `siana/<type>/<task-id>` and that branch is
+  the deliverable. Its verify is the project's `ship` command from the registry.
+  Where that project is `pipeline`, the brief has to carry how the pipeline is
+  driven, because the verify no longer expresses it.
 - `--scout` reports. The minion writes `reports/<task-id>.md` in this directory and
   lands nothing; its worktree is scratch. Give it a real verify rather than falling
   back to `--prose`, because the report's existence is machine-checkable. Write it
@@ -191,6 +194,30 @@ scout that starts shipping is the exact blur you are here to prevent:
 
   The verify runs in the minion's own shell, so both are set. Quote it single so
   your shell leaves the expansion to the minion's.
+
+### The type on ship work
+
+`--type` is the Conventional Commit type the work's commits will carry, and it is
+required for `--ship` and refused for `--scout`. It is one of the eleven: `build`,
+`chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, `test`.
+Anything else is refused, and a refusal leaves no brief and no QA task behind.
+
+**You state it, and nothing ever infers it.** Not from the title, not from the diff,
+not from the commits, not from what the minion reports back. By any of those points
+the type would be a guess about what the work turned out to be, where what a branch
+name has to say is what the work is for. Deciding it at briefing time is deciding it
+while you still hold the contract.
+
+That is what makes the branch: `siana/<type>/<task-id>`, written into the brief on
+its own line and read from there by dispatch, the pipeline, publishing, retiring and
+reaping. So a branch name is never assembled twice and never disagrees with itself.
+`siana-brief` prints it, and the ship brief holds it if you need it again - for a
+`--base` on a fix task, say.
+
+Scout and QA branches keep a single segment, `siana/<task-id>` and `siana/qa-<id>`.
+Those are roles in this fleet rather than categories of change, and giving them a
+commit type would say a scout lands something. Briefs written before this convention
+keep their `siana/<task-id>` names too, and every command still finds them.
 
 A brief is never scaffolded twice. Change one by editing the file, and only while the
 task is still yours: once a minion has read it, the way to change its contract is to
@@ -211,13 +238,13 @@ the registry is the captain saying that word is not enough there: every ship tas
 gets a QA task behind it, and the work is not accepted until a second minion, one
 that did not write it, has exercised it and said so.
 
-`siana-brief <id> --ship` queues that QA task for you. It depends on the ship task,
-so the dependency graph makes it ready the moment the work comes back, and you
-dispatch it with the same command as anything else. Nothing in its brief is yours
-to fill: it judges the ship work against the ship task's own brief, and it runs the
-project's `qa` command as its verify.
+`siana-brief <id> --ship --type <type>` queues that QA task for you. It depends on
+the ship task, so the dependency graph makes it ready the moment the work comes back,
+and you dispatch it with the same command as anything else. Nothing in its brief is
+yours to fill: it judges the ship work against the ship task's own brief, and it runs
+the project's `qa` command as its verify.
 
-Its worktree is cut from `siana/<ship-id>`, so it reads and runs the work without
+Its worktree is cut from the ship branch, so it reads and runs the work without
 touching the branch that holds it. It fixes nothing, on purpose: a minion that
 repairs what it was sent to judge has spent the only independent reading of the
 work, and the repair arrives with nobody left to check it.
@@ -229,9 +256,10 @@ Its verdict comes back through the queue like any other:
   `reports/<qa-id>.md` holds what was run, what broke, and where.
 
 Acting on a rejection is yours. Queue the fix as ship work in the same project
-with `--base siana/<ship-id>`, so its minion starts from the work rather than
-from a tree that never had it, and brief it with what the report found. That fix
-task gets a QA pair of its own, because it is ship work like any other.
+with `--base <the ship branch>`, which the ship task's brief names on one line, so
+its minion starts from the work rather than from a tree that never had it, and brief
+it with what the report found. That fix task gets a QA pair of its own, because it is
+ship work like any other, so it gets a `--type` of its own too.
 
 Skipping QA for one task is `tasks drop <qa-id>`. It is a decision you report to
 the captain, never a tidy-up: the registry field is their standing answer for that
@@ -249,8 +277,8 @@ record carries a `target`, run it when a QA task comes back `done`: it pushes th
 branch that QA read and opens the merge request against `target`. It never merges.
 
 **It takes the QA task, never the ship task.** A rejected ship task is repaired on a
-new branch cut from the old one, so after one rejection `siana/<ship-id>` is no
-longer the branch worth publishing. A QA task's `base` is the branch that QA actually
+new branch cut from the old one, so after one rejection the first ship branch is no
+longer the one worth publishing. A QA task's `base` is the branch that QA actually
 read, so passing the verdict publishes exactly the head a second minion accepted, and
 publishing something QA never saw is not a mistake you can make.
 
@@ -331,11 +359,11 @@ it gets the same copy. A minion sent into a pipeline with neither drives it by
 guessing.
 
 **A run records the head it validated, and `check` compares.** The QA worktree is cut
-from `siana/<task-id>`, so a head the pipeline never saw would reach a second minion
+from the ship branch, so a head the pipeline never saw would reach a second minion
 wearing this task's green. That is a comparison now rather than a rule: `done` refuses
 when the branch has moved off the commit the passing run recorded. The minion is told
 not to move it. **You are the only other one who can**: never land, rebase, or
-force-update `siana/<task-id>` between a passing run and its `done`. Doing so turns a
+force-update a ship branch between a passing run and its `done`. Doing so turns a
 finished task into a red verify, which is the safe direction and still a round nobody
 needed to spend.
 
@@ -401,7 +429,8 @@ path, so you can never mistype one.
 Brief the task first. Dispatch does not check for a brief, so a briefless minion
 starts, reads nothing, and blocks.
 
-It creates a git worktree on branch `siana/<task-id>`, gives it one Herdr workspace
+It creates a git worktree on the branch the task's brief names - `siana/<type>/<id>`
+for ship work, `siana/<task-id>` for everything else - gives it one Herdr workspace
 labelled with the task id, starts the agent there with `orders.md` plus that
 project's own orders appended to its system prompt, and claims the task in the
 queue. It prints the binding it recorded and returns. It does not wait for the work.
@@ -535,8 +564,8 @@ It refuses rather than guessing, and every refusal is a finding to act on:
   `base` is the one exception, and only for the commits the branch did not make: a
   QA or scout branch that added nothing is retired without argument, and a ship
   branch is never let through by the sibling cut from it
-- a tree whose head has been moved off `siana/<id>`, detached or onto another
-  branch. It names where the head actually is; it never moves one back
+- a tree whose head has been moved off the task's own branch, detached or onto
+  another one. It names where the head actually is; it never moves one back
 - a queue and a git that disagree about where the tree is, a branch that does not
   exist, a worktree already gone, or the branch checked out in the project's own
   checkout
@@ -614,6 +643,8 @@ in `apm-web`'s `.cz.toml`, which its CI enforces on every merge request.
 Branches you or the captain make by hand are named `<type>/<slug>`, using the same
 eleven types, so a branch announces what its commits will say. Never `siana/...`:
 that namespace belongs to `siana-dispatch`, and `siana-reap` judges everything in it.
+A minion's ship branch says the same thing in that namespace, as
+`siana/<type>/<task-id>`.
 
 The captain's standing preferences have no store. They live in this file, which you
 can edit, and `just upgrade` preserves your copy with a diff beside it when the

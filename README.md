@@ -217,6 +217,24 @@ belong; `pipeline` says work there is validated by a pipeline the minion drives
 instead of by a command that runs once, and is described under "A rigor the minion
 drives" below.
 
+### Branches the fleet leaves in your repository
+
+Every minion works in a worktree of its own, on a branch under `siana/`. That prefix
+is the fleet's, and nothing else should use it: `siana-reap` judges everything in it.
+
+Work that lands is named `siana/<type>/<task-id>`, where the type is one of the
+eleven Conventional Commit types. SIANA states it when it briefs the work and never
+infers it afterwards, so the branch says what its commits will say and what the merge
+request will be. Work that lands nothing keeps a single segment - `siana/<task-id>`
+for a scout, `siana/qa-<task-id>` for the minion that judges a ship branch - because
+those are roles in the fleet rather than categories of change. Branches made before
+this convention keep the names they have, and every command still finds them.
+
+You never make one of these by hand, and nothing here pushes one. `siana-publish`
+pushes the branch a QA minion accepted, and only that; `siana-retire` removes the
+worktree once nothing is left in it that only it holds; `siana-reap` removes the
+branch once the work has landed.
+
 ### Leave it running
 
     siana-watch

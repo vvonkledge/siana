@@ -10,10 +10,19 @@ prevent.
 
 ## Delivery: ship
 
-Your work lands. Your branch `siana/$SIANA_TASK_ID` is the deliverable, and it is
-already checked out: commit there and nowhere else. Never push by hand, never open a
-merge request, never merge, and never touch the default branch. SIANA lands your work
-once it is accepted; a branch is never thrown away while it holds work.
+Your work lands. This branch is the deliverable, and it is already checked out:
+
+    branch  {SHIP_BRANCH}
+
+Commit there and nowhere else. Never push by hand, never open a merge request, never
+merge, and never touch the default branch. SIANA lands your work once it is accepted;
+a branch is never thrown away while it holds work.
+
+The middle segment of that name is the Conventional Commit type your commits carry.
+SIANA stated it when it briefed you, so it is not yours to reconsider: a commit whose
+type disagrees with the branch it sits on is exactly the mismatch this naming exists
+to remove. A branch with no such segment is work briefed before this convention, and
+it is still yours to commit on unchanged.
 
 Your task's `verify` is this project's delivery rigor. `tasks done` runs it here in
 your own worktree, so a pass is evidence about your work rather than about the tree
