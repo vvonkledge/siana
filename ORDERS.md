@@ -16,6 +16,8 @@ and the line between those two is the project's whole design.
 - `tests/` is the suite. Standard-library `unittest`, no dependencies.
 - `VISION.md` says what the fleet is for. Read it before you argue with a design
   choice in here, because most of them are downstream of it.
+- `README.md` is the captain's install and operating guide. A change to what `init`
+  writes, to what a command is called, or to what a recipe refuses, changes it too.
 
 ## How your work is checked
 
