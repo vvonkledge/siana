@@ -68,18 +68,21 @@ def merged_on_forge(remote_url: str, path: str, branch: str) -> bool:
     that cannot be reached returns False, because "I could not tell" and "it landed"
     must never be the same answer where the consequence is a deletion."""
     if "gitlab" in remote_url:
-        out = subprocess.run(
-            ["glab", "mr", "list", "--source-branch", branch, "--all", "--output", "json"],
-            cwd=path, capture_output=True, text=True)
-        key = "state"
+        argv = ["glab", "mr", "list", "--source-branch", branch, "--all",
+                "--output", "json"]
         wanted = "merged"
     elif "github" in remote_url:
-        out = subprocess.run(
-            ["gh", "pr", "list", "--head", branch, "--state", "merged", "--json", "state"],
-            cwd=path, capture_output=True, text=True)
-        key = "state"
+        argv = ["gh", "pr", "list", "--head", branch, "--state", "merged",
+                "--json", "state"]
         wanted = "MERGED"
     else:
+        return False
+    key = "state"
+    try:
+        out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    except OSError:
+        # The CLI is not installed. Not knowing has to answer "kept", exactly as an
+        # unreachable forge does.
         return False
     if out.returncode != 0:
         return False
@@ -112,8 +115,13 @@ def herdr_workspace(path: str, checkout: str):
 
     `siana-dispatch` creates worktrees through herdr, so removing one behind herdr's
     back leaves a workspace pointing at a directory that is gone."""
-    out = subprocess.run(["herdr", "worktree", "list"], cwd=path,
-                         capture_output=True, text=True)
+    try:
+        out = subprocess.run(["herdr", "worktree", "list"], cwd=path,
+                             capture_output=True, text=True)
+    except OSError:
+        # herdr is not installed here. A machine without it has no herdr
+        # workspaces, so absent and none-found are the same answer.
+        return None
     if out.returncode != 0:
         return None
     try:

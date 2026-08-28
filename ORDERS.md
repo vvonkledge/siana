@@ -37,6 +37,13 @@ If you change a behaviour a test names, change that test in the same commit and 
 why. If you add a behaviour worth having, add the test that fails without it. A test
 named after a rule is how the next agent finds out the rule exists.
 
+Every pull request into `main` runs that same command on a clean runner, from
+`.github/workflows/ci.yml`. That check is required for merge-readiness: work is not
+ready to land until it is green, and a run that never started is not a pass. It
+installs what the suite drives - `just`, `uv`, `pi`, and pinned checkouts of `tasks`
+and `datafile` - so a green there says the suite passes somewhere other than the
+machine that wrote it.
+
 ## Conventions
 
 - Never the em dash. Use a plain dash.
