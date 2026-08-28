@@ -32,9 +32,24 @@ init: _contract-drift
     # different one behind their back would give SIANA a queue skill that is not
     # the one they are editing. Checked before anything is written, so a typo in
     # SIANA_PI_PACKAGE costs a retype and not a half-built home.
+    #
+    # Two ways to get it wrong, and the second is the likelier one. A path that is
+    # not there is a typo. A directory that is there and holds no package.json is
+    # the near miss: the tasks checkout root rather than the `pi-agent-tasks`
+    # inside it. `pi install -l -a` takes any directory without complaint, so that
+    # one used to exit 0 with a settings.json naming it, `pi package list` showing
+    # nothing, and `doctor` calling the home complete - the silently queueless home
+    # this whole recipe exists to prevent. package.json is what makes a directory a
+    # pi package, and it is what `tasks pi-package --out` writes.
     pkg='{{pi_package}}'
+    problem=""
     if [ -n "$pkg" ] && [ ! -d "$pkg" ]; then
-        echo "no pi package directory at $pkg" >&2
+        problem="no pi package directory at $pkg"
+    elif [ -n "$pkg" ] && [ ! -f "$pkg/package.json" ]; then
+        problem="not a pi package: no package.json in $pkg"
+    fi
+    if [ -n "$problem" ]; then
+        echo "$problem" >&2
         echo "  SIANA_PI_PACKAGE must name a directory holding the tasks pi package" >&2
         echo "  \`tasks pi-package --out <dir>\` writes one; unset it to have init" >&2
         echo "  generate one into $home" >&2

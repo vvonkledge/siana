@@ -117,9 +117,14 @@ it and it will install that one instead of generating anything:
 
     SIANA_PI_PACKAGE=~/src/tasks/pi-agent-tasks just init
 
-A `SIANA_PI_PACKAGE` that does not name a directory is refused before anything is
-written, rather than quietly falling back to a generated package. If you asked for a
-particular package, getting a different one silently is worse than a retype.
+It has to be the package directory itself, the one holding `package.json`, and not
+the checkout around it. A `SIANA_PI_PACKAGE` that is not there, or that names a
+directory with no `package.json` in it, is refused before anything is written rather
+than quietly falling back to a generated package. `pi` installs any directory you
+give it without complaint, so the near miss would otherwise leave you a home that
+`doctor` calls complete with no queue in front of SIANA. If you asked for a
+particular package, getting a different one silently - or none - is worse than a
+retype.
 
 ## Run SIANA
 
