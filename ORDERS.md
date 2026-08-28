@@ -40,6 +40,11 @@ named after a rule is how the next agent finds out the rule exists.
 - Logic that can be exact belongs in a script; work that needs understanding belongs
   in an agent. Never mix them.
 
+The first two are exact, so `just test` checks them instead of trusting you to
+remember (`tests/test_conventions.py`). The column limit is for prose only: fenced
+and indented blocks are commands, and wrapping one changes what it does. The rest of
+this list is judgment and lives only here.
+
 ## Do not
 
 - **Never remove or retype a field in a store contract** (`template/schema-*.yaml`).
