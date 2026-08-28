@@ -162,13 +162,22 @@ if [ "$kind" = ship ]; then
         "off a title or a diff, which is a guess about what the work turned out to" \
         "be rather than a statement of what it is for" \
         "one of: $TYPES"
-    case " $TYPES " in
-        *" $type "*) ;;
-        *) die "$type is not a Conventional Commit type" \
-               "the eleven are: $TYPES" \
-               "a branch named for anything else announces a commit that this" \
-               "project's CI rejects on the merge request" ;;
-    esac
+    # Compared whole against one type at a time. The membership test this replaces,
+    # `case " $TYPES " in *" $type "*)`, matched any adjacent run of the list -
+    # `--type 'ci docs'` is a substring of the haystack, bounded by spaces on both
+    # sides - and went on to write `siana/ci docs/<id>`: a name git refuses to create
+    # and that no reader can read back, because the branch line holds one \S+ token.
+    # Every command then fell to the legacy `siana/<id>` while the QA task queued
+    # just below waited on a base nobody had ever made, and the first refusal came
+    # from a QA dispatch long after the ship work was finished.
+    supported=""
+    for known in $TYPES; do
+        if [ "$type" = "$known" ]; then supported=yes; break; fi
+    done
+    [ -n "$supported" ] || die "$type is not a Conventional Commit type" \
+        "the eleven are: $TYPES" \
+        "a branch named for anything else announces a commit that this" \
+        "project's CI rejects on the merge request"
     branch="siana/$type/$id"
 elif [ -n "$type" ]; then
     die "--type is for ship work, and $id was briefed --scout" \
