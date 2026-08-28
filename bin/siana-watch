@@ -762,9 +762,18 @@ def watch(h, pane, home, tasks_file, harness, pending, interval):
                 behind_since = time.time()
             elif time.time() - behind_since > SETTLE_WARN_S:
                 behind_since = time.time()
+                # What this can see is that the two counters disagree, and that is
+                # all it says. Two states produce it and they want opposite things:
+                # a session that is gone, and a session that is there and holding
+                # every wake behind a draft the captain left in the editor. Naming
+                # the first would send them to restart SIANA, which is exactly what
+                # discards the draft this whole path exists to protect.
                 print(f"held     SIANA has taken {consumed} of {pending} wake(s) in "
-                      f"{SETTLE_WARN_S:.0f}s; nothing in its session is reading them",
-                      file=sys.stderr, flush=True)
+                      f"{SETTLE_WARN_S:.0f}s\n"
+                      "         a draft left in its editor holds every wake until it "
+                      "is sent or cleared;\n"
+                      "         `just doctor` says whether that session is there at "
+                      "all", file=sys.stderr, flush=True)
         elif behind_since is not None:
             behind_since = None
             print(f"woken    SIANA has taken all {consumed} wake(s)", flush=True)

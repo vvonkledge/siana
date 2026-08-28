@@ -274,8 +274,19 @@ with what to do about it when it is not:
   advances only on your turns.
 
 A wake raised while SIANA is down is not lost: the counter is on disk, and the
-session drains it as it starts. If SIANA stops reading while the watcher runs, the
-watcher says so on its stderr every five minutes and keeps counting.
+session drains it as it starts.
+
+If wakes stop being taken while the watcher runs, it says so on its stderr every
+five minutes and keeps counting. It cannot say why, and it does not guess. There are
+two reasons and they want opposite things from you:
+
+- **A draft left in SIANA's editor.** The extension holds every wake while there is
+  text in the input, so that one never arrives in the middle of something you are
+  half way through typing. Send that message or clear it, and the held wake goes out
+  within half a second. Nothing else is needed, and restarting SIANA here would
+  throw the draft away.
+- **The session is gone.** `just doctor` says whether one is running. Start SIANA
+  again and it drains everything counted while it was away.
 
 ### A rigor the minion drives
 
