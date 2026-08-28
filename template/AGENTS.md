@@ -359,9 +359,30 @@ id is the only durable handle back to a running minion: Herdr's labels are not
 unique, its workspace numbers shift when others close, and its pane metadata is
 wiped when its server restarts. Read the owner. Never search by label.
 
-The script stops and reports rather than guessing. A refused claim, an agent that
-never becomes ready, and a minion born blocked on a first-run trust dialog all come
-back to you with the task still held, so nothing is silently lost.
+Herdr's **agent names** are a third namespace, and unlike labels they are unique:
+the server enforces one live agent per name across every workspace, at
+`agent.start` and `agent.rename` alike, and a name can never be shaped like a pane
+id because it cannot contain `:`. Dispatch names the minion after its task and
+targets that name for the seconds between starting the agent and its prompt
+landing, which is safe because it holds the name for all of them: the name resolves
+to the agent it just started or to nothing, never to a different one. That is the
+whole of where a name is safe. It is not durable - it is freed when the agent
+exits and lost when the server restarts - so the pane id stays what the queue
+records and what you read a minion back by.
+
+One consequence for you: **a task id is also a Herdr agent name**, and Herdr's
+grammar is the narrower of the two. It allows `[a-z][a-z0-9_-]` up to 32
+characters where the queue allows 48. Dispatch refuses a longer id before it
+creates anything, so the fix is to re-add the task under a shorter one, which
+costs nothing at that point.
+
+The script stops and reports rather than guessing, and it says which side of the
+claim it stopped on. Before the agent is running, a refusal undoes itself: a claim
+the queue refuses and a start Herdr refuses both take the workspace back down and
+return the task to the queue, so re-dispatching is all it takes once you have fixed
+what the refusal named. After it is running, an agent that never becomes ready and
+a minion born blocked on a first-run trust dialog leave the task held, because by
+then the pane may hold work. Read it before you `reset` it.
 
 **Herdr tells you a process stopped, never that it succeeded.** Its `idle` covers
 both a minion that finished and a minion that asked a question in prose and stalled

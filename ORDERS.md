@@ -21,7 +21,7 @@ and the line between those two is the project's whole design.
 
     just test
 
-About 50 seconds. It drives the pure mechanics in-process and drives the commands as
+About a minute. It drives the pure mechanics in-process and drives the commands as
 real processes against a real `tasks` and `datafile`, because a stubbed store would
 only ever agree with the suite.
 
