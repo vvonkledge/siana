@@ -4,6 +4,9 @@ The watcher is the captain's autonomy grant, so its two failure modes are both
 severe and both silent. Reading the queue wrong drops a minion's report for good,
 and the report is the only thing that ever reaches SIANA. Resolving the session
 wrong types a poke into a stranger's pane.
+
+What it does with a report once it has one - who it pokes, and when it stops - is in
+`test_watch_herdr.py`, where herdr is scripted.
 """
 
 import io

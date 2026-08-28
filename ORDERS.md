@@ -21,9 +21,15 @@ and the line between those two is the project's whole design.
 
     just test
 
-About 35 seconds. It drives the pure mechanics in-process and drives the commands as
+About 50 seconds. It drives the pure mechanics in-process and drives the commands as
 real processes against a real `tasks` and `datafile`, because a stubbed store would
 only ever agree with the suite.
+
+Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
+and answers when it answers, so the answers that matter most - herdr slow, wrong, or
+gone - are the ones it could never be made to give on cue. Its transport is scripted
+and nothing else is: the commands still open a real socket and speak the real
+protocol. Script herdr there; never a store.
 
 If you change a behaviour a test names, change that test in the same commit and say
 why. If you add a behaviour worth having, add the test that fails without it. A test

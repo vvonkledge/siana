@@ -1,10 +1,10 @@
 """siana-dispatch's mechanics: reading a store, and turning a handle into a place.
 
-Everything here runs without herdr. What herdr does is dispatch's other half, but
-the half that decides *where* a minion lands is pure, and it is the half that fails
-silently: a fold that misreads a tombstone dispatches into a project the captain
-deleted, and a resolve that guesses puts a minion in the wrong tree with no sign
-that anything went wrong.
+Everything here runs without herdr. What herdr does is dispatch's other half and is
+covered in `test_dispatch_herdr.py`, but the half that decides *where* a minion lands
+is pure, and it is the half that fails silently: a fold that misreads a tombstone
+dispatches into a project the captain deleted, and a resolve that guesses puts a
+minion in the wrong tree with no sign that anything went wrong.
 """
 
 import io

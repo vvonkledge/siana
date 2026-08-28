@@ -93,15 +93,18 @@ class Herdr:
         self.path, self.timeout = os.path.expanduser(path), timeout
 
     def call(self, method, **params):
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(self.timeout)
-            s.connect(self.path)
-        except OSError as e:
-            die(f"herdr is not reachable at {self.path}: {e}",
-                "the session SIANA runs in lives in herdr; start it first",
-                kind=Unreachable)
-        with s:
+        # Opened inside the `with`, so a connect that fails still closes it. This is
+        # the one path that repeats: while herdr is away, the loop reconnects every
+        # tick for the whole detection grace, and a descriptor left for the garbage
+        # collector on that path is the only place they accumulate.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            try:
+                s.settimeout(self.timeout)
+                s.connect(self.path)
+            except OSError as e:
+                die(f"herdr is not reachable at {self.path}: {e}",
+                    "the session SIANA runs in lives in herdr; start it first",
+                    kind=Unreachable)
             try:
                 s.sendall((json.dumps({"id": "siana-watch", "method": method,
                                        "params": params}) + "\n").encode())
