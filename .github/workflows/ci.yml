@@ -1,0 +1,126 @@
+# Real CI for the distro: a clean runner, every dependency `just test` actually
+# needs installed from a public source, and the project's own verify command run
+# unchanged. Nothing here is weakened for CI - a green check has to mean exactly
+# what `just test` means in a captain's checkout, or it means nothing at all.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Read is the whole of what this needs: it clones, installs, and runs tests. It
+# never pushes, never comments, and never touches a release.
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the ref, so a fresh push cancels only the run it superseded and never
+  # a run on some other branch. `main` is excluded: the default branch's verdict is
+  # what later work is published against, and cancelling one leaves a landed commit
+  # with no verdict at all.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # Named for the command it runs, so a red check tells you what to run locally.
+    name: just test
+    runs-on: ubuntu-latest
+    # The suite takes about 40 seconds. This is a hang guard, not a budget.
+    timeout-minutes: 15
+
+    env:
+      # Pinned rather than tracked, so a red run stays reproducible tomorrow. The
+      # suite drives a real `tasks` and `datafile` on purpose, so these are the
+      # stores under test and not incidental tooling: bump them deliberately, in a
+      # commit that says which siana change needed a newer one.
+      TASKS_REF: d1925ba462896d00bb75de2800d33b5b1c0cdb33 # vvonkledge/tasks main
+      DATAFILE_REF: f6e6cf8124700cfc09eef26138e5cafb2cf9367e # vvonkledge/datafile main
+      # `just init` refuses outright without `pi`, so five tests covering install,
+      # upgrade and uninstall skip themselves when it is absent. Nothing in the
+      # suite executes it; the recipe only checks that it is there.
+      PI_VERSION: "0.84.3"
+      JUST_VERSION: "1.58.0"
+      UV_VERSION: "0.11.21"
+      PYTHON_VERSION: "3.12"
+
+    steps:
+      - name: Check out the submitted commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # On a pull request the default ref is GitHub's synthetic merge commit,
+          # which nobody submitted and nobody can check out again. Test the head
+          # itself, so a red run names a commit that exists on the branch and a
+          # gate comparing submitted heads is comparing the same thing this ran.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Nothing here pushes, so a token left in .git/config would only widen
+          # what a compromised step could reach.
+          persist-credentials: false
+
+      - name: Check out tasks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: vvonkledge/tasks
+          ref: ${{ env.TASKS_REF }}
+          path: .ci-deps/tasks
+          persist-credentials: false
+
+      - name: Check out datafile
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: vvonkledge/datafile
+          ref: ${{ env.DATAFILE_REF }}
+          path: .ci-deps/datafile
+          persist-credentials: false
+
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: ${{ env.JUST_VERSION }}
+
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        # `tasks.py` and `datafile.py` are `uv run --script` programs: uv is what
+        # resolves their pydantic and pyyaml at call time, so without it the suite
+        # cannot drive a real store at all.
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install pi
+        run: npm install --global "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+      - name: Put tasks and datafile on PATH
+        run: |
+          set -euo pipefail
+          # The suite drives both as real processes rather than importing them, so
+          # a checkout is not enough: they have to be commands. Each is one
+          # self-contained script and linking it is the whole of its install,
+          # which is exactly what each project's own `just install` does.
+          mkdir -p "$RUNNER_TEMP/bin"
+          for script in .ci-deps/tasks/tasks.py .ci-deps/datafile/datafile.py; do
+            chmod +x "$script"
+            ln -sfn "$PWD/$script" "$RUNNER_TEMP/bin/$(basename "$script" .py)"
+          done
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Report the versions this run tested against
+        # A red run is only reproducible if it says what it ran against. These also
+        # fail the job before the suite does when an install silently produced
+        # nothing, which reads far better than 129 tests erroring at once.
+        run: |
+          just --version
+          python3 --version
+          uv --version
+          pi --version
+          tasks --version
+          datafile --version
+
+      - name: just test
+        run: just test

@@ -25,6 +25,7 @@ somewhere to record it, so an existing merge request is reported and exits zero.
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -313,6 +314,9 @@ def main() -> None:
             "only gitlab and github are recognised, and the wrong guess publishes",
             "somewhere nobody asked for; open this one by hand")
 
+    cli = "glab" if forge == "gitlab" else "gh"
+    missing = shutil.which(cli) is None
+
     if args.dry_run:
         print(f"branch:  {branch}")
         print(f"target:  {target}")
@@ -321,7 +325,19 @@ def main() -> None:
         print("body:")
         for line in body.splitlines():
             print(f"  {line}")
+        # Reported rather than refused. A dry run changes nothing, so it stays
+        # readable on any machine; it just says what a real one would hit.
+        if missing:
+            print(f"warning: {cli} is not installed here, so a real run would refuse",
+                  file=sys.stderr)
         return
+
+    # Checked before the push, not after it. A missing CLI discovered later leaves
+    # the branch published with no merge request and nothing saying why.
+    if missing:
+        die(f"{cli} is not installed, and {remote_url} needs it",
+            "the branch would push and then have nowhere to open a merge request,",
+            f"which is the half-done state this refuses to create; install {cli}")
 
     push = subprocess.run(["git", "-C", path, "push", "--set-upstream", "origin", branch],
                           capture_output=True, text=True)

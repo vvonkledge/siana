@@ -230,6 +230,22 @@ class DryRun(HomeTest):
         out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
         self.assertRefused(out, "unfilled placeholder")
 
+    def test_a_missing_forge_cli_stops_a_real_run_before_it_pushes(self):
+        # Discovered after the push, this leaves the branch published with no merge
+        # request and nothing on the record saying why.
+        out = self.run_bin("siana-publish", "qa-add-json", env={"PATH": "/usr/bin:/bin"})
+        self.assertRefused(out, "glab is not installed",
+                           "nowhere to open a merge request")
+
+    def test_a_dry_run_still_describes_the_plan_without_the_cli(self):
+        # A dry run changes nothing, so it has to stay readable on a machine that
+        # could not carry it out - including CI, which has neither glab nor gh.
+        text = self.assertAccepted(self.run_bin("siana-publish", "qa-add-json",
+                                                "--dry-run",
+                                                env={"PATH": "/usr/bin:/bin"}))
+        self.assertIn("branch:  siana/add-json", text)
+        self.assertIn("glab is not installed here", text)
+
     def test_a_branch_that_is_no_longer_there(self):
         subprocess.run(["git", "-C", self.repo, "checkout", "main"],
                        capture_output=True, text=True)
