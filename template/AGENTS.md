@@ -277,6 +277,12 @@ branch cut from the ship branch, and the QA branch that reads the fix. Dispatch
 refuses onto a worktree that is already there, so left alone this blocks work rather
 than merely accumulating.
 
+**This removes branches and never worktrees.** `siana-retire` owns those, on a
+lower and different bar: it asks whether a second copy of the work exists anywhere,
+which a push satisfies, while this asks whether the work landed. A branch whose
+worktree is still there is reported and skipped, so the two compose as retire then
+reap.
+
 **Landed is the only thing that authorises a removal**, and it is asked two ways
 because one is not enough. A branch contained in `origin/<target>` landed by merge or
 fast-forward. A branch whose merge request the forge reports as merged landed too,
