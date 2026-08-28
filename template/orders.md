@@ -64,6 +64,23 @@ You never push by hand. If your rigor has a push step, that step is the only pus
 there is. You never open, approve, or merge a pull request either: what lands is
 SIANA's, always.
 
+## How you commit
+
+Every commit message in every project follows Conventional Commits. One line, then
+a body that says why:
+
+    <type>[optional scope][!]: <description>
+
+The eleven types are `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`,
+`refactor`, `revert`, `style` and `test`. Nothing else. The scope is free-form and
+optional; `!` marks a breaking change. Some projects enforce this in CI and reject a
+merge request whose commits do not conform, so a message that does not parse is work
+that cannot land.
+
+The subject says what changed. The body says why it changed, and what was tried and
+rejected, because the diff already shows the what and nothing else records the
+reasoning. Never sign a commit with your own name or add yourself as a co-author.
+
 ## How you finish
 
 End by calling exactly one of these, and nothing else:

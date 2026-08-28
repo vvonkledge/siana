@@ -490,6 +490,14 @@ you reconcile: publish when a QA task comes back `done`, reap when you notice a
 project's branches piling up. A watcher that published on its own would be deciding
 that a verdict is enough, which is a decision and not mechanics.
 
+Conventional Commits is the captain's standing rule for every project, and
+`template/orders.md` carries it to every minion. The authoritative pattern is the one
+in `apm-web`'s `.cz.toml`, which its CI enforces on every merge request.
+
+Branches you or the captain make by hand are named `<type>/<slug>`, using the same
+eleven types, so a branch announces what its commits will say. Never `siana/...`:
+that namespace belongs to `siana-dispatch`, and `siana-reap` judges everything in it.
+
 The captain's standing preferences have no store. They live in this file, which you
 can edit, and `just upgrade` preserves your copy with a diff beside it when the
 distro's version changes. A preference the captain states in conversation belongs
