@@ -18,6 +18,12 @@ A task's status is not one of them. `done` says a minion finished; it says nothi
 about whether anyone merged the result, and reaping on it would delete work that was
 never published.
 
+This removes branches and never worktrees. `siana-retire` owns those, on a lower
+and different bar: it asks whether a second copy of the work exists anywhere, which
+a push satisfies, while this asks whether the work landed. A branch whose worktree
+is still there is reported and skipped, so the two commands compose as retire then
+reap rather than racing over the same directory.
+
 Removal is off by default. A branch is the deliverable in this fleet, so a wrong
 reap is the one mistake here that loses work.
 """
@@ -110,34 +116,6 @@ def worktrees(path: str):
     return found
 
 
-def herdr_workspace(path: str, checkout: str):
-    """The herdr workspace holding a checkout, when there is one.
-
-    `siana-dispatch` creates worktrees through herdr, so removing one behind herdr's
-    back leaves a workspace pointing at a directory that is gone."""
-    try:
-        out = subprocess.run(["herdr", "worktree", "list"], cwd=path,
-                             capture_output=True, text=True)
-    except OSError:
-        # herdr is not installed here. A machine without it has no herdr
-        # workspaces, so absent and none-found are the same answer.
-        return None
-    if out.returncode != 0:
-        return None
-    try:
-        listing = json.loads(out.stdout)
-    except json.JSONDecodeError:
-        return None
-    wanted = os.path.realpath(checkout)
-    for entry in listing.get("result", {}).get("worktrees", []):
-        # Resolved both sides: on macOS /var is a symlink to /private/var, so git's
-        # real path and herdr's can name one directory and not compare equal. A miss
-        # here leaves a herdr workspace pointing at a directory that is gone.
-        if entry.get("path") and os.path.realpath(entry["path"]) == wanted:
-            return entry.get("open_workspace_id")
-    return None
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Remove the worktrees and branches whose work has landed.")
@@ -215,28 +193,21 @@ def main() -> None:
             kept.append((branch, f"not landed: not in {ref}, and no merged merge request"))
             continue
 
-        checkout = checkouts.get(branch)
-        if checkout:
-            dirty = git(checkout, "status", "--porcelain")
-            if dirty.stdout.strip():
-                kept.append((branch, f"worktree at {checkout} has uncommitted changes"))
-                continue
+        # A worktree is `siana-retire`'s to remove, on a different and lower bar:
+        # it asks whether a second copy of the work exists anywhere, where this asks
+        # whether the work landed. Doing it here as well meant a second, worse copy
+        # of that safety check - one that read a tree holding a `.env` as clean,
+        # because `git status --porcelain` does not show ignored files.
+        if branch in checkouts:
+            kept.append((branch, f"worktree still at {checkouts[branch]}: "
+                                 f"`siana-retire {branch.removeprefix('siana/')}` first"))
+            continue
 
         how = "contained" if contained else "merged on the forge"
         if not args.yes:
             reaped.append((branch, f"would reap ({how})"))
             continue
 
-        if checkout:
-            workspace = herdr_workspace(path, checkout)
-            if workspace:
-                subprocess.run(["herdr", "worktree", "remove", "--workspace", workspace],
-                               cwd=path, capture_output=True, text=True)
-            removed = git(path, "worktree", "remove", checkout)
-            if removed.returncode != 0 and os.path.isdir(checkout):
-                kept.append((branch, f"worktree at {checkout} would not remove: "
-                                     f"{(removed.stderr or removed.stdout).strip()}"))
-                continue
         gone = git(path, "branch", "-D", branch)
         if gone.returncode != 0:
             kept.append((branch, (gone.stderr or gone.stdout).strip()))

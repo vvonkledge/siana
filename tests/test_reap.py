@@ -89,25 +89,32 @@ class Reap(HomeTest):
         text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes"))
         self.assertIn("siana/ship  kept: a minion is working on it", text)
 
-    def test_a_dirty_worktree_is_kept(self):
-        self.branch("siana/dirty", landed=True)
+    def test_a_branch_with_a_worktree_is_left_for_retire(self):
+        """Worktrees are `siana-retire`'s, on a lower bar. Removing one here meant a
+        second copy of that safety check, and the copy was worse: `git status
+        --porcelain` does not list ignored files, so a tree holding a `.env` read as
+        clean and `git worktree remove` deleted it without a word."""
+        self.branch("siana/held", landed=True)
         checkout = os.path.join(self.home, "wt")
-        self.git("worktree", "add", checkout, "siana/dirty")
-        with open(os.path.join(checkout, "scratch.txt"), "w") as fh:
-            fh.write("work nobody committed\n")
+        self.git("worktree", "add", checkout, "siana/held")
         self.project("demo", path=self.repo, target="main")
         text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes"))
-        self.assertIn("uncommitted changes", text)
-        self.assertIn("siana/dirty", self.git("branch", "--list", "siana/dirty"))
+        self.assertIn("siana-retire held", text)
+        self.assertTrue(os.path.isdir(checkout))
+        self.assertIn("siana/held", self.git("branch", "--list", "siana/held"))
 
-    def test_a_clean_worktree_goes_with_its_branch(self):
-        self.branch("siana/clean", landed=True)
+    def test_an_ignored_file_is_never_this_command_s_to_judge(self):
+        # The bug this reconcile removes: a `.env` in an otherwise clean worktree.
+        self.branch("siana/dotenv", landed=True)
         checkout = os.path.join(self.home, "wt")
-        self.git("worktree", "add", checkout, "siana/clean")
+        self.git("worktree", "add", checkout, "siana/dotenv")
+        with open(os.path.join(self.repo, ".gitignore"), "w") as fh:
+            fh.write(".env\n")
+        with open(os.path.join(checkout, ".env"), "w") as fh:
+            fh.write("SECRET=hunter2\n")
         self.project("demo", path=self.repo, target="main")
         self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes"))
-        self.assertFalse(os.path.isdir(checkout))
-        self.assertEqual(self.git("branch", "--list", "siana/clean").strip(), "")
+        self.assertTrue(os.path.isfile(os.path.join(checkout, ".env")))
 
     def test_a_project_that_never_publishes_has_nothing_to_reap(self):
         self.branch("siana/landed", landed=True)
@@ -132,10 +139,10 @@ class Reap(HomeTest):
         self.assertEqual(found.get("siana/one"), os.path.realpath(checkout))
         self.assertEqual(found.get("main"), os.path.realpath(self.repo))
 
-    def test_a_machine_without_herdr_or_a_forge_cli_still_reaps(self):
+    def test_a_machine_without_a_forge_cli_still_reaps(self):
         """CI found this: `subprocess.run` raises rather than returning non-zero when
         the binary is absent, so a clean runner crashed the whole sweep. Absent has
-        to read as "no herdr workspace" and "could not tell", never as a traceback."""
+        to read as "could not tell", never as a traceback."""
         self.branch("siana/landed", landed=True)
         self.project("demo", path=self.repo, target="main")
         text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes",

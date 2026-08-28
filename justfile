@@ -142,7 +142,7 @@ init: _contract-drift
     echo "wrote    $home/.pi/settings.json"
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-publish siana-reap; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -339,7 +339,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-publish siana-reap; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"
