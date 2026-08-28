@@ -33,6 +33,12 @@ fields:
     type: str
     required: false
     description: the project's delivery rigor; SIANA types it into `tasks add --verify`
+  pipeline:
+    type: bool
+    default: false
+    description: true when ship work here is validated by a driven pipeline rather
+      than by a command that runs once at `done`. The task's verify then reads the
+      run's outcome (`siana-pipeline check`) and `ship` above is what a run executes
   qa:
     type: str
     required: false

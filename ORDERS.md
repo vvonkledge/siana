@@ -69,3 +69,64 @@ this list is judgment and lives only here.
   and instructions SIANA has evolved for itself. Your worktree is the distro. Writing
   to the home from here would edit the fleet you are running inside.
 - Never edit `CHANGELOG.md` or any file marked auto-generated.
+
+## When a brief sends you through the pipeline
+
+**This project's routine rigor is `just test`, and your task's `verify` says so.**
+Run it, make it pass, and report. That is the whole of what most ship work here
+needs.
+
+`siana-pipeline` is a different thing and it is not the default. It is this distro's
+own validation pipeline: it runs the project's `ship` command and then puts an agent
+on your diff, so every finding costs a review round. It runs when a brief explicitly
+asks for it, and never because this section exists. If your brief does not mention
+it, you are not driving one.
+
+When your brief does ask for it, the rest of this section is how it behaves.
+
+### A round
+
+From your own worktree, with everything committed:
+
+    siana-pipeline run
+
+It refuses a dirty tree. A run validates one commit and records which one, so
+anything you have not committed is work it would pass without having seen. It runs
+`just test` first and starts the reviewer only on a green suite, so a red suite costs
+you a minute and no tokens.
+
+Then read the exit code. It is the whole protocol:
+
+    0   passed. The record is green at this commit. Stop here.
+    1   yours to fix. Fix it, commit, and run again.
+    2   not yours. `block`, and relay what it printed, verbatim.
+
+There is no third state, and there is no run to attach to: the command returns or it
+does not, so nothing can be parked at a gate and there is no status to poll. An exit
+code here really is a verdict, because the thing that produced it has already
+finished.
+
+### After a pass
+
+**Do not commit again.** The run recorded the head it validated, and your verify is
+`siana-pipeline check`, which compares that head against where your branch actually
+is. A commit after a passing run turns a finished task into a red verify, and it does
+so for a good reason: the QA minion is cut from this branch, and it would otherwise
+read a head nothing validated while wearing your green.
+
+If you do have to change something, that is fine. Change it, commit it, and run
+again. What you must never do is change it and call `done`.
+
+`check` starts nothing; it reads the record. So `done` cannot produce a green that a
+run did not already earn, and there is no flag anywhere that makes it try.
+
+### What a finding is
+
+A finding the run lists for you to fix is yours: the reviewer read your diff against
+your brief and says that part is wrong. Fix it, commit, run again.
+
+A finding the run prints as one nobody here can settle is not yours at all. It is a
+product choice, a destructive step, or a change to what you were asked for. `block`
+and relay it word for word. Answering it yourself is deciding something the pipeline
+already said was not the minion's to decide, and paraphrasing it decides half of it
+on the way past.

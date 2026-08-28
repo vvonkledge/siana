@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The captain's one interface. Opens a pi session in SIANA's home, where the
+# The captain's one interface. Opens an agent session in SIANA's home, where the
 # fleet queue and SIANA's own instructions live.
 set -euo pipefail
 
@@ -22,12 +22,77 @@ set +a
 
 cd "$home"
 
+# Which harness this session runs in. Both are told the same things in the same
+# flag and differ only in how consent to this directory is given, so the choice is
+# the captain's and is made per start rather than baked into the home.
+#
+# Resolved before anything else, and before the leader lock in particular: a
+# refusal after the claim would take the session file and release it again, which
+# a watcher reads as a SIANA that started and stopped.
+harness="${SIANA_HARNESS:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --harness)
+            [ $# -ge 2 ] || { echo "--harness needs a name: pi or claude" >&2; exit 1; }
+            harness="$2"; shift 2 ;;
+        --harness=*) harness="${1#--harness=}"; shift ;;
+        *) break ;;
+    esac
+done
+
+# The queue integration `just init` wrote for each harness. Checked rather than
+# read out of siana.env, because a name recorded there is a claim about the home
+# and these are the things themselves.
+pi_settings="$home/.pi/settings.json"
+claude_settings="$home/.claude/settings.json"
+
+# No choice means whichever this home was installed for, pi first when it has
+# both. `init` writes an integration for every harness it finds, so this is
+# reading what the captain has rather than guessing between two working homes.
+if [ -z "$harness" ]; then
+    if [ -f "$pi_settings" ]; then harness=pi
+    elif [ -f "$claude_settings" ]; then harness=claude
+    else
+        echo "no harness is installed in $home" >&2
+        echo "  install pi or claude, then run \`just init\` in the distro" >&2
+        exit 1
+    fi
+fi
+
+# Named in a `case` rather than resolved by a function, because a function would
+# have to report an unknown name from inside a command substitution, where `exit`
+# leaves the subshell and the caller carries on with an empty path.
+case "$harness" in
+    pi)     settings="$pi_settings" ;;
+    claude) settings="$claude_settings" ;;
+    *)
+        echo "unknown harness: $harness" >&2
+        echo "  SIANA starts in pi or claude; nothing else is guessed" >&2
+        exit 1 ;;
+esac
+
+# A harness whose integration was never installed opens a session with no fleet
+# queue in front of it. That session looks exactly like a working SIANA, answers
+# about the queue from nothing, and is the one failure this check exists for.
+if [ ! -f "$settings" ]; then
+    echo "$harness has no queue integration in $home" >&2
+    echo "  install $harness, then run \`just init\` in the distro to write one" >&2
+    exit 1
+fi
+
+command -v "$harness" >/dev/null || {
+    echo "missing: $harness" >&2
+    echo "  it is the harness this session was asked to start in" >&2
+    exit 1
+}
+
 # The registry tells SIANA which projects exist and where they live. Appending it
 # to the system prompt makes that a guarantee rather than a read SIANA might skip.
 #
 # The fields are pinned rather than left to the default view, because `list` shows
-# only the first few and would silently drop `worktree` - and a registry that looks
-# complete while hiding a project's isolation policy is worse than no registry.
+# only the first few and would silently drop `worktree` and `pipeline` - and a
+# registry that looks complete while hiding a project's isolation policy, or the
+# fact that its ship tasks take a different verify, is worse than no registry.
 #
 # A registry that cannot be read is a stop, not an empty registry. Injecting an
 # error message here would leave SIANA believing the captain has no projects.
@@ -39,7 +104,7 @@ cd "$home"
 context=""
 if [ -f "$home/schema-projects.yaml" ]; then
     if ! registry="$(datafile -f "$home/projects.jsonl" \
-            list --fields handle,path,ship,orders,worktree 2>&1)"; then
+            list --fields handle,path,ship,pipeline,orders,worktree 2>&1)"; then
         echo "the project registry at $home/projects.jsonl is not readable" >&2
         echo "$registry" >&2
         exit 1
@@ -85,7 +150,7 @@ prompt=()
 #
 # It carries the pid, because that is what liveness can be asked about, and the pane
 # id when there is one, because that is how `siana-watch` wakes this session. The
-# pane id comes from the environment herdr sets, never from searching for a pi agent
+# pane id comes from the environment herdr sets, never from searching for an agent
 # that looks about right: herdr's labels are not unique, so a search could poke the
 # wrong session.
 session="$home/session"
@@ -110,6 +175,13 @@ claim() {
     {
         printf 'SIANA_PID=%s\n' "$$"
         [ -n "${HERDR_PANE_ID:-}" ] && printf 'SIANA_PANE=%s\n' "$HERDR_PANE_ID"
+        # Which harness is in that pane. `siana-watch` will not poke a pane herdr
+        # reports a different agent in, because that pane has been taken over and
+        # every poke would be typed into somebody else's session. Herdr names the
+        # agent it detected, so the watcher needs to know which name is SIANA's -
+        # and asking the home would answer with what is installed rather than with
+        # what started.
+        printf 'SIANA_HARNESS=%s\n' "$harness"
     } > "$tmp"
     if ln "$tmp" "$session" 2>/dev/null; then
         rm -f "$tmp"
@@ -142,6 +214,16 @@ trap 'rm -f "$session"' EXIT
 [ -n "${HERDR_PANE_ID:-}" ] || \
     echo "not running under herdr: siana-watch cannot wake this session" >&2
 
-# --approve trusts this directory's project-local pi files. The captain created
-# this directory by running init, so the consent is explicit rather than inferred.
-pi --approve "${prompt[@]}" "$@"
+# Started as a child and never `exec`ed, so the trap above still runs and the
+# session file is released when the harness exits.
+case "$harness" in
+    # --approve trusts this directory's project-local pi files. The captain created
+    # this directory by running init, so the consent is explicit rather than inferred.
+    pi) pi --approve "${prompt[@]}" "$@" ;;
+    # No consent flag. claude reads this directory's .claude/settings.json without
+    # being asked, and the captain is sitting in front of this session: waiving its
+    # permission prompts is a decision only they can make, so it is theirs to pass
+    # through rather than one this command makes on their behalf. A minion's is
+    # waived by `siana-dispatch` because nobody is there to answer one.
+    claude) claude "${prompt[@]}" "$@" ;;
+esac

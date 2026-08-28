@@ -145,13 +145,19 @@ class Herdr:
 
 
 def read_session(home):
-    """SIANA's pane id, which is the only durable handle back to its session.
+    """SIANA's pane id and the harness in it, the only durable handle back to its
+    session.
 
     Herdr's labels are not unique and its pane metadata is wiped when its server
-    restarts, so this reads what `siana` recorded and never searches for a pi agent
+    restarts, so this reads what `siana` recorded and never searches for an agent
     that looks about right. A stale file names a pane that is gone or now holds
     something else, and both are refusals rather than a poke sent into whatever
-    happens to be there now."""
+    happens to be there now.
+
+    The harness travels with the pane because herdr answers with the name of the
+    agent it detected, and SIANA's session can be either of two. Recorded rather
+    than inferred from the home: what is installed there is what SIANA could have
+    started in, and this has to be what it did start in."""
     path = os.path.join(home, "session")
     if not os.path.isfile(path):
         die(f"no SIANA session recorded at {path}",
@@ -164,6 +170,10 @@ def read_session(home):
                 k, v = line.split("=", 1)
                 fields[k.strip()] = v.strip()
     pane = fields.get("SIANA_PANE")
+    # A session file written before SIANA could start in anything else. Its writer
+    # started pi, so that is not a default standing in for an unknown - it is the
+    # only thing the file could have meant.
+    harness = fields.get("SIANA_HARNESS", "pi")
     if not pane:
         # A SIANA outside herdr is a working SIANA, just one with no pane to prompt.
         # Saying which of the two it is beats reporting a missing session that is
@@ -171,7 +181,7 @@ def read_session(home):
         die(f"SIANA (pid {fields.get('SIANA_PID', '?')}) is running outside herdr",
             "nothing can wake a session herdr does not host; restart SIANA inside",
             "herdr if you want the fleet to advance while you are away")
-    return pane
+    return pane, harness
 
 
 # Where this process records that it is the grant. Not part of an install and never
@@ -381,15 +391,19 @@ def pane_agent(h, pane):
         return None
 
 
-def confirm_alive(h, pane, home):
+def confirm_alive(h, pane, home, harness):
     """That pane still holds SIANA, not a shell or somebody else's agent.
 
     This is the check at startup, where an undetected agent is refused outright:
     the captain is at the keyboard and a rerun costs them a second. Once the loop
     is running the same answer is held instead, because by then nobody is watching
-    for the refusal and stopping is the fleet quietly halting."""
+    for the refusal and stopping is the fleet quietly halting.
+
+    `harness` is the one SIANA recorded at startup, and not the set it could have
+    started in: a pane running the other one is a pane SIANA is not in, and the
+    difference between those two readings is a poke typed into a minion."""
     agent = pane_agent(h, pane)
-    if agent and agent.get("agent") == "pi":
+    if agent and agent.get("agent") == harness:
         return agent
     seen = (agent or {}).get("agent") or "no agent"
     die(f"pane {pane} is not running SIANA: herdr sees {seen}",
@@ -458,9 +472,9 @@ def main():
     if args.status:
         raise SystemExit(check_grant(home))
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(home, "tasks.jsonl")
-    pane = read_session(home)
+    pane, harness = read_session(home)
     h = Herdr(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
-    confirm_alive(h, pane, home)
+    confirm_alive(h, pane, home, harness)
 
     # A watcher left running in the background is stopped with `kill`, and that is
     # the captain withdrawing the grant rather than a crash. Left on its default
@@ -475,7 +489,7 @@ def main():
     print(f"watching {tasks_file}\npoking   SIANA at {pane}\ngrant    {grant}",
           flush=True)
     try:
-        watch(h, pane, home, tasks_file, args.interval)
+        watch(h, pane, home, tasks_file, harness, args.interval)
     except KeyboardInterrupt:
         release_grant(home)
         raise
@@ -491,9 +505,12 @@ def _interrupted(signum, frame):
     raise KeyboardInterrupt
 
 
-def watch(h, pane, home, tasks_file, interval):
+def watch(h, pane, home, tasks_file, harness, interval):
     """The loop: read the queue, hold what it finds until SIANA can take it, and
-    stop the moment that pane is no longer SIANA's."""
+    stop the moment that pane is no longer SIANA's.
+
+    `harness` is the agent SIANA recorded at startup, and the only name herdr can
+    report in that pane without it having been taken over."""
     # Start at the end. Reports from before this began were SIANA's to reconcile in
     # the session that saw them, and replaying them would poke about work already
     # accounted for. The poke carries no content, so nothing is lost by not knowing
@@ -540,7 +557,7 @@ def watch(h, pane, home, tasks_file, interval):
                     f"coming back; restarting SIANA rewrites {home}/session with the",
                     "pane it lands in")
             status = None
-        elif agent.get("agent") != "pi":
+        elif agent.get("agent") != harness:
             # Not a gap. Something else holds that pane now, so every poke from here
             # would be typed into somebody else's session. No window makes that safer.
             die(f"pane {pane} is not running SIANA: herdr sees {agent.get('agent')}",

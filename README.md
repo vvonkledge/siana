@@ -18,10 +18,11 @@ Two things are worth separating before anything else:
 
 ## What you need
 
-`just init` refuses without `pi` and `tasks`. The rest of this list is what running a
-fleet needs, and `just doctor` reports which of it it can find. Versions are the ones
-this has actually been run against; nothing older or newer has been tried, and
-nothing here has been run on an operating system other than macOS.
+`just init` refuses without `tasks`, and without at least one of `pi` and `claude`
+to run SIANA's own session in. The rest of this list is what running a fleet needs,
+and `just doctor` reports which of it it can find. Versions are the ones this has
+actually been run against; nothing older or newer has been tried, and nothing here
+has been run on an operating system other than macOS.
 
 | Tool       | Verified   | Why it is needed                                      |
 | ---------- | ---------- | ----------------------------------------------------- |
@@ -30,10 +31,10 @@ nothing here has been run on an operating system other than macOS.
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
 | `datafile` | 0.1.1      | every record store: queue, registry, obligations      |
-| `tasks`    | 0.1.0      | the fleet queue, and the pi package for it            |
-| `pi`       | 0.84.2     | the harness SIANA's own session runs in               |
+| `tasks`    | 0.1.0      | the fleet queue, and the agent packages for it        |
+| `pi`       | 0.84.2     | one of the two harnesses SIANA's session can run in   |
 | `herdr`    | 0.8.0      | the session manager minions are started in            |
-| `claude`   | 2.1.231    | the harness minions run in                            |
+| `claude`   | 2.1.231    | the harness minions run in, and the other of the two  |
 
 Verified on macOS 26.6.2 (Darwin 25.6) on 2026-08-28.
 
@@ -53,7 +54,13 @@ reachable, and tells you the two ways to fix it.
 `claude` is Claude Code, installed however you normally install it. It is the only
 minion harness `siana-dispatch` will start: any other kind is refused rather than
 guessed, because a wrong flag starts an agent that silently has no orders and looks
-exactly like a working dispatch.
+exactly like a working dispatch. It is also what reads the diff in the review step of
+a driven pipeline, for the same reason and with the same refusal.
+
+SIANA's own session is the one place there is a choice. It runs in `pi` or in
+`claude`, `init` installs the queue for whichever of them you have, and you pick per
+start. See [Choose the harness](#choose-the-harness). Only one of the two is needed
+to run a fleet; installing both costs nothing and settles nothing until you start.
 
 ## Initialize
 
@@ -80,18 +87,20 @@ Into the home:
 
 - `siana.env`, a flat env file with the resolved paths SIANA needs to find itself.
   Regenerated every run, because it is derived and never yours to edit for keeps.
-- `AGENTS.md`, `orders.md`, `brief-ship.md`, `brief-scout.md`, `brief-qa.md`, copied
-  from `template/`. **Copied only when absent.** SIANA evolves its own instructions,
-  so a home copy that differs from the template is your work, and `init` says
-  `kept` and leaves it alone.
+- `AGENTS.md`, `orders.md`, `review.md`, `brief-ship.md`, `brief-scout.md`,
+  `brief-qa.md`, copied from `template/`. **Copied only when absent.** SIANA evolves
+  its own instructions, so a home copy that differs from the template is your work,
+  and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-tasks.yaml`: the store
   contracts. Also never overwritten, for a harder reason. A contract only ever grows,
   because a field dropped from a live contract makes every record still carrying it
   unreadable.
-- `pi-agent-tasks/`, the pi package that puts the queue in front of SIANA's session,
-  generated from the installed `tasks`. See below.
-- `.pi/settings.json`, installing that package project-locally, so SIANA's session
-  sees the fleet queue and no other agent session on this machine does.
+- The queue integration for each harness you have, so SIANA's session sees the
+  fleet queue and no other agent session on this machine does. For `pi`, that is
+  `pi-agent-tasks/`, generated from the installed `tasks`, and `.pi/settings.json`
+  installing it project-locally. For `claude`, `.claude/settings.json` carrying the
+  SessionStart hook and `.claude/skills/agent-tasks/`. Both are written when you
+  have both. See [The queue integration](#the-queue-integration).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl` - are
 not written here. `datafile` creates each on its first append, so a contract with no
@@ -99,18 +108,26 @@ not written here. `datafile` creates each on its first append, so a contract wit
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-publish`,
-`siana-reap`. They are links, so a `git pull` here updates the commands with no
-reinstall. It does not update the home; `just upgrade` does that.
+`siana-reap`, `siana-pipeline`. They are links, so a `git pull` here updates the
+commands with no reinstall. It does not update the home; `just upgrade` does that.
 
-### The tasks pi package
+### The queue integration
 
-SIANA's session opens with the queue already in front of it. That comes from a pi
-package `tasks` generates, and `just init` generates a fresh one into the home on
-every run. You do not have to find it, and there is no checkout it has to sit beside.
+SIANA's session opens with the queue already in front of it, whichever harness it
+opens in. `tasks` knows how to say that to both, and `init` installs it for each
+harness it finds: for `pi` a generated package, and for `claude` a SessionStart hook
+with the same skill beside it. Both land in the home, so no other agent session on
+this machine sees fleet-wide state.
 
-Regenerating it every time is deliberate: the package bakes in the absolute path of
-the `tasks` it was generated from, so a stale copy can point at a `tasks` you have
-since moved or replaced.
+You do not have to find any of it, and there is no checkout it has to sit beside.
+The pi package is regenerated on every `init`, deliberately: it bakes in the
+absolute path of the `tasks` it was generated from, so a stale copy can point at a
+`tasks` you have since moved or replaced.
+
+Starting SIANA in a harness the home has no integration for is refused. That session
+would come up looking exactly like a working SIANA with no fleet queue behind it, and
+would answer about the queue from nothing. If you install a second harness later, run
+`just init` again and it gains one.
 
 If you keep your own copy - a tasks checkout you are editing, say - point `init` at
 it and it will install that one instead of generating anything:
@@ -134,9 +151,9 @@ SIANA runs inside a `herdr` session, because that is how it starts minions and h
     herdr
     siana
 
-`siana` opens a pi session in the home, with the project registry and SIANA's open
-obligations appended to its system prompt. Talk to it there. You never talk to a
-minion, and no minion talks to you.
+`siana` opens an agent session in the home, with the project registry and SIANA's
+open obligations appended to its system prompt. Talk to it there. You never talk to
+a minion, and no minion talks to you.
 
 It starts outside herdr too, and says so when it does: with no pane there is nothing
 for `siana-watch` to wake, so the fleet only advances on your turns.
@@ -146,9 +163,41 @@ you the pane the first is in so you can attach to it. Two would race each other 
 every task in the queue, and you would have no way to tell which one you were
 talking to.
 
-To stop SIANA, exit the pi session. That releases the claim. If it is killed hard
+To stop SIANA, exit the session. That releases the claim. If it is killed hard
 enough that it cannot clean up, `just doctor` reports the session as stale and names
 the file to remove.
+
+### Choose the harness
+
+SIANA's session runs in `pi` or in Claude Code. Both are told the same things in the
+same flag, and they differ in how each is pointed at the home: `pi` is started with
+`--approve`, which is your consent to the project-local files `init` wrote there, and
+`claude` is started plain and picks up the home's `.claude/settings.json` as the
+settings of the directory it opens in.
+
+Neither is started with its permission checks waived. That is a call only you can
+make, so pass `--dangerously-skip-permissions` yourself if you want it. A minion's is
+waived by `siana-dispatch` because nobody is there to answer a prompt, and at the
+helm you are.
+
+With no argument, `siana` opens in whichever harness the home was installed for, and
+in `pi` when it was installed for both. Say otherwise per start:
+
+    siana --harness claude
+    SIANA_HARNESS=claude siana
+
+The flag wins over the environment, so a shell that exports one still leaves you able
+to say otherwise for a single start. Everything after the flag is the session's:
+
+    siana --harness claude --model opus
+
+A name that is neither is refused rather than guessed at, because falling back to the
+default would open a session you did not ask for and say nothing about it.
+
+`siana` records the harness it started alongside the pane, and `siana-watch` pokes
+that pane only while herdr still reports that same agent in it. So the watcher
+follows whichever harness you chose, and a pane that has been taken over by the
+other one is a stop rather than a poke typed into somebody else's session.
 
 ### Register a project
 
@@ -160,11 +209,13 @@ The registry is yours, so SIANA writes it only when told to, with:
     datafile -f ~/.siana/projects.jsonl put \
         --set handle=<handle> --set path=<path> --set ship='<verify command>'
 
-`~/.siana/schema-projects.yaml` is the full field list. Two are worth knowing about
+`~/.siana/schema-projects.yaml` is the full field list. Three are worth knowing about
 when you ask: `qa` is an independent validation command, and setting it puts a QA
 task behind every ship task in that project; `orders` names a file of extra standing
 orders every minion there is started with, which is where a project's own conventions
-belong.
+belong; `pipeline` says work there is validated by a pipeline the minion drives
+instead of by a command that runs once, and is described under "A rigor the minion
+drives" below.
 
 ### Leave it running
 
@@ -178,6 +229,46 @@ through the home.
 ready work without you in the room. The grant is the process: you give it by starting
 this and withdraw it by stopping it with Ctrl-C. Nothing outlives it, so no session
 can inherit an autonomy you did not choose to leave running.
+
+### A rigor the minion drives
+
+Most projects are verified by one command that runs when the minion says it is
+finished. That is enough when the whole of the rigor is exact. It is not enough when
+part of it is judgment, because judgment spent once, after the work is declared done,
+arrives too late for anyone to act on.
+
+For those projects there is a pipeline the minion drives instead, round by round:
+
+    datafile -f ~/.siana/projects.jsonl put \
+        --set handle=<handle> --set path=<path> --set ship='<test command>' \
+        --set pipeline=true
+
+`ship` stays what it was - the exact command a run executes. What changes is that
+SIANA gives ship tasks there a verify that *reads what a run recorded* rather than one
+that starts anything. The minion runs `siana-pipeline run`, which runs your `ship`
+command and then puts an agent on the diff against the brief; whatever comes back, the
+minion fixes and runs again, until a run passes.
+
+Two properties are worth knowing, because they are the reason it is shaped this way:
+
+- **A run records the commit it validated, and `done` refuses if the branch has moved
+  off it.** The QA minion is cut from that branch, so anything committed after a
+  passing run would be reviewed wearing a green nothing gave it. This is a comparison
+  the machinery makes, not a rule anybody is trusted to follow.
+- **Nothing is pushed.** A run happens inside the ship task, which is before any
+  independent minion has accepted the work. Review, test, lint, and the branch is
+  where it ends; `siana-publish` still carries everything after the QA verdict.
+
+A finding the reviewer says only a human can settle stops the run and comes back to
+you through SIANA, as a `block`. The minion never answers one.
+
+It costs what a second agent costs. A round is minutes, and every finding is another
+round, and the minion is parked for all of it. Turn it on for a project where a
+missed judgment is expensive, and leave it off where a green suite is the whole of
+what you wanted.
+
+`~/.siana/review.md` is what that reviewer is told. It is yours to edit, like every
+other instruction file in the home.
 
 ## Validate a change to the distro
 

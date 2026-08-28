@@ -192,21 +192,38 @@ class ConfirmAlive(WatchTest):
 
     def test_a_pane_holding_siana_is_confirmed(self):
         self.herdr.reply("agent.get", SIANA)
-        agent = w.confirm_alive(self.client(), self.PANE, self.home)
+        agent = w.confirm_alive(self.client(), self.PANE, self.home, "pi")
         self.assertEqual(agent["agent"], "pi")
+
+    def test_a_pane_holding_the_harness_siana_started_in_is_confirmed(self):
+        # A SIANA the captain started with `--harness claude`. Refusing it because
+        # herdr does not see pi would leave that fleet advancing only on the
+        # captain's turns, which is the whole thing a watcher is for.
+        self.herdr.reply("agent.get", TAKEOVER)
+        agent = w.confirm_alive(self.client(), self.PANE, self.home, "claude")
+        self.assertEqual(agent["agent"], "claude")
 
     def test_a_pane_holding_something_else_names_what_herdr_sees(self):
         self.herdr.reply("agent.get", TAKEOVER)
         with self.assertRaises(w.Refusal) as cm:
-            w.confirm_alive(self.client(), self.PANE, self.home)
+            w.confirm_alive(self.client(), self.PANE, self.home, "pi")
         self.assertIn("is not running SIANA: herdr sees claude", str(cm.exception))
+
+    def test_the_other_harness_in_that_pane_is_a_takeover_and_not_a_siana(self):
+        # The recorded harness is checked, never the pair of them. A claude SIANA
+        # whose pane now holds pi is a pane SIANA has left, and reading "either one
+        # will do" would type the captain's pokes into whatever took it.
+        self.herdr.reply("agent.get", SIANA)
+        with self.assertRaises(w.Refusal) as cm:
+            w.confirm_alive(self.client(), self.PANE, self.home, "claude")
+        self.assertIn("is not running SIANA: herdr sees pi", str(cm.exception))
 
     def test_a_pane_herdr_has_not_detected_yet_says_wait_and_rerun(self):
         # herdr re-detects agents from the pane after a restart, so an empty answer
         # is routinely a SIANA that is very much alive.
         self.herdr.reply("agent.get", NOBODY)
         with self.assertRaises(w.Refusal) as cm:
-            w.confirm_alive(self.client(), self.PANE, self.home)
+            w.confirm_alive(self.client(), self.PANE, self.home, "pi")
         self.assertIn("no agent", str(cm.exception))
         self.assertIn("wait and rerun", str(cm.exception))
 

@@ -54,8 +54,10 @@ Every project carries its own configuration there:
 - `path` is where minions run and where verification happens.
 - `ship` is that project's delivery rigor. Usually it is a command you type into
   `tasks add --verify`. No script enforces it; a task's verify is whatever you
-  wrote on it. In some projects the rigor is a process the minion drives instead,
-  and then the verify only reads its outcome. See "When the rigor is a gate".
+  wrote on it.
+- `pipeline` set true says the rigor there is a process the minion drives instead,
+  and then the verify only reads its outcome and `ship` is what a run executes.
+  See "When the rigor is a pipeline".
 - `qa` is that project's independent validation command. Setting it is the
   captain saying ship work there is not accepted on the word of the minion that
   did it, and it puts a QA task behind every ship task you brief.
@@ -125,8 +127,8 @@ standalone report and lands nothing. Do not let one drift into the other.
 
 A verify that *starts* the rigor is not a verify. It runs once, after the minion has
 already declared itself finished, so anything the rigor demanded arrives too late to
-act on, and a rigor that parks for a human decision can exit 0 while still parked at
-one. Verify the outcome, never the process.
+act on, and a rigor that asks for a human decision has nobody left to ask. Verify the
+outcome, never the process.
 
 Put the pointers a cold-starting minion needs in `--context`. A minion should not
 have to ask you what it is looking at.
@@ -177,8 +179,8 @@ scout that starts shipping is the exact blur you are here to prevent:
 
 - `--ship` lands. The minion commits on `siana/<task-id>` and that branch is the
   deliverable. Its verify is the project's `ship` command from the registry. Where
-  that rigor is a gate, the brief has to carry how it is driven, because the verify
-  no longer expresses it.
+  that project is `pipeline`, the brief has to carry how the pipeline is driven,
+  because the verify no longer expresses it.
 - `--scout` reports. The minion writes `reports/<task-id>.md` in this directory and
   lands nothing; its worktree is scratch. Give it a real verify rather than falling
   back to `--prose`, because the report's existence is machine-checkable. Write it
@@ -195,8 +197,9 @@ task is still yours: once a minion has read it, the way to change its contract i
 tell that minion, not to edit the file underneath it.
 
 `brief-ship.md`, `brief-scout.md` and `brief-qa.md` in this directory are the
-templates, and they are yours to evolve like `orders.md`. An upgrade preserves your
-copy and leaves the diff beside it.
+templates, and they are yours to evolve like `orders.md`. `review.md` beside them is
+what the pipeline's review step is told, and it is yours on the same terms. An
+upgrade preserves your copy of each and leaves the diff beside it.
 
 In a project that sets `qa`, `--ship` also queues the QA task that will judge the
 work. See "Independent validation".
@@ -285,7 +288,7 @@ reap.
 
 **Remote branches are the forge's, not this fleet's.** Reap reads local refs only.
 Enable `delete_branch_on_merge` on the repository and the forge deletes the source
-branch when the pull request merges, server-side and with no worktree in the way.
+branch when the merge request merges, server-side and with no worktree in the way.
 Asking the client side to do it does not work: git refuses to delete a branch a
 worktree still holds, so a `--delete-branch` at merge time fails whenever retire has
 not run yet. Three commands, one removal each: retire the worktree, reap the local
@@ -307,45 +310,49 @@ is a deletion, "I could not tell" and "yes" must not be the same answer.
 
 Run it without `--yes` first. It prints every branch and why it was kept.
 
-## When the rigor is a gate
+## When the rigor is a pipeline
 
-Some projects deliver through a validation pipeline the minion drives, rather than a
-command that runs once at `done`. Three things change, and all three are yours.
+Some projects are validated by a pipeline the minion drives, rather than by a command
+that runs once at `done`. `pipeline` true in the registry is the captain saying so of
+one project, and it changes three things, all three yours.
 
-**The verify reads the outcome, never starts the gate.** A gate parks for human
-decisions, and at least one of them exits 0 while still parked at an open one. A
-verify built on it reports success on work nobody approved, which is a false green on
-exactly the boundary this fleet defends. Give a gated ship task a verify that reads
-the run's terminal verdict, or what the gate published, and never one that starts it.
+**The verify reads the outcome, never starts a run.** A ship task in such a project
+gets `--verify 'siana-pipeline check'` and never the project's `ship` command. `ship`
+is what a run executes; `check` reads what a run recorded and executes nothing. It
+takes the task id from the minion's own environment, so there is nothing to type and
+nothing to mistype. A verify that started the rigor would run it once, after the
+minion had already declared itself finished, so anything it demanded would arrive
+with nobody left to act on it.
 
 **The brief and the project's orders carry the protocol.** The verify no longer says
-how the work is validated, so the ship brief has to, and the tool's own protocol
-belongs in that project's `orders` file where every minion on it gets the same copy.
-A minion sent into a gate with neither drives it by guessing.
+how the work is validated, so the ship brief has to say that a run is driven here,
+and how one is driven belongs in that project's `orders` file, where every minion on
+it gets the same copy. A minion sent into a pipeline with neither drives it by
+guessing.
 
-**Never move a branch under a live run.** A gate validates the head the minion
-submitted to it. If `siana/<task-id>` moves while a run is parked on it, the
-pipeline's fixes land on a head that branch has already left behind, and the run is
-stranded - silently, because the tool reports the healthy and the stranded case
-identically. The minion is told not to move its own branch. **You are the only other
-one who can**: never land, rebase, or force-update `siana/<task-id>` while a run is
-parked on it. Nothing else in the fleet can give that guarantee.
+**A run records the head it validated, and `check` compares.** The QA worktree is cut
+from `siana/<task-id>`, so a head the pipeline never saw would reach a second minion
+wearing this task's green. That is a comparison now rather than a rule: `done` refuses
+when the branch has moved off the commit the passing run recorded. The minion is told
+not to move it. **You are the only other one who can**: never land, rebase, or
+force-update `siana/<task-id>` between a passing run and its `done`. Doing so turns a
+finished task into a red verify, which is the safe direction and still a round nobody
+needed to spend.
 
-**The pipeline does not push.** It once did, under an earlier ruling, and that
-ruling is superseded: nothing leaves the machine before a QA minion has accepted it,
-and a pipeline runs inside the ship task, which is before. So a driven pipeline here
-is review, test and lint, and the branch is where it ends. `siana-publish` carries
-everything downstream of that, and it is yours.
+**The pipeline does not push, and opens nothing.** It is review, test and lint, and
+the branch is where it ends: nothing leaves the machine before a QA minion has
+accepted the work, and a run happens inside the ship task, which is before.
+`siana-publish` carries everything downstream of that, and it is yours.
 
-**It must leave `siana/<task-id>` at exactly the head it validated**, before the
-minion calls `done`. The QA worktree is cut from that branch afterwards, so a
-pipeline that rebases and does not return the branch hands the second minion a head
-nobody validated. This is the requirement, not an open question.
+A finding the pipeline marks for a human comes back as a `block` with the finding
+relayed. That is a decision, so it is yours to take to the captain, and the minion is
+right not to have answered it. Acting on it is the same as acting on a QA rejection:
+the answer goes into a fix task, not back down the wire.
 
-A gated run is not fire and forget. The minion is parked for the whole of it - tens
-of minutes, several returns, and escalations at more than one step, not only at
-review. It can do nothing else while it waits. Dispatch on that basis, and never read
-a long silence from a gated minion as a stall.
+A driven run is not fire and forget. Its review step is an agent reading the whole
+change, so a round costs minutes and every finding costs another round; the minion is
+parked for all of them and can do nothing else. Dispatch on that basis, and never read
+a long silence from a pipeline minion as a stall.
 
 ## Scripts and judgment
 
@@ -508,10 +515,10 @@ finished work it asks two things in order. First, did that branch add anything t
 full by that base, so there is nothing to lose - which is every scout and every QA
 task, and why neither ever needs landing to be tidied away. Second, for whatever it
 did add: does a copy exist outside the fleet's own branches - on the default branch,
-on a tag, or on any remote-tracking ref? A gated ship task comes back published and
-unmerged, and that push is an anchor: the tree may be retired, and doing so says
-nothing about whether the pull request has landed. The merge is still yours, and still
-a separate decision.
+on a tag, or on any remote-tracking ref? A branch `siana-publish` has pushed is
+anchored by that push, and it is the only push there is: the tree may be retired, and
+doing so says nothing about whether the merge request has landed. The merge is still
+yours, and still a separate decision.
 
 It refuses rather than guessing, and every refusal is a finding to act on:
 

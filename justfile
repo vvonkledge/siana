@@ -19,13 +19,29 @@ init: _contract-drift
     home='{{home}}'
 
     # Stop safely and report when the world surprises us, rather than guessing.
-    for cmd in pi tasks; do
-        command -v "$cmd" >/dev/null || {
-            echo "missing: $cmd" >&2
-            [ "$cmd" = tasks ] && echo "  run \`just install\` in the tasks checkout" >&2
-            exit 1
-        }
-    done
+    command -v tasks >/dev/null || {
+        echo "missing: tasks" >&2
+        echo "  run \`just install\` in the tasks checkout" >&2
+        exit 1
+    }
+
+    # SIANA's session runs in pi or in claude, and each needs a different queue
+    # integration in the home, so init writes one for every harness it finds
+    # rather than choosing. Which one a session opens in is `siana --harness`, and
+    # a home with both installed answers to either without another init.
+    #
+    # Neither present is a stop. `siana` refuses to start in a harness whose
+    # integration is not there, so an install that wrote none at all is a home the
+    # captain can only find out about at the helm.
+    have_pi=""; have_claude=""
+    if command -v pi >/dev/null; then have_pi=1; fi
+    if command -v claude >/dev/null; then have_claude=1; fi
+    if [ -z "$have_pi$have_claude" ]; then
+        echo "missing: pi and claude" >&2
+        echo "  SIANA's session runs in one of them; install at least one" >&2
+        echo "  \`brew install pi-coding-agent\`, or install Claude Code" >&2
+        exit 1
+    fi
 
     # A configured package that is not there is a refusal, never a fallback. The
     # captain naming a directory means they want that package; generating a
@@ -41,7 +57,17 @@ init: _contract-drift
     # nothing, and `doctor` calling the home complete - the silently queueless home
     # this whole recipe exists to prevent. package.json is what makes a directory a
     # pi package, and it is what `tasks pi-package --out` writes.
+    #
+    # Naming one with no pi to install it into is refused for the same reason, and
+    # not skipped as harmless: the captain who set it is expecting a pi session,
+    # and an init that quietly wrote a claude home instead would answer a question
+    # they did not ask.
     pkg='{{pi_package}}'
+    if [ -n "$pkg" ] && [ -z "$have_pi" ]; then
+        echo "SIANA_PI_PACKAGE is set and pi is not installed" >&2
+        echo "  install pi, or unset it to install for the harnesses you have" >&2
+        exit 1
+    fi
     problem=""
     if [ -n "$pkg" ] && [ ! -d "$pkg" ]; then
         problem="no pi package directory at $pkg"
@@ -71,7 +97,7 @@ init: _contract-drift
     # SIANA can evolve its own instructions, the orders its minions are started with,
     # and the brief templates it scaffolds a task contract from, so a home copy that
     # has diverged is the captain's work, not drift to be cleaned up. Never clobber it.
-    for f in AGENTS.md orders.md brief-ship.md brief-scout.md brief-qa.md; do
+    for f in AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "wrote    $home/$f"
@@ -125,24 +151,49 @@ init: _contract-drift
     # package bakes in the absolute path of the `tasks` it came from, so one found
     # on disk can point at a different one. Regenerated on every init, like
     # siana.env, because it is derived and never the captain's work.
-    if [ -z "$pkg" ]; then
-        pkg="$home/pi-agent-tasks"
-        tasks pi-package --out "$pkg" >/dev/null || {
-            echo "cannot generate the pi package with $(command -v tasks)" >&2
-            echo "  \`tasks pi-package --out <dir>\` is how the ambient queue is built" >&2
-            echo "  upgrade tasks until it works, or set SIANA_PI_PACKAGE to a" >&2
-            echo "  package directory you already have" >&2
+    if [ -n "$have_pi" ]; then
+        if [ -z "$pkg" ]; then
+            pkg="$home/pi-agent-tasks"
+            tasks pi-package --out "$pkg" >/dev/null || {
+                echo "cannot generate the pi package with $(command -v tasks)" >&2
+                echo "  \`tasks pi-package --out <dir>\` is how the ambient queue is built" >&2
+                echo "  upgrade tasks until it works, or set SIANA_PI_PACKAGE to a" >&2
+                echo "  package directory you already have" >&2
+                exit 1
+            }
+            echo "wrote    $pkg"
+        fi
+        # -a because pi refuses to rewrite an existing project-local config in an
+        # untrusted directory, and re-running init must not be a first-run-only path.
+        (cd "$home" && pi install -l -a "$(cd "$pkg" && pwd)" >/dev/null)
+        echo "wrote    $home/.pi/settings.json"
+    fi
+
+    # The same two halves the pi package carries in one, which is why both are
+    # installed and not just the skill: `setup` writes the SessionStart hook that
+    # puts the queue in front of the session unasked, and `skill` writes the one
+    # SIANA reads when it goes looking. A home with only the skill opens a session
+    # that has to remember to ask, which is the thing an ambient queue replaces.
+    #
+    # --scope project for the reason the pi package is installed locally: the
+    # files land in the home, so no other claude session on this machine sees
+    # fleet-wide state.
+    if [ -n "$have_claude" ]; then
+        (cd "$home" \
+            && tasks setup --scope project --app claude >/dev/null \
+            && tasks skill --install --scope project --app claude >/dev/null) || {
+            echo "cannot install the claude queue integration with $(command -v tasks)" >&2
+            echo "  \`tasks setup --app claude\` writes the ambient queue and" >&2
+            echo "  \`tasks skill --install --app claude\` the skill beside it" >&2
+            echo "  upgrade tasks until both work" >&2
             exit 1
         }
-        echo "wrote    $pkg"
+        echo "wrote    $home/.claude/settings.json"
+        echo "wrote    $home/.claude/skills/agent-tasks/SKILL.md"
     fi
-    # -a because pi refuses to rewrite an existing project-local config in an
-    # untrusted directory, and re-running init must not be a first-run-only path.
-    (cd "$home" && pi install -l -a "$(cd "$pkg" && pwd)" >/dev/null)
-    echo "wrote    $home/.pi/settings.json"
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -188,7 +239,7 @@ upgrade: _initialized init
     backup="$home/upgrade/$stamp"
     kept=""
     echo
-    for f in AGENTS.md orders.md brief-ship.md brief-scout.md brief-qa.md; do
+    for f in AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "restored $home/$f (it was missing)"
@@ -306,7 +357,7 @@ doctor: _contract-drift
     set -uo pipefail
     home='{{home}}'
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md brief-ship.md brief-scout.md brief-qa.md schema-projects.yaml schema-obligations.yaml schema-tasks.yaml .pi/settings.json; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md schema-projects.yaml schema-obligations.yaml schema-tasks.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -320,10 +371,45 @@ doctor: _contract-drift
     if [ -e "$home/obligations.jsonl" ]; then echo "  ok      obligations.jsonl"
     elif [ -e "$home/schema-obligations.yaml" ]; then echo "  ok      obligations.jsonl (empty; written on the first promise)"
     else echo "  missing obligations.jsonl"; fi
-    for cmd in pi tasks datafile; do
+    for cmd in tasks datafile; do
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
     done
+    # What `siana` can start in. A harness needs both the command and the queue
+    # integration `init` wrote into this home for it, so they are reported as the
+    # one fact they make: a session started with either half missing has no fleet
+    # queue in front of it and looks exactly like a working SIANA.
+    #
+    # pi and claude are alternatives, so an absent one is a harness this captain
+    # does not have and never a fault. Only what is here is named; having nothing
+    # to start in at all is the stop, and it is the only thing said twice.
+    starts=""
+    for cmd in pi claude; do
+        case "$cmd" in
+            pi)     f=".pi/settings.json" ;;
+            claude) f=".claude/settings.json" ;;
+        esac
+        p="$(command -v "$cmd" || true)"
+        [ -n "$p" ] || continue
+        echo "  ok      $cmd -> $p"
+        if [ -e "$home/$f" ]; then
+            echo "  ok      $f"
+            starts="$starts $cmd"
+        else
+            echo "  missing $f (\`just init\` writes it)"
+        fi
+    done
+    if [ -n "$starts" ]; then
+        # Which one is the default only means anything when there is a choice, and
+        # a home with one harness reading "the first is the default" invites the
+        # captain to go looking for the second.
+        case "$starts" in
+            *" "*" "*) echo "  ok      siana starts in:$starts (the first by default)" ;;
+            *)         echo "  ok      siana starts in:$starts" ;;
+        esac
+    else
+        echo "  no harness to start in; install pi or claude, then \`just init\`" >&2
+    fi
     # One SIANA leads the fleet, so which one is a thing the captain can ask about.
     # No session is the ordinary state between sessions and never a fault; a session
     # whose pid is gone is one killed before its trap ran, and blocks the next start.
@@ -358,7 +444,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""Validate a ship task's branch, and record the exact head that was validated.
+
+Most projects verify with one command that runs at `done`. Some are validated by a
+pipeline the minion drives round by round, because part of the rigor is judgment and
+judgment is too expensive to spend once, after the minion has already declared itself
+finished. This is that pipeline, and it is two commands rather than a session:
+
+    siana-pipeline run     runs the steps against the current head, and records what
+                           it found. The minion runs it, fixes what comes back, and
+                           runs it again until it passes.
+    siana-pipeline check   reads that record. It is what goes in the task's `verify`.
+
+**The verify reads the outcome and never starts the pipeline.** A verify that starts
+the rigor runs once, after the minion has said it is finished, so anything the rigor
+demands arrives too late to act on. `check` therefore never runs a step.
+
+**A run leaves the branch at exactly the head it validated.** The QA worktree is cut
+from that branch afterwards, so a head the pipeline never saw would reach a second
+minion wearing a green. That is not left to instructions: the record binds a verdict
+to a commit, and `check` refuses when the branch has moved off it. Committing after a
+passing run is the ordinary way to get that wrong, and it is the one thing this makes
+impossible rather than merely discouraged.
+
+**Nothing is pushed here.** A run happens inside the ship task, which is before any
+independent minion has accepted the work, and nothing leaves the machine before then.
+Review, test, and the branch is where this ends. `siana-publish` carries the push, the
+merge request and everything downstream, and it runs on the QA verdict.
+
+**A finding only a human can settle stops the run.** It is relayed, never answered:
+the minion calls `block` with it, SIANA carries it to the captain. The exit code says
+which of the two a caller is looking at:
+
+    0   passed; the record is green at this head
+    1   yours to fix, then run again
+    2   not yours: `block` and relay what this printed
+
+Steps run cheapest first. The project's own `ship` command is exact and takes a
+minute; the review is an agent and costs tokens, so a red suite stops the run before
+one is started.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+# Yours to fix and run again, versus not yours at all. The split is the whole of what
+# a minion needs to decide between fixing and calling `block`, so it is an exit code
+# and not a sentence it has to parse out of the output.
+FIX = 1
+BLOCK = 2
+
+# A review that never returns parks the minion forever, and a parked minion is
+# indistinguishable from a working one. Bounded, because the thing this design
+# replaced failed exactly there.
+REVIEW_TIMEOUT = 900
+
+# Only claude is verified end to end. Other kinds are refused rather than guessed: a
+# wrong flag starts an agent that never writes the findings file, which reads here as
+# a review that did not happen and stops a run nobody broke.
+REVIEWERS = {
+    "claude": ["claude", "--dangerously-skip-permissions", "-p"],
+}
+
+
+def die(message: str, *hints: str, code: int = BLOCK):
+    print(f"error: {message}", file=sys.stderr)
+    for hint in hints:
+        print(f"  {hint}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def fold(store: str, key: str):
+    """The last record for each key in an append-only store.
+
+    Reads only. Every write still goes through `tasks` or `datafile`, so what is on
+    disk has already passed its contract. A tombstone is a last line like any other:
+    a dropped record must read as absent, not as a record with every field missing.
+
+    A store with no writes yet has no file at all, which is empty rather than a
+    fault."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def git(path: str, *args, check=True):
+    out = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True)
+    if check and out.returncode != 0:
+        die(f"git {' '.join(args)} failed in {path}",
+            (out.stderr or out.stdout).strip())
+    return out
+
+
+def worktree(path: str):
+    """Where the work is, which branch holds it, what its head is, and whether
+    anything tracked is uncommitted.
+
+    Untracked files are deliberately not asked about. Build litter is real and is
+    `siana-retire`'s problem; what matters here is only whether the head is the whole
+    of what the minion has, and a tracked change that is not committed is not in it."""
+    top = git(path, "rev-parse", "--show-toplevel", check=False)
+    if top.returncode != 0:
+        die(f"{path} is not inside a git repository",
+            "a pipeline validates a commit, so there has to be one")
+    root = top.stdout.strip()
+    branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    head = git(root, "rev-parse", "HEAD").stdout.strip()
+    pending = git(root, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+    return root, branch, head, pending
+
+
+def stale(record, branch: str, head: str):
+    """Why this record does not describe the work in front of us, or None.
+
+    This is the hardest constraint in the design, made into a comparison. A run
+    validates one commit and records it; if the branch is anywhere else by the time
+    the verify runs, what a QA minion would be cut from is a head nobody validated.
+    Instructing against that is what the fleet did before, and instructions are not
+    what this stakes a green on."""
+    if record.get("verdict") != "passed":
+        return f"its last run did not pass ({record.get('verdict')})"
+    if record.get("branch") != branch:
+        return (f"it validated {record.get('branch')}, and this worktree is on "
+                f"{branch}")
+    if record.get("head") != head:
+        return (f"it validated {str(record.get('head'))[:12]}, and {branch} is now at "
+                f"{head[:12]}")
+    return None
+
+
+def record_path(home: str, task_id: str):
+    return os.path.join(home, "pipeline", f"{task_id}.json")
+
+
+def findings_path(home: str, task_id: str):
+    """Findings land in the home and never in the worktree. A run refuses a dirty
+    tree, and `siana-retire` refuses a tree holding untracked files, so a scratch
+    file written beside the work would break both."""
+    return os.path.join(home, "pipeline", f"{task_id}.findings.json")
+
+
+def write_record(path: str, record):
+    """Written through a temporary and renamed, so a run killed mid-write leaves the
+    previous verdict rather than a half-record. Written on failure too: `check` saying
+    the last run failed is a better answer than it saying no run happened."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(record, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def read_findings(path: str):
+    """The reviewer's verdict, as a list of findings.
+
+    Every way this can fail is the same failure: nobody reviewed the change. It is
+    never a pass, because the whole point of this step is that something looked."""
+    if not os.path.isfile(path):
+        return None, "the reviewer wrote no findings file"
+    try:
+        with open(path) as fh:
+            payload = json.load(fh)
+    except (json.JSONDecodeError, OSError) as e:
+        return None, f"the reviewer's findings file is unreadable: {e}"
+    if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
+        return None, "the reviewer's findings file has no `findings` list"
+    findings = []
+    for item in payload["findings"]:
+        if not isinstance(item, dict) or not item.get("what"):
+            return None, "a finding says nothing; every one needs a `what`"
+        findings.append({"where": str(item.get("where") or "?"),
+                         "what": str(item["what"]),
+                         "decide": bool(item.get("decide"))})
+    return findings, None
+
+
+def show(findings):
+    for f in findings:
+        print(f"  {f['where']}")
+        for line in f["what"].splitlines():
+            print(f"    {line}")
+
+
+def cmd_run(args, home: str, tasks_file: str, task_id: str) -> int:
+    registry = os.path.join(home, "projects.jsonl")
+
+    task = fold(tasks_file, "id").get(task_id)
+    if task is None:
+        die(f"no task {task_id} in {tasks_file}",
+            "a run is validation of one task's work, so there has to be a task")
+
+    handle = task.get("project")
+    if not handle:
+        die(f"{task_id} names no project",
+            "the project is what says how work here is validated")
+    projects = fold(registry, "handle")
+    if handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {handle}", f"known handles: {known}")
+    project = projects[handle]
+
+    # A green recorded for a project whose verify is an ordinary command is a green
+    # nothing reads. Refuse rather than write one: the field is the captain's
+    # statement that ship work here is validated this way.
+    if not project.get("pipeline"):
+        ship = project.get("ship") or "(none recorded)"
+        die(f"{handle} is not validated by a driven pipeline",
+            f"its rigor is a command that runs at `done`: {ship}",
+            "run that instead; this would record a verdict its tasks never read")
+
+    step_command = project.get("ship")
+    if not step_command:
+        die(f"{handle} records no `ship` command",
+            "a run has nothing exact to execute, and a review on its own is not this",
+            "project's rigor")
+
+    root, branch, head, pending = worktree(os.getcwd())
+    expected = f"siana/{task_id}"
+    if branch != expected:
+        die(f"this worktree is on {branch}, not {expected}",
+            "a run validates the branch that is the task's deliverable, and records",
+            "that it did; validating anything else would record a green about work",
+            "no QA minion will ever be cut from",
+            code=BLOCK)
+    if pending:
+        print(f"error: {branch} has uncommitted changes", file=sys.stderr)
+        for line in pending.splitlines():
+            print(f"  {line}", file=sys.stderr)
+        print("  a run validates a commit and records it, so anything not committed",
+              file=sys.stderr)
+        print("  is work it would pass without having seen; commit, then run again",
+              file=sys.stderr)
+        return FIX
+
+    # What the change is measured against. The task's own `base` is the ref its
+    # worktree was cut from; a task queued without one started from whatever the
+    # project was checked out to, and the branch a merge request targets is the only
+    # other thing that can honestly be called the fork point. Neither is guessed: a
+    # diff against the wrong base is a review of somebody else's work.
+    base = task.get("base") or project.get("target")
+    if not base:
+        die(f"cannot tell what {branch} forked from",
+            f"{task_id} records no `base`, and {handle} records no `target`",
+            "reviewing a diff against a guessed base judges work nobody did here")
+    if git(root, "rev-parse", "--verify", str(base), check=False).returncode != 0:
+        die(f"{root} has no ref {base}",
+            "it is what this branch is measured against, so there is no change to",
+            "review until it resolves")
+
+    brief = os.path.join(home, "briefs", f"{task_id}.md")
+    if not os.path.isfile(brief):
+        die(f"no brief at {brief}",
+            "the brief is what the work is judged against, and a reviewer without",
+            "one judges by its own lights instead of by what was asked")
+
+    prompt_template = os.path.join(home, "review.md")
+    if not os.path.isfile(prompt_template):
+        die(f"no reviewer instructions at {prompt_template}",
+            "SIANA owns its home copy and can evolve it",
+            "run `just init` in the distro to lay one down")
+
+    steps = []
+    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    out = record_path(home, task_id)
+
+    def fail(reason: str, code: int) -> int:
+        write_record(out, {"task": task_id, "branch": branch, "head": head,
+                           "base": str(base), "at": started, "verdict": "failed",
+                           "reason": reason, "steps": steps})
+        return code
+
+    print(f"pipeline {task_id}")
+    print(f"  branch {branch} at {head[:12]} (base {base})")
+
+    print(f"\n=== test: {step_command}")
+    tested = subprocess.run(step_command, shell=True, cwd=root)
+    steps.append({"name": "test", "command": step_command,
+                  "status": "passed" if tested.returncode == 0 else "failed"})
+    if tested.returncode != 0:
+        print(f"\ntest failed ({tested.returncode}). Fix it and run again.",
+              file=sys.stderr)
+        print("  the review is not started on a red suite: it costs tokens, and it",
+              file=sys.stderr)
+        print("  would be reviewing a change that does not work yet", file=sys.stderr)
+        return fail(f"`{step_command}` exited {tested.returncode}", FIX)
+
+    reviewer = REVIEWERS[args.reviewer]
+    if shutil.which(reviewer[0]) is None:
+        # Recorded as a failed run, like every other way the review does not happen.
+        # It costs a prior pass at this same head, and that is the right direction:
+        # a record that outlived the run it describes is the one thing `check` must
+        # never be handed.
+        steps.append({"name": "review", "status": "error"})
+        fail(f"{reviewer[0]} is not installed", BLOCK)
+        die(f"{reviewer[0]} is not installed, and the review step needs it",
+            "the suite passed, so nothing is wrong with the work; there is just",
+            "nobody here to read it")
+
+    findings_file = findings_path(home, task_id)
+    # Removed before the reviewer starts. A file left by the previous round would
+    # otherwise be read as this round's verdict, which is a pass on findings nobody
+    # raised about a head nobody looked at.
+    if os.path.exists(findings_file):
+        os.remove(findings_file)
+    os.makedirs(os.path.dirname(findings_file), exist_ok=True)
+
+    # The project's own conventions are the one thing a reviewer could not have read
+    # out of the diff, and they are where most of what this project would call a
+    # finding actually lives. Named rather than left to be found.
+    orders = project.get("orders")
+    orders = os.path.join(root, str(orders)) if orders else "(this project has none)"
+
+    prompt = open(prompt_template).read()
+    for marker, value in (("{TASK}", task_id), ("{BRANCH}", branch),
+                          ("{BASE}", str(base)), ("{BRIEF}", brief),
+                          ("{ORDERS}", orders), ("{FINDINGS}", findings_file)):
+        prompt = prompt.replace(marker, value)
+
+    print(f"\n=== review: {reviewer[0]}")
+    try:
+        looked = subprocess.run([*reviewer, prompt], cwd=root,
+                                capture_output=True, text=True,
+                                timeout=REVIEW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        steps.append({"name": "review", "status": "error"})
+        timed_out = f"the reviewer did not return within {REVIEW_TIMEOUT}s"
+        fail(timed_out, BLOCK)
+        die(timed_out,
+            "nothing read the change, so there is no verdict to record",
+            "`block` and say so rather than running again into the same wall")
+
+    findings, problem = read_findings(findings_file)
+    if problem is not None:
+        steps.append({"name": "review", "status": "error"})
+        fail(problem, BLOCK)
+        hints = [f"the reviewer exited {looked.returncode}"]
+        tail = (looked.stderr or looked.stdout or "").strip().splitlines()[-10:]
+        hints += [f"  {line}" for line in tail]
+        hints += ["a review that did not happen is not a pass, and running again",
+                  "without knowing why it failed spends the same tokens on the",
+                  "same wall"]
+        die(problem, *hints)
+
+    decide = [f for f in findings if f["decide"]]
+    fixable = [f for f in findings if not f["decide"]]
+    steps.append({"name": "review", "status": "passed" if not findings else "failed",
+                  "findings": len(findings), "for_the_captain": len(decide)})
+
+    if decide:
+        print(f"\n{len(decide)} finding(s) nobody here can settle:")
+        show(decide)
+        if fixable:
+            print(f"\nand {len(fixable)} for you to fix:")
+            show(fixable)
+        print("\nThese are not yours to answer. `block` and relay them verbatim.",
+              file=sys.stderr)
+        return fail(f"{len(decide)} finding(s) for the captain", BLOCK)
+
+    if fixable:
+        print(f"\n{len(fixable)} finding(s) to fix:")
+        show(fixable)
+        print("\nFix them, commit, and run again.", file=sys.stderr)
+        return fail(f"{len(fixable)} finding(s) to fix", FIX)
+
+    write_record(out, {"task": task_id, "branch": branch, "head": head,
+                       "base": str(base), "at": started, "verdict": "passed",
+                       "steps": steps})
+    print(f"\npassed   {branch} at {head[:12]}")
+    print(f"recorded {out}")
+    print("  leave the branch here. Anything committed now is work this run never")
+    print("  saw, and `siana-pipeline check` compares the two at `done`.")
+    return 0
+
+
+def cmd_check(args, home: str, tasks_file: str, task_id: str) -> int:
+    """The task's verify. It reads the outcome and starts nothing.
+
+    It asks the registry nothing on purpose. A verdict is about a commit, and the
+    record and the branch are between them the whole of that question; a registry
+    that moved underneath should not be able to turn a green into a red."""
+    out = record_path(home, task_id)
+    if not os.path.isfile(out):
+        die(f"no pipeline run recorded for {task_id}",
+            f"expected {out}",
+            "this project's rigor is a pipeline you drive: run `siana-pipeline run`",
+            "and reach a pass before calling `done`")
+    try:
+        with open(out) as fh:
+            record = json.load(fh)
+    except (json.JSONDecodeError, OSError) as e:
+        die(f"{out} is unreadable: {e}",
+            "it is the only evidence that anything validated this work; run",
+            "`siana-pipeline run` again to write a fresh one")
+
+    root, branch, head, pending = worktree(os.getcwd())
+    why = stale(record, branch, head)
+    if why is not None:
+        hints = []
+        if record.get("reason"):
+            hints.append(f"the run said: {record['reason']}")
+        hints += ["a QA minion is cut from this branch, so a head the pipeline never",
+                  "validated would be read wearing this task's green",
+                  "run `siana-pipeline run` again from where the branch actually is"]
+        die(f"the recorded run does not describe {branch}: {why}", *hints)
+    if pending:
+        print(f"error: {branch} has uncommitted changes since that run",
+              file=sys.stderr)
+        for line in pending.splitlines():
+            print(f"  {line}", file=sys.stderr)
+        print("  the head is right and it is not the whole of what you have; commit,",
+              file=sys.stderr)
+        print("  then run `siana-pipeline run` again", file=sys.stderr)
+        return BLOCK
+
+    print(f"passed   {branch} at {head[:12]}")
+    print(f"  run at {record.get('at')} against base {record.get('base')}")
+    for step in record.get("steps") or []:
+        print(f"  {step.get('status'):8} {step.get('name')}")
+    return 0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Validate a ship task's branch, and record the head it validated.")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="run the steps against the current head")
+    run.add_argument("task_id", nargs="?", help="defaults to $SIANA_TASK_ID")
+    run.add_argument("--reviewer", default="claude", choices=sorted(REVIEWERS),
+                     help="agent kind for the review step; only verified kinds")
+
+    check = sub.add_parser("check", help="read the recorded outcome; starts nothing")
+    check.add_argument("task_id", nargs="?", help="defaults to $SIANA_TASK_ID")
+
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    tasks_file = os.environ.get("SIANA_TASKS_FILE", os.path.join(home, "tasks.jsonl"))
+
+    # Dispatch sets it, so a minion never types its own id and can never mistype it.
+    # Typed by hand it is a positional, for a captain looking at a worktree by hand.
+    task_id = args.task_id or os.environ.get("SIANA_TASK_ID")
+    if not task_id:
+        die("which task?",
+            "$SIANA_TASK_ID is unset and no task was named",
+            f"usage: siana-pipeline {args.command} <task-id>")
+
+    if args.command == "run":
+        raise SystemExit(cmd_run(args, home, tasks_file, task_id))
+    raise SystemExit(cmd_check(args, home, tasks_file, task_id))
+
+
+if __name__ == "__main__":
+    main()
