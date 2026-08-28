@@ -48,6 +48,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -349,8 +350,13 @@ def check_owners(tasks_file: str) -> int:
                 print(f"  ok      {tid} -> {owner} ({agent.get('agent_status') or 'unknown'})")
                 continue
             print(f"  GONE    {tid}: {pane} now holds {seen or 'no agent'}, not {kind}")
-        print(f"            look at its worktree before `tasks reset {tid}`; a refusal")
-        print("            to discard unlanded work is a finding, not an obstacle")
+        # Spelled out in full and on one line, because this is the only action
+        # this command prescribes and the captain runs it by hand. `--reason` is
+        # required, so a hint that omits it exits USAGE_ERROR when it is typed back.
+        print("            a refusal to discard unlanded work is a finding, not an")
+        print("            obstacle; look at its worktree, then reclaim it with")
+        print(f"            tasks --file {tasks_file} reset {tid} --reason "
+              f"{shlex.quote(f'dispatch --check: no {kind} agent in {pane}')}")
         failed += 1
         gone += 1
     if gone:
@@ -508,23 +514,31 @@ def main() -> None:
         The worktree is brand new and nothing has run in it, so removing it cannot
         destroy any work. Where herdr says otherwise it is not forced: a cleanup
         that cannot prove it is safe leaves the directory and reports it.
+
+        Nothing herdr says escapes this. It only ever runs while dispatch is already
+        refusing, so a second refusal thrown from here would reach the captain
+        instead of the first: a bare herdr code about the cleanup, in place of the
+        reason the dispatch failed, its hints, and whether the task came back.
         """
-        if not project["worktree"]:
-            h.call("workspace.close", workspace_id=workspace_id)
-            return ""
+        left = []
+        if project["worktree"]:
+            try:
+                h.call("worktree.remove", workspace_id=workspace_id)
+                return ""
+            except Unreachable as e:
+                # herdr is not answering at all. Closing the pane would fail the
+                # same way, so there is nothing left to try.
+                return f"workspace {workspace_id} is still open at {work_cwd} ({e})"
+            except Refusal:
+                # The pane still goes, because a container nothing points at is the
+                # thing this must never leave behind, and a directory nobody is told
+                # about is one nobody cleans up.
+                left.append(f"worktree left behind at {work_cwd}")
         try:
-            h.call("worktree.remove", workspace_id=workspace_id)
-        except Unreachable:
-            # herdr is not answering at all. Closing the pane would fail the same
-            # way, so there is nothing left to try and the caller says what is left.
-            raise
-        except Refusal:
-            # The pane still goes, because a container nothing points at is the
-            # thing this must never leave behind, and a directory nobody is told
-            # about is one nobody cleans up.
             h.call("workspace.close", workspace_id=workspace_id)
-            return f"worktree left behind at {work_cwd}"
-        return ""
+        except (Unreachable, Refusal) as e:
+            left.append(f"workspace {workspace_id} is still open at {work_cwd} ({e})")
+        return "; ".join(left)
 
     def abandon(message: str, *hints: str):
         """Undo a half-made dispatch: release the claim, then take the container
@@ -534,19 +548,21 @@ def main() -> None:
         if claimed:
             # The claim goes first, because releasing it needs nothing from herdr
             # and this is reached with herdr unreachable.
+            reason = f"dispatch abandoned: {message}"
             released = subprocess.run(
                 ["tasks", "--file", tasks_file, "reset", args.task_id,
-                 "--reason", f"dispatch abandoned: {message}"],
+                 "--reason", reason],
                 capture_output=True, text=True, check=False)
+            # The one action on this path the captain performs by hand, so it is
+            # given whole: `--reason` is required, and a hint without it exits
+            # USAGE_ERROR when it is typed back.
             hints.append(
                 f"{args.task_id} is back in the queue; nothing holds it"
                 if released.returncode == 0 else
                 f"{args.task_id} is still held by {owner}: read that pane, then "
-                f"`tasks --file {tasks_file} reset {args.task_id}`")
-        try:
-            left = close_container()
-        except Unreachable as e:
-            left = f"workspace {workspace_id} is still open at {work_cwd} ({e})"
+                f"`tasks --file {tasks_file} reset {args.task_id} "
+                f"--reason {shlex.quote(reason)}`")
+        left = close_container()
         if left:
             print(f"warning: {left}", file=sys.stderr)
         die(message, *hints)
