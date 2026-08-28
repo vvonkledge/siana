@@ -18,7 +18,7 @@ import shutil
 import stat
 import unittest
 
-from helpers import BIN, HomeTest, script
+from helpers import HomeTest, script
 
 pipeline = script("siana-pipeline")
 
@@ -445,9 +445,10 @@ class Check(Pipeline):
     def queue_done(self, wt):
         """`tasks done`, run the way a minion runs it: the verify by the name SIANA
         wrote on the task, in the minion's own worktree, with its own environment."""
-        # `bin/` on PATH because this is the one place the verify is reached by name
-        # rather than by the path this suite happens to know.
-        env = {"PATH": os.pathsep.join([self.reviewer, BIN, os.environ["PATH"]]),
+        # `distro_path` because this is the one place the verify is reached by name
+        # rather than by the path this suite happens to know, and by name it would
+        # otherwise find the captain's installed SIANA instead of this checkout.
+        env = {"PATH": self.distro_path(self.reviewer),
                "SIANA_TASK_ID": self.TASK, "SIANA_HOME": self.home}
         return self.run_cmd(["tasks", "--file", self.at("tasks.jsonl"), "done",
                              self.TASK, "--reason", "built it"], cwd=wt, env=env)

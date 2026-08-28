@@ -21,7 +21,7 @@ import stat
 import unittest
 
 from fake_herdr import FakeHerdr
-from helpers import HomeTest
+from helpers import BIN, HomeTest
 
 # The line a ship brief records its branch on. Read rather than rebuilt, because
 # rebuilding it here would be the test agreeing with itself about the one thing it
@@ -178,7 +178,7 @@ class TypedFlow(HomeTest):
         self.git("add", "-A", cwd=worktree)
         self.git("commit", "-qm", "docs: write the guide", cwd=worktree)
         head = self.git("rev-parse", "HEAD", cwd=worktree).strip()
-        pipe_env = {"PATH": self.reviewer + os.pathsep + os.environ["PATH"],
+        pipe_env = {"PATH": self.distro_path(self.reviewer),
                     "SIANA_TASK_ID": ship, "FAKE_FINDINGS": "[]",
                     "SIANA_TASKS_FILE": self.at("tasks.jsonl")}
         self.assertAccepted(self.run_bin("siana-pipeline", "run", cwd=worktree,
@@ -192,6 +192,20 @@ class TypedFlow(HomeTest):
         # 5. The verify reads that record, and the queue accepts the work on it.
         self.assertAccepted(self.run_bin("siana-pipeline", "check", cwd=worktree,
                                          env=pipe_env))
+
+        # The queue runs that verify by name, through a shell, so `bin/` being on
+        # the PATH it runs it with is the whole of what makes the next line drive
+        # this checkout. Asserted by taking it back off, because the alternative is
+        # a green that came from wherever `siana-pipeline` happened to be installed
+        # - which is what this suite did until a runner with no SIANA on it read
+        # exit 127 out of the same call.
+        bare = os.pathsep.join(d for d in pipe_env["PATH"].split(os.pathsep)
+                               if d != BIN)
+        self.assertRefused(
+            self.run_cmd(["tasks", "--file", self.at("tasks.jsonl"), "done", ship,
+                          "--reason", "wrote it"], env={**pipe_env, "PATH": bare}),
+            "siana-pipeline check", "127")
+
         self.tasks("done", ship, "--reason", "wrote it", env=pipe_env)
         self.assertEqual(self.record(ship)["status"], "done")
 
