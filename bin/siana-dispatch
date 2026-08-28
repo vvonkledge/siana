@@ -47,6 +47,8 @@ its own parser could pass while a real dispatch fails.
 import argparse
 import json
 import os
+import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -62,6 +64,13 @@ AGENTS = {
 
 READY_TIMEOUT_S = 90.0
 PROMPT_LANDED_S = 8.0
+
+# A minion's herdr agent name is its task id, so the queue's id grammar has to fit
+# inside herdr's name grammar. It does not: `tasks` allows 3 to 48 characters and
+# herdr allows 1 to 32 (verified 2026-08-28, herdr 0.8.0), so an id of 33 to 48 is
+# valid in the queue and refused by `agent.start`. Checked here, before anything is
+# created, because the same refusal after the claim costs a workspace and a rollback.
+HERDR_AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
 class Refusal(SystemExit):
@@ -88,6 +97,20 @@ class Unreachable(Refusal):
 
 def die(message: str, *hints: str, kind=Refusal):
     raise kind(message, hints)
+
+
+def gone(r: "Refusal") -> bool:
+    """herdr answering that no live agent holds this name right now.
+
+    A name is bound to a live agent and freed the moment that agent exits, so a
+    minion that dies mid-dispatch reads as `agent_not_found` rather than as an
+    unready one. Inside a polling loop that is an observation about this instant,
+    never an answer about the pane: the loop's own timeout refusal carries the pane
+    id and the owner and a raw herdr line carries neither. Switching to pane-id
+    targeting does not avoid this - a live pane holding no agent answers
+    `agent_not_found` too.
+    """
+    return "agent_not_found" in str(r)
 
 
 def report(r: "Refusal") -> None:
@@ -327,8 +350,13 @@ def check_owners(tasks_file: str) -> int:
                 print(f"  ok      {tid} -> {owner} ({agent.get('agent_status') or 'unknown'})")
                 continue
             print(f"  GONE    {tid}: {pane} now holds {seen or 'no agent'}, not {kind}")
-        print(f"            look at its worktree before `tasks reset {tid}`; a refusal")
-        print("            to discard unlanded work is a finding, not an obstacle")
+        # Spelled out in full and on one line, because this is the only action
+        # this command prescribes and the captain runs it by hand. `--reason` is
+        # required, so a hint that omits it exits USAGE_ERROR when it is typed back.
+        print("            a refusal to discard unlanded work is a finding, not an")
+        print("            obstacle; look at its worktree, then reclaim it with")
+        print(f"            tasks --file {tasks_file} reset {tid} --reason "
+              f"{shlex.quote(f'dispatch --check: no {kind} agent in {pane}')}")
         failed += 1
         gone += 1
     if gone:
@@ -373,6 +401,15 @@ def main() -> None:
     if not args.task_id:
         die("which task?", "usage: siana-dispatch <task-id>",
             "run `siana-dispatch --check` to inspect the registry instead")
+
+    # The minion is named after its task, so a task the queue accepts can still be
+    # one herdr will not name an agent. Refused here, before a worktree or a claim
+    # exists, rather than by `agent.start` after both do.
+    if not HERDR_AGENT_NAME.fullmatch(args.task_id):
+        die(f"{args.task_id} cannot be a herdr agent name",
+            "a minion is named after its task, and herdr allows 1 to 32 characters",
+            "of [a-z][a-z0-9_-], where the queue allows up to 48",
+            "re-add the task under a shorter id; nothing has been created for this one")
 
     if not os.path.isfile(tasks_file):
         die(f"no task store at {tasks_file}", "run `just init` in the distro")
@@ -469,17 +506,65 @@ def main() -> None:
 
     owner = f"{args.kind}@{pane_id}"
 
-    def abandon(message: str, *hints: str):
-        """Never leave a container behind that no task record points at. The worktree
-        is brand new and therefore clean, so removing it cannot destroy any work."""
-        if not project["worktree"]:
-            h.call("workspace.close", workspace_id=workspace_id)
-        else:
+    claimed = False
+
+    def close_container() -> str:
+        """Take the container down, and say what is left if anything is.
+
+        The worktree is brand new and nothing has run in it, so removing it cannot
+        destroy any work. Where herdr says otherwise it is not forced: a cleanup
+        that cannot prove it is safe leaves the directory and reports it.
+
+        Nothing herdr says escapes this. It only ever runs while dispatch is already
+        refusing, so a second refusal thrown from here would reach the captain
+        instead of the first: a bare herdr code about the cleanup, in place of the
+        reason the dispatch failed, its hints, and whether the task came back.
+        """
+        left = []
+        if project["worktree"]:
             try:
                 h.call("worktree.remove", workspace_id=workspace_id)
+                return ""
+            except Unreachable as e:
+                # herdr is not answering at all. Closing the pane would fail the
+                # same way, so there is nothing left to try.
+                return f"workspace {workspace_id} is still open at {work_cwd} ({e})"
             except Refusal:
-                h.call("workspace.close", workspace_id=workspace_id)
-                print(f"warning: worktree left behind at {work_cwd}", file=sys.stderr)
+                # The pane still goes, because a container nothing points at is the
+                # thing this must never leave behind, and a directory nobody is told
+                # about is one nobody cleans up.
+                left.append(f"worktree left behind at {work_cwd}")
+        try:
+            h.call("workspace.close", workspace_id=workspace_id)
+        except (Unreachable, Refusal) as e:
+            left.append(f"workspace {workspace_id} is still open at {work_cwd} ({e})")
+        return "; ".join(left)
+
+    def abandon(message: str, *hints: str):
+        """Undo a half-made dispatch: release the claim, then take the container
+        down. A task held by an owner whose pane is about to close is an orphan the
+        next dispatch trips over, and it outlives the workspace by a long way."""
+        hints = list(hints)
+        if claimed:
+            # The claim goes first, because releasing it needs nothing from herdr
+            # and this is reached with herdr unreachable.
+            reason = f"dispatch abandoned: {message}"
+            released = subprocess.run(
+                ["tasks", "--file", tasks_file, "reset", args.task_id,
+                 "--reason", reason],
+                capture_output=True, text=True, check=False)
+            # The one action on this path the captain performs by hand, so it is
+            # given whole: `--reason` is required, and a hint without it exits
+            # USAGE_ERROR when it is typed back.
+            hints.append(
+                f"{args.task_id} is back in the queue; nothing holds it"
+                if released.returncode == 0 else
+                f"{args.task_id} is still held by {owner}: read that pane, then "
+                f"`tasks --file {tasks_file} reset {args.task_id} "
+                f"--reason {shlex.quote(reason)}`")
+        left = close_container()
+        if left:
+            print(f"warning: {left}", file=sys.stderr)
         die(message, *hints)
 
     # `tasks start` is the gate: it refuses unmet dependencies and a task another
@@ -492,13 +577,36 @@ def main() -> None:
                            text=True, check=False)
     if claim.returncode != 0:
         abandon(f"tasks refused to dispatch {args.task_id}", claim.stdout.strip())
+    claimed = True
 
     spec = AGENTS[args.kind]
     # herdr refuses any agent argument containing a newline ("agent arguments cannot
     # be encoded safely for the target shell"), so multi-line orders must travel as a
     # file path. Verified 2026-08-26: newline is the only rejected character.
     start_args = spec["args"] + [spec["orders_flag"], orders]
-    h.call("agent.start", name=args.task_id, kind=args.kind, pane_id=pane_id, args=start_args)
+    # The last thing that can refuse, and the first that does so holding a claim.
+    # herdr enforces one live agent per name server-wide, so this is where a
+    # previous minion on this task announces itself rather than being typed over.
+    try:
+        h.call("agent.start", name=args.task_id, kind=args.kind, pane_id=pane_id,
+               args=start_args)
+    except Refusal as e:
+        if "agent_name_taken" in str(e):
+            # herdr names the incumbent in its own message, and that pane is exactly
+            # what the captain needs: it is a previous minion on this same task.
+            at = re.search(r"pane_id=(\S+)", str(e))
+            where = f" at {at.group(1)}" if at else ""
+            abandon(f"a live agent is already named {args.task_id}{where}",
+                    "that is a previous minion on this task; read it before you"
+                    " replace it" if at else
+                    "herdr did not say which pane; `herdr agent list` will",
+                    "a name is only freed when its pane closes, so a launch that never",
+                    "produced an agent still holds one")
+        if "invalid_agent_name" in str(e):
+            abandon(f"herdr will not name an agent {args.task_id}",
+                    "a minion is named after its task, and herdr allows 1 to 32",
+                    "characters of [a-z][a-z0-9_-]", str(e))
+        abandon(f"herdr would not start a minion on {args.task_id}", str(e))
 
     # agent.wait is level-triggered, so it answers "is in this state now" and can
     # return before the agent has drawn anything. The honest readiness test is that
@@ -506,7 +614,12 @@ def main() -> None:
     deadline = time.time() + READY_TIMEOUT_S
     agent = {}
     while time.time() < deadline:
-        agent = h.call("agent.get", target=args.task_id)["agent"]
+        try:
+            agent = h.call("agent.get", target=args.task_id)["agent"]
+        except Refusal as e:
+            if not gone(e):
+                raise
+            agent = {}          # A minion that died mid-poll is one that is not ready.
         if agent.get("agent") and agent.get("interactive_ready"):
             break
         time.sleep(0.5)
@@ -528,19 +641,51 @@ def main() -> None:
     # window is swallowed silently: the dispatch looks successful and the minion sits
     # forever holding a task it never saw. So confirm the effect, and re-send once.
     # Anything other than `idle` means the minion took it.
+    vanished = False
+
+    def status() -> str:
+        """What herdr says the agent is doing, or "gone" when it says nothing is.
+
+        An agent that died between the readiness check and here answers
+        `agent_not_found` to everything it is asked. That is not delivery, and this
+        loop's own refusal is the one that should say so: a raw herdr line names
+        neither the pane nor the owner.
+        """
+        nonlocal vanished
+        try:
+            return h.call("agent.get", target=args.task_id)["agent"].get("agent_status")
+        except Refusal as e:
+            if not gone(e):
+                raise
+            vanished = True
+            return "gone"
+
     def delivered(within: float) -> bool:
         limit = time.time() + within
         while time.time() < limit:
-            if h.call("agent.get", target=args.task_id)["agent"].get("agent_status") != "idle":
+            if status() not in ("idle", "gone"):
                 return True
             time.sleep(0.5)
         return False
 
-    h.call("agent.prompt", target=args.task_id, text=args.prompt)
+    def send() -> None:
+        """Same reasoning: a prompt at an agent that is gone is refused by herdr,
+        and swallowing that refusal is what lets the loop reach its own."""
+        nonlocal vanished
+        try:
+            h.call("agent.prompt", target=args.task_id, text=args.prompt)
+        except Refusal as e:
+            if not gone(e):
+                raise
+            vanished = True
+
+    send()
     if not delivered(PROMPT_LANDED_S):
-        h.call("agent.prompt", target=args.task_id, text=args.prompt)
+        send()
         if not delivered(PROMPT_LANDED_S * 2):
             die(f"{args.task_id} did not take its prompt",
+                f"herdr has no agent in {pane_id} any more: it exited mid-dispatch"
+                if vanished else
                 f"the minion is alive at {pane_id} but never started working",
                 f"the task is held by {owner}; reclaim it with `tasks reset` if it stays idle")
 

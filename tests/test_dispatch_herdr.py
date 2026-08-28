@@ -16,6 +16,9 @@ import contextlib
 import io
 import json
 import os
+import re
+import shlex
+import subprocess
 import sys
 import time
 import unittest
@@ -35,6 +38,22 @@ def seen(kind="claude", ready=True, status="idle"):
 
 
 NOTHING = {"agent": {}}          # herdr answering that the pane holds no agent yet.
+
+# A pane taking input that herdr has not identified an agent in. It is the answer
+# that separates the two halves of the readiness test, which `NOTHING` cannot: that
+# one fails both at once, so it cannot say which half is doing the work.
+UNNAMED = {"agent": {"interactive_ready": True, "agent_status": "idle"}}
+
+# herdr's own `agent_name_taken`, which names the incumbent in its message. That
+# pane id is the whole value of the error: it is a previous minion on this task.
+TAKEN = HerdrError("agent_name_taken",
+                   "agent name is already used; candidates: "
+                   "terminal_id=term_65a15 pane_id=w9:p4 workspace_id=w9 "
+                   "tab_id=w9:t1 cwd=/private/tmp status=Unknown")
+
+# What herdr says about a name no live agent holds. A minion that exits frees its
+# name at once, so this is also what a pane whose agent just died answers.
+VANISHED = HerdrError("agent_not_found", "agent target not found")
 
 
 class Dispatched:
@@ -76,6 +95,34 @@ class DispatchTest(HerdrTest):
         self.tree = self.at("tree")
         os.makedirs(self.work)
         os.makedirs(self.tree)
+
+    @contextlib.contextmanager
+    def release_refused(self):
+        """A `tasks reset` that will not run, and every other `tasks` call real.
+
+        Nothing can make a real queue refuse to release a claim dispatch itself
+        just made, and the hint printed when it does is the one command on this
+        whole path the captain types by hand. So the release alone is intercepted.
+
+        Scoped to the dispatch, and never wider: this replaces `subprocess.run`
+        itself, so left standing it would refuse the very command the test then
+        runs to prove the hint works.
+        """
+        real = subprocess.run
+
+        def refuse_reset(argv, *a, **kw):
+            if "reset" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "reset refused")
+            return real(argv, *a, **kw)
+
+        with mock.patch.object(subprocess, "run", refuse_reset):
+            yield
+
+    def prescribed(self, said):
+        """The command a refusal tells the captain to run, taken back out of it."""
+        found = re.search(r"`([^`]*\breset\b[^`]*)`", said)
+        self.assertIsNotNone(found, f"no reset command was prescribed in:\n{said}")
+        return shlex.split(found.group(1))
 
     def shared_project(self):
         """A project with worktree isolation off: one pane, no branch."""
@@ -207,6 +254,39 @@ class Readiness(DispatchTest):
         self.assertEqual(asked.index("agent.prompt") - asked.index("agent.get"), 3,
                          "the pane was typed into before herdr said it could take it")
 
+    def test_a_pane_taking_input_is_not_ready_until_herdr_has_named_its_agent(self):
+        # The other half of the readiness test, on its own. herdr reports a pane as
+        # taking input before it has identified what is in it, and typing then is
+        # typing into whatever the pane happens to be running - a shell, a pager, a
+        # dialog. Nothing about the answer looks wrong, which is why it needs its
+        # own case: a scripted answer that fails both halves at once proves neither.
+        self.shared_project()
+        self.herdr.reply("agent.get", UNNAMED)
+        task_id = self.task()
+
+        result = self.dispatch(task_id, ready=0.2, landed=0.2)
+
+        self.assertIn("did not become ready", result.said)
+        self.assertEqual(self.herdr.calls_to("agent.prompt"), [])
+
+    def test_an_agent_that_dies_mid_poll_ends_in_the_readiness_refusal(self):
+        # A name is freed the moment its agent exits, so a minion that dies while
+        # dispatch is waiting on it reads as `agent_not_found`. That is one instant's
+        # observation, not an answer about the pane: read as a refusal it escapes the
+        # loop and the captain gets a herdr code instead of the pane and the owner.
+        self.shared_project()
+        self.herdr.reply("agent.get", NOTHING, VANISHED)
+        task_id = self.task()
+
+        # Long enough to poll twice: the first answer is a pane still coming up and
+        # the second is the agent it was coming up as, already gone.
+        result = self.dispatch(task_id, ready=0.8, landed=0.2)
+
+        self.assertIn("did not become ready", result.said)
+        self.assertIn("w1:p1", result.said)
+        self.assertIn("claude@w1:p1", result.said)
+        self.assertNotIn("agent_not_found", result.said)
+
     def test_a_minion_that_never_becomes_ready_names_the_pane_and_the_owner(self):
         self.shared_project()
         self.herdr.reply("agent.get", NOTHING)
@@ -290,6 +370,24 @@ class PromptDelivery(DispatchTest):
         self.assertEqual(self.record(task_id)["status"], "doing")
         self.assertIn("claude@w1:p1", result.said)
 
+    def test_an_agent_that_dies_in_the_delivery_window_is_a_refusal_that_says_so(self):
+        # herdr answers `agent_not_found` to the prompt and to every poll after it.
+        # None of that is delivery, and dispatch's own refusal is the only one that
+        # names the pane and the owner the captain has to act on.
+        self.shared_project()
+        self.herdr.reply("agent.get", seen(), VANISHED)
+        self.herdr.reply("agent.prompt", VANISHED)
+        task_id = self.task()
+
+        result = self.dispatch(task_id, landed=0.2)
+
+        self.assertIn("did not take its prompt", result.said)
+        self.assertIn("no agent in w1:p1 any more", result.said)
+        self.assertIn("claude@w1:p1", result.said)
+        self.assertNotIn("agent_not_found", result.said)
+        # Still held: the pane is there to be read, and reclaiming is the captain's.
+        self.assertEqual(self.record(task_id)["status"], "doing")
+
     def test_a_custom_prompt_is_the_one_delivered(self):
         self.shared_project()
         self.herdr.reply("agent.get", seen(), seen(status="working"))
@@ -351,6 +449,189 @@ class AbandonedDispatch(DispatchTest):
 
         self.assertEqual(self.herdr.calls_to("worktree.remove"), [])
         self.assertEqual(self.herdr.calls_to("workspace.close"), [])
+
+
+class StartRefusals(DispatchTest):
+    """`agent.start` is the last call that can refuse, and the first that refuses
+    holding a claim. Left to escape, it exits with a raw herdr line, an orphan
+    workspace nothing points at, and a task in `doing` whose pane holds no agent -
+    and the next dispatch of that task then fails on the leftover worktree instead,
+    saying it may hold unlanded work that never existed."""
+
+    def started(self, answer):
+        self.herdr.reply("agent.start", answer)
+        return self.task()
+
+    def test_a_name_a_live_agent_already_holds_names_the_pane_to_read_first(self):
+        # herdr enforces one live agent per name, so this is a previous minion on
+        # this same task announcing itself. Its pane is in herdr's own message, and
+        # it is exactly what the captain has to read before replacing anything.
+        self.shared_project()
+        task_id = self.started(TAKEN)
+
+        result = self.dispatch(task_id)
+
+        self.assertIn(f"a live agent is already named {task_id} at w9:p4", result.said)
+        self.assertIn("previous minion on this task", result.said)
+
+    def test_a_refused_start_gives_the_task_back_and_takes_the_workspace_down(self):
+        self.shared_project()
+        task_id = self.started(TAKEN)
+
+        result = self.dispatch(task_id)
+
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        self.assertIsNone(self.record(task_id)["owner"])
+        self.assertEqual(self.herdr.calls_to("workspace.close"),
+                         [{"workspace_id": "ws1"}])
+        self.assertIn("back in the queue", result.said)
+
+    def test_a_refused_start_removes_the_worktree_it_had_just_made(self):
+        # Safe for the same reason the claim rollback is: the agent never started,
+        # so nothing has run in there and there is no work to destroy.
+        self.isolated_project()
+        task_id = self.started(TAKEN)
+
+        self.dispatch(task_id)
+
+        self.assertEqual(self.herdr.calls_to("worktree.remove"),
+                         [{"workspace_id": "ws1"}])
+        self.assertEqual(self.record(task_id)["status"], "todo")
+
+    def test_a_worktree_that_will_not_remove_is_left_and_said_out_loud(self):
+        # A cleanup that cannot prove it is safe stops and reports. The pane still
+        # goes, because a container no record points at is the thing to never leave.
+        self.isolated_project()
+        self.herdr.reply("worktree.remove", HerdrError("busy", "worktree is in use"))
+        task_id = self.started(TAKEN)
+
+        result = self.dispatch(task_id)
+
+        self.assertIn(f"worktree left behind at {self.tree}", result.err)
+        self.assertEqual(self.herdr.calls_to("workspace.close"),
+                         [{"workspace_id": "ws1"}])
+
+    def test_a_cleanup_that_also_refuses_does_not_replace_what_it_cleans_up(self):
+        # Two herdr calls refusing in one dispatch. The second is about the cleanup
+        # and the first is about the dispatch, and only the first is what the
+        # captain came for: a rollback that threw its own error would hand them a
+        # bare herdr code instead of the reason, the hints, and the queue result.
+        self.isolated_project()
+        self.herdr.reply("worktree.remove", HerdrError("busy", "worktree is in use"))
+        self.herdr.reply("workspace.close", HerdrError("no_such_workspace", "gone"))
+        task_id = self.started(TAKEN)
+
+        result = self.dispatch(task_id)
+
+        self.assertIn(f"a live agent is already named {task_id} at w9:p4", result.said)
+        self.assertIn("previous minion on this task", result.said)
+        self.assertIn("back in the queue", result.said)
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        # Both halves of the mess, because both are still on disk and in herdr.
+        self.assertIn(f"worktree left behind at {self.tree}", result.err)
+        self.assertIn("workspace ws1 is still open", result.err)
+
+    def test_a_workspace_that_will_not_close_is_a_warning_not_the_refusal(self):
+        # The same loss, one call earlier: a project with no worktree closes its
+        # workspace directly, so that refusal is the only one cleanup can hit.
+        self.shared_project()
+        self.herdr.reply("workspace.close", HerdrError("no_such_workspace", "gone"))
+        task_id = self.started(TAKEN)
+
+        result = self.dispatch(task_id)
+
+        self.assertIn(f"a live agent is already named {task_id} at w9:p4", result.said)
+        self.assertIn("back in the queue", result.said)
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        self.assertIn("workspace ws1 is still open", result.err)
+
+    def test_a_release_that_fails_prescribes_a_reset_that_runs(self):
+        # The only manual action the rollback ever asks for. `tasks reset` requires
+        # `--reason`, so a hint written against the older signature exits
+        # USAGE_ERROR when it is typed back, and this path has nothing else to try.
+        self.shared_project()
+        task_id = self.started(TAKEN)
+
+        with self.release_refused():
+            result = self.dispatch(task_id)
+
+        self.assertIn(f"{task_id} is still held by claude@w1:p1", result.said)
+        self.assertEqual(self.record(task_id)["status"], "doing")
+        command = self.prescribed(result.said)
+        # The store, spelled out: a captain reading a refusal has no reason to be
+        # standing anywhere in particular, and dispatch knows which queue this was.
+        self.assertIn(self.at("tasks.jsonl"), command)
+        self.assertAccepted(self.run_cmd(command))
+        self.assertEqual(self.record(task_id)["status"], "todo")
+
+    def test_a_task_id_herdr_will_not_name_an_agent_says_what_the_limit_is(self):
+        # Unreachable through the queue's own ids, which are checked before anything
+        # is created. Still hinted, because herdr's grammar is herdr's to change.
+        self.shared_project()
+        task_id = self.started(HerdrError("invalid_agent_name", "1-32 characters"))
+
+        result = self.dispatch(task_id)
+
+        self.assertIn("will not name an agent", result.said)
+        self.assertIn("1 to 32", result.said)
+        self.assertEqual(self.record(task_id)["status"], "todo")
+
+    def test_a_refusal_herdr_gives_no_hint_for_still_rolls_the_dispatch_back(self):
+        self.shared_project()
+        task_id = self.started(HerdrError("pane_busy", "pane already has an agent"))
+
+        result = self.dispatch(task_id)
+
+        self.assertIn("pane_busy", result.said)
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        self.assertEqual(self.herdr.calls_to("workspace.close"),
+                         [{"workspace_id": "ws1"}])
+
+    def test_a_herdr_that_stops_answering_still_gives_the_task_back(self):
+        # The claim is released first precisely for this: it needs nothing from
+        # herdr, and it is the half of the mess that outlives the workspace.
+        self.shared_project()
+        self.herdr.reply("agent.start", CLOSE)
+        self.herdr.reply("workspace.close", CLOSE)
+        task_id = self.task()
+
+        result = self.dispatch(task_id)
+
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        self.assertIn("back in the queue", result.said)
+        self.assertIn("workspace ws1 is still open", result.err)
+
+
+class TaskIdIsAlsoAnAgentName(DispatchTest):
+    """A minion is named after its task, so the queue's id grammar has to fit inside
+    herdr's. It does not: the queue allows 48 characters and herdr allows 32."""
+
+    def test_an_id_too_long_to_be_an_agent_name_is_refused_before_anything_exists(self):
+        # Caught late, this costs a workspace, a claim and a rollback, and it fails
+        # in `agent.start` where the message is about herdr rather than about the id.
+        self.shared_project()
+        task_id = self.task("Reconciliationimplementationdocumentation of a thing")
+        self.assertGreater(len(task_id), 32)
+
+        result = self.dispatch(task_id)
+
+        self.assertIn("cannot be a herdr agent name", result.said)
+        self.assertIn("1 to 32 characters", result.said)
+        # Nothing was made and nothing was taken: there is nothing to clean up.
+        self.assertEqual(self.herdr.calls, [])
+        self.assertEqual(self.record(task_id)["status"], "todo")
+
+    def test_an_id_herdr_accepts_is_dispatched_as_normal(self):
+        self.shared_project()
+        self.herdr.reply("agent.get", seen(), seen(status="working"))
+        task_id = self.task("A" * 32)
+        self.assertEqual(len(task_id), 32)
+
+        result = self.dispatch(task_id)
+
+        self.assertIsNone(result.refusal, result.err)
+        started, = self.herdr.calls_to("agent.start")
+        self.assertEqual(started["name"], task_id)
 
 
 class WorktreeRefusals(DispatchTest):
@@ -440,7 +721,7 @@ class CheckOwners(HerdrTest):
         rc, out = self.check(self.doing("t1", "claude@w1:p1"))
         self.assertEqual(rc, 1)
         self.assertIn("GONE    t1", out)
-        self.assertIn("before `tasks reset t1`", out)
+        self.assertIn("reset t1 --reason", out)
 
     def test_a_pane_that_now_holds_a_different_agent_reads_as_gone(self):
         self.herdr.reply("agent.get", seen(kind="pi"))
@@ -518,6 +799,28 @@ class CheckReadsWhatDispatchWrites(DispatchTest):
 
         self.assertEqual(rc, 0, buf.getvalue())
         self.assertIn(f"ok      {task_id} -> claude@w1:p1", buf.getvalue())
+
+    def test_the_reset_check_prescribes_for_a_dead_minion_runs(self):
+        # `--check` only reports, so the command it prints is the whole of what it
+        # offers. It carries the store the check read and a reason saying what the
+        # check saw, because a captain typing it back has neither to hand.
+        self.shared_project()
+        self.herdr.reply("agent.get", seen(), seen(status="working"))
+        task_id = self.task()
+        self.assertIsNone(self.dispatch(task_id).refusal)
+
+        self.herdr.reply("agent.get", VANISHED)
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, self.socket_env()), redirect_stdout(buf):
+            rc = d.check_owners(self.at("tasks.jsonl"))
+
+        self.assertEqual(rc, 1, buf.getvalue())
+        self.assertIn("no claude agent in w1:p1", buf.getvalue())
+        command = shlex.split(next(line.strip() for line in buf.getvalue().splitlines()
+                                   if "reset" in line))
+        self.assertIn(self.at("tasks.jsonl"), command)
+        self.assertAccepted(self.run_cmd(command))
+        self.assertEqual(self.record(task_id)["status"], "todo")
 
 
 class Transport(HerdrTest):
