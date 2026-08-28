@@ -25,12 +25,20 @@ class Recipe(HomeTest):
         super().setUp()
         self.bindir = self.at("bin")
 
-    def just(self, *args, home=None, timeout=180):
+    def just(self, *args, home=None, pi_package=None, timeout=180):
         e = dict(os.environ)
+        # Every location the recipes write to is passed as a just variable, and the
+        # environment that would override one is dropped: a suite that inherited the
+        # captain's SIANA_HOME or SIANA_PI_PACKAGE would install over the live fleet.
         e.pop("SIANA_HOME", None)
+        e.pop("SIANA_PI_PACKAGE", None)
+        # `doctor` asks `siana-dispatch --check`, which prefers SIANA_TASKS_FILE
+        # over the home it was given. Inherited, that reads the live fleet's queue,
+        # and these assertions would be about whatever the captain has in flight.
+        e.pop("SIANA_TASKS_FILE", None)
         return subprocess.run(
             ["just", f"home={home if home is not None else self.home}",
-             f"bindir={self.bindir}", *args],
+             f"bindir={self.bindir}", f"pi_package={pi_package or ''}", *args],
             cwd=DISTRO, env=e, text=True, capture_output=True, timeout=timeout)
 
 
@@ -116,19 +124,38 @@ class Init(Recipe):
                              os.path.realpath(os.path.join(DISTRO, "bin", c)))
         doctor = self.just("doctor")
         self.assertNotIn("stale", doctor.stderr)
-        # The ambient queue is the one part of an install that depends on something
-        # outside the distro: `init` writes `.pi/settings.json` only when the tasks
-        # pi package sits beside the checkout, and says so when it does not. From a
-        # linked worktree that sibling is absent, so a blanket "nothing is missing"
-        # asserts on where this suite was checked out rather than on the install -
-        # green in the main tree and red in every minion's. Demanded when the package
-        # is there, tolerated by name when it is not, and nothing else ever tolerated.
+        # Nothing is tolerated here. The ambient queue used to depend on a tasks
+        # checkout beside this one, so this had to excuse a missing
+        # `.pi/settings.json` from a worktree - which meant the assertion was about
+        # where the suite was checked out rather than about the install. `init`
+        # generates the package from the installed `tasks` now, so a complete home
+        # is complete everywhere.
         missing = [line.strip() for line in doctor.stdout.splitlines()
                    if "missing " in line]
-        if os.path.isdir(os.path.join(DISTRO, os.pardir, "tasks", "pi-agent-tasks")):
-            self.assertEqual(missing, [])
-        else:
-            self.assertEqual(missing, ["missing .pi/settings.json"])
+        self.assertEqual(missing, [])
+
+    def test_a_configured_pi_package_is_the_one_installed(self):
+        # The captain who keeps their own package - a tasks checkout they are
+        # editing - gets that one, not a generated copy that would shadow it.
+        pkg = os.path.join(self.home, "elsewhere", "pi-agent-tasks")
+        gen = subprocess.run(["tasks", "pi-package", "--out", pkg],
+                             text=True, capture_output=True, timeout=60)
+        self.assertEqual(gen.returncode, 0, gen.stdout + gen.stderr)
+        out = self.just("init", pi_package=pkg)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(os.path.exists(self.at(".pi", "settings.json")))
+        # And nothing was generated beside it, which is how a silent fallback to a
+        # different package would show.
+        self.assertFalse(os.path.exists(self.at("pi-agent-tasks")))
+
+    def test_a_configured_pi_package_that_is_absent_is_refused(self):
+        # Never a fallback: generating a different package behind the captain's
+        # back gives SIANA a queue skill that is not the one they pointed at. And
+        # the refusal comes before anything is written, so a typo costs a retype.
+        gone = os.path.join(self.home, "not-a-package")
+        self.assertRefused(self.just("init", pi_package=gone),
+                           "no pi package directory at", "SIANA_PI_PACKAGE")
+        self.assertFalse(os.path.exists(self.at("siana.env")))
 
     def test_it_is_idempotent_and_never_clobbers_an_evolved_file(self):
         # SIANA can evolve its own instructions, so a diverged home copy is the

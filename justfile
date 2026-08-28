@@ -2,6 +2,10 @@
 bindir := env('XDG_BIN_HOME', env('HOME') / '.local/bin')
 # Where a SIANA instance keeps its queue and its configuration.
 home := env('SIANA_HOME', env('HOME') / '.siana')
+# The tasks pi package, which puts the queue in front of SIANA's session. Empty
+# means `just init` generates one into the home from the installed `tasks`; set it
+# only to point at a package directory you keep yourself.
+pi_package := env('SIANA_PI_PACKAGE', '')
 
 [private]
 default:
@@ -22,6 +26,20 @@ init: _contract-drift
             exit 1
         }
     done
+
+    # A configured package that is not there is a refusal, never a fallback. The
+    # captain naming a directory means they want that package; generating a
+    # different one behind their back would give SIANA a queue skill that is not
+    # the one they are editing. Checked before anything is written, so a typo in
+    # SIANA_PI_PACKAGE costs a retype and not a half-built home.
+    pkg='{{pi_package}}'
+    if [ -n "$pkg" ] && [ ! -d "$pkg" ]; then
+        echo "no pi package directory at $pkg" >&2
+        echo "  SIANA_PI_PACKAGE must name a directory holding the tasks pi package" >&2
+        echo "  \`tasks pi-package --out <dir>\` writes one; unset it to have init" >&2
+        echo "  generate one into $home" >&2
+        exit 1
+    fi
 
     mkdir -p "$home"
 
@@ -83,16 +101,30 @@ init: _contract-drift
 
     # Project-local, never global: SIANA's session opens with the queue in front
     # of it, and no other agent session on this machine sees fleet-wide state.
-    pkg="$distro/../tasks/pi-agent-tasks"
-    if [ -d "$pkg" ]; then
-        # -a because pi refuses to rewrite an existing project-local config in an
-        # untrusted directory, and re-running init must not be a first-run-only path.
-        (cd "$home" && pi install -l -a "$(cd "$pkg" && pwd)" >/dev/null)
-        echo "wrote    $home/.pi/settings.json"
-    else
-        echo "skipped  ambient queue: no pi package at $pkg" >&2
-        echo "         run \`tasks pi-package\` in the tasks checkout, then re-run init" >&2
+    #
+    # The package is generated from the installed `tasks`, not found beside the
+    # checkout. A sibling `../tasks/pi-agent-tasks` is a layout one machine happened
+    # to have, so the ambient queue was an install step nobody else could complete,
+    # and it failed by skipping - leaving a home that looked installed and had no
+    # queue in front of it. Generated is also the only way it stays correct: the
+    # package bakes in the absolute path of the `tasks` it came from, so one found
+    # on disk can point at a different one. Regenerated on every init, like
+    # siana.env, because it is derived and never the captain's work.
+    if [ -z "$pkg" ]; then
+        pkg="$home/pi-agent-tasks"
+        tasks pi-package --out "$pkg" >/dev/null || {
+            echo "cannot generate the pi package with $(command -v tasks)" >&2
+            echo "  \`tasks pi-package --out <dir>\` is how the ambient queue is built" >&2
+            echo "  upgrade tasks until it works, or set SIANA_PI_PACKAGE to a" >&2
+            echo "  package directory you already have" >&2
+            exit 1
+        }
+        echo "wrote    $pkg"
     fi
+    # -a because pi refuses to rewrite an existing project-local config in an
+    # untrusted directory, and re-running init must not be a first-run-only path.
+    (cd "$home" && pi install -l -a "$(cd "$pkg" && pwd)" >/dev/null)
+    echo "wrote    $home/.pi/settings.json"
 
     mkdir -p '{{bindir}}'
     for c in siana siana-dispatch siana-brief siana-watch siana-owe; do
