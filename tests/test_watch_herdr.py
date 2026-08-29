@@ -88,6 +88,30 @@ class Signals:
                              "the watcher")
 
 
+def _interrupt(_seconds):
+    """The captain's Ctrl-C, landing where the loop sleeps."""
+    raise KeyboardInterrupt
+
+
+class Clock:
+    """The `time` the watcher sees, with only its own sleep replaced.
+
+    Bound onto the module rather than onto `time.sleep`, which is shared with every
+    library in this process. `subprocess.run(..., timeout=)` polls for its child
+    with `time.sleep`, so patching the function delivered the scripted signal from
+    inside the `ps` call in `process_command` - before the watcher had installed
+    anything - and the test failed saying SIGTERM was left on its default
+    disposition. On Linux only, where that child is not reaped on the first
+    `waitpid`; on macOS it is, `time.sleep` is never reached, and the same suite ran
+    green for as long as nobody ran it anywhere else."""
+
+    def __init__(self, sleep):
+        self.sleep = sleep
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 class WatchTest(HomeTest):
     """A recorded SIANA session, and a herdr that answers on cue."""
 
@@ -157,11 +181,11 @@ class WatchTest(HomeTest):
                                                   self.signals.install))
             if terminated:
                 stack.enter_context(mock.patch.object(
-                    w.time, "sleep",
-                    side_effect=lambda _s: self.signals.deliver(signal.SIGTERM)))
+                    w, "time",
+                    Clock(lambda _s: self.signals.deliver(signal.SIGTERM))))
             if interrupted:
-                stack.enter_context(mock.patch.object(w.time, "sleep",
-                                                      side_effect=KeyboardInterrupt))
+                stack.enter_context(mock.patch.object(
+                    w, "time", Clock(_interrupt)))
             stack.enter_context(redirect_stdout(out))
             stack.enter_context(redirect_stderr(err))
             try:
