@@ -50,6 +50,7 @@ const removed = [];
 const realReadFileSync = fs.readFileSync;
 const realWriteFileSync = fs.writeFileSync;
 const realUnlinkSync = fs.unlinkSync;
+const realRenameSync = fs.renameSync;
 const realWatch = fs.watch;
 const realSetInterval = globalThis.setInterval;
 const realClearInterval = globalThis.clearInterval;
@@ -65,6 +66,14 @@ fs.writeFileSync = (path, ...rest) => {
 fs.unlinkSync = (path, ...rest) => {
   removed.push(String(path));
   return realUnlinkSync(path, ...rest);
+};
+// A disk that will not take the write. Wrapped at the rename because that is where
+// a staged write becomes the file, so a failure here is the one that leaves the
+// counter on disk behind what has actually been delivered.
+let renameThrows = false;
+fs.renameSync = (from, to, ...rest) => {
+  if (renameThrows) throw new Error("nothing can be written here");
+  return realRenameSync(from, to, ...rest);
 };
 
 const sent = [];
@@ -186,6 +195,9 @@ async function run(command) {
       return fire("session_start", { reason: command.reason ?? "startup" });
     case "shutdown":
       return fire("session_shutdown", { reason: command.reason ?? "quit" });
+    case "refuse-writes":
+      renameThrows = command.value;
+      return {};
     case "refuse-sends":
       sendThrows = command.value;
       return {};

@@ -110,10 +110,14 @@ export default function (pi: ExtensionAPI): void {
   let paths: Paths | null = null;
   let watcher: fs.FSWatcher | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
-  // The high-water mark this has delivered, and the one it has seen raised. Held
-  // in memory as well as on disk so a wake that cannot go out yet is not re-read
-  // from a file the watcher may have moved on from.
+  // Three marks, and the split between the first two is load-bearing. `consumed` is
+  // what has been delivered and is what stops a wake going twice; `recorded` is what
+  // the file says, which is what the watcher reads. They come apart when the write
+  // fails - the directory gone, the disk full - and they have to, because a delivery
+  // already made must never be retried on the strength of a write that did not land.
+  // `held` is the highest count seen raised.
   let consumed = 0;
+  let recorded = 0;
   let held = 0;
 
   /**
@@ -135,21 +139,35 @@ export default function (pi: ExtensionAPI): void {
    * as a steer.
    */
   function flush(ctx: ExtensionContext): void {
-    if (held <= consumed) return;
-    // No editor at all - print mode, rpc - is an empty editor: there is no draft
-    // to arrive in the wrong order behind the wake.
-    const draft = ctx.hasUI ? ctx.ui.getEditorText() : "";
-    if (draft.trim() !== "") return;
-    const mark = held;
-    if (ctx.isIdle()) pi.sendUserMessage(WAKE);
-    // Mid-turn. `followUp` waits for the agent to finish its tool calls rather
-    // than steering the turn already in flight, which is the same hazard the
-    // watcher used to guard against by refusing to poke a working agent.
-    else pi.sendUserMessage(WAKE, { deliverAs: "followUp" });
-    // Only after the send. `consumed` written first would swallow the wake for
-    // good if the send threw, and the watcher would have no way to know.
-    writeCounter(paths!.consumed, mark);
-    consumed = mark;
+    if (held > consumed) {
+      // No editor at all - print mode, rpc - is an empty editor: there is no draft
+      // to arrive in the wrong order behind the wake.
+      const draft = ctx.hasUI ? ctx.ui.getEditorText() : "";
+      if (draft.trim() === "") {
+        const mark = held;
+        if (ctx.isIdle()) pi.sendUserMessage(WAKE);
+        // Mid-turn. `followUp` waits for the agent to finish its tool calls rather
+        // than steering the turn already in flight, which is the same hazard the
+        // watcher used to guard against by refusing to poke a working agent.
+        else pi.sendUserMessage(WAKE, { deliverAs: "followUp" });
+        // Here, and never after the write below. This is what makes delivery
+        // once-only, and the wake has now been delivered: left behind `held` by a
+        // write that threw, the next tick would send the same wake again half a
+        // second later, and again, for as long as the write kept failing - and
+        // `sendUserMessage` always triggers a turn, so that is a paid turn every
+        // half second with nothing but a stderr line five minutes later to say so.
+        consumed = mark;
+      }
+    }
+    // Recorded separately, because delivery and recording fail for different
+    // reasons and only this half is retryable. It is never reached before a send
+    // has succeeded: `consumed` moves nowhere else. Until it lands the watcher
+    // reads the wake as untaken and says so, which is the right thing for it to
+    // be saying while this cannot write.
+    if (recorded < consumed) {
+      writeCounter(paths!.consumed, consumed);
+      recorded = consumed;
+    }
   }
 
   function drain(ctx: ExtensionContext): void {
@@ -215,7 +233,7 @@ export default function (pi: ExtensionAPI): void {
       consumed: join(dir, "consumed"),
       consumer: join(dir, "consumer"),
     };
-    consumed = counter(paths.consumed);
+    consumed = recorded = counter(paths.consumed);
     held = consumed;
     // Rewritten on every session_start, which covers a record left behind by a pi
     // that was killed: the watcher verifies the pid and the command, so a stale

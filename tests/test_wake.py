@@ -233,6 +233,43 @@ class Refused(WakeTest):
         self.assertEqual(self.consumed(), 1)
 
 
+class Unwritable(WakeTest):
+    """A disk that will not take the mark, which is the one failure that could turn
+    one wake into an unbounded stream of them.
+
+    `sendUserMessage` always triggers a turn, so a wake re-sent every half second is
+    a paid turn every half second, and the only signal is a line on a stderr nobody
+    is reading five minutes later. What makes delivery once-only has to be the send
+    itself, never the record of it."""
+
+    def test_a_mark_that_cannot_be_written_never_sends_the_wake_again(self):
+        pi = self.session()
+        pi("start")
+        pi("refuse-writes", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        state = pi("quiet")
+        self.assertEqual(len(state["sent"]), 1,
+                         f"the wake was re-sent {len(state['sent'])} times because "
+                         "its mark could not be written")
+
+    def test_the_mark_lands_as_soon_as_it_can_be_written(self):
+        # The watcher reads that file, and until it lands it reads the wake as
+        # untaken and says so - which is the right thing for it to be saying. So
+        # the write is retried, and the delivery behind it is not.
+        pi = self.session()
+        pi("start")
+        pi("refuse-writes", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        pi("quiet")
+        self.assertEqual(self.consumed(), 0)
+        pi("refuse-writes", value=False)
+        state = pi("quiet")
+        self.assertEqual(self.consumed(), 1)
+        self.assertEqual(len(state["sent"]), 1)
+
+
 class TheEditor(WakeTest):
     """The captain's draft, which is the whole reason this lives inside pi."""
 
