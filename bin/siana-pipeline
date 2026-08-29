@@ -22,6 +22,13 @@ to a commit, and `check` refuses when the branch has moved off it. Committing af
 passing run is the ordinary way to get that wrong, and it is the one thing this makes
 impossible rather than merely discouraged.
 
+**The review is measured from one commit, and that commit is behind the head.** A
+task records its base as a ref, and a ref moves; work whose whole job is to move a
+branch leaves the ref it started from off this line altogether. So the base is
+resolved to a commit before anything reads it, and a commit the branch does not
+contain is refused: a range measured from a fork point reviews both lines, which is
+mostly somebody else's work with this change buried in it.
+
 **Nothing is pushed here.** A run happens inside the ship task, which is before any
 independent minion has accepted the work, and nothing leaves the machine before then.
 Review, test, and the branch is where this ends. `siana-publish` carries the push, the
@@ -311,15 +318,24 @@ def cmd_run(args, home: str, tasks_file: str, task_id: str) -> int:
     # project was checked out to, and the branch a merge request targets is the only
     # other thing that can honestly be called the fork point. Neither is guessed: a
     # diff against the wrong base is a review of somebody else's work.
-    base = task.get("base") or project.get("target")
-    if not base:
+    base_ref = task.get("base") or project.get("target")
+    if not base_ref:
         die(f"cannot tell what {branch} forked from",
             f"{task_id} records no `base`, and {handle} records no `target`",
             "reviewing a diff against a guessed base judges work nobody did here")
-    if git(root, "rev-parse", "--verify", str(base), check=False).returncode != 0:
-        die(f"{root} has no ref {base}",
+    base_ref = str(base_ref)
+
+    # Pinned to one commit here, and every later reader is handed that commit rather
+    # than the ref it came from. A ref moves: the branch it names can be advanced,
+    # rewritten or deleted between this run and whoever reads its record, and then
+    # the record and the review prompt would name work this run never measured.
+    resolved = git(root, "rev-parse", "--verify", f"{base_ref}^{{commit}}",
+                   check=False)
+    if resolved.returncode != 0:
+        die(f"{root} has no ref {base_ref}",
             "it is what this branch is measured against, so there is no change to",
             "review until it resolves")
+    base = resolved.stdout.strip()
 
     brief = os.path.join(home, "briefs", f"{task_id}.md")
     if not os.path.isfile(brief):
@@ -339,12 +355,34 @@ def cmd_run(args, home: str, tasks_file: str, task_id: str) -> int:
 
     def fail(reason: str, code: int) -> int:
         write_record(out, {"task": task_id, "branch": branch, "head": head,
-                           "base": str(base), "at": started, "verdict": "failed",
+                           "base": base, "at": started, "verdict": "failed",
                            "reason": reason, "steps": steps})
         return code
 
+    # The base has to be behind this head, and not merely resolvable. Work whose job
+    # is to move a branch invalidates its own base by succeeding: replay the commits
+    # onto another line and the ref they came from shares nothing with the result but
+    # a fork point, so `{BASE}..HEAD` answers with every commit either line has made
+    # since. That is how a review of one rebased commit came back a review of
+    # eighteen, and read as green. Refused rather than repaired, because nothing here
+    # can say which commit was meant: a merge-base would review a range nobody chose,
+    # and the base is the queue's contract, which a minion may not rewrite.
+    #
+    # Recorded as a failed run before the refusal, and not only printed. The head does
+    # not have to have moved for a base to stop being an ancestor - the ref can move
+    # instead - and a prior pass at this same head would otherwise still read as green
+    # to `check`.
+    if git(root, "merge-base", "--is-ancestor", base, head, check=False).returncode:
+        fail(f"{base_ref} is not an ancestor of {head}", BLOCK)
+        die(f"base {base_ref} is not an ancestor of {branch} at {head[:12]}",
+            f"it resolves to {base[:12]}, which this branch's history does not have",
+            "they share only a fork point, so the review would be measured from",
+            "there and would judge every commit either line has made since",
+            "this is not yours to work around: `block` and relay it. Whether the",
+            "base is wrong or the branch has to be replayed onto it is SIANA's")
+
     print(f"pipeline {task_id}")
-    print(f"  branch {branch} at {head[:12]} (base {base})")
+    print(f"  branch {branch} at {head[:12]} (base {base_ref} at {base[:12]})")
 
     print(f"\n=== test: {step_command}")
     tested = subprocess.run(step_command, shell=True, cwd=root)
@@ -386,7 +424,7 @@ def cmd_run(args, home: str, tasks_file: str, task_id: str) -> int:
 
     prompt = open(prompt_template).read()
     for marker, value in (("{TASK}", task_id), ("{BRANCH}", branch),
-                          ("{BASE}", str(base)), ("{BRIEF}", brief),
+                          ("{BASE}", base), ("{BRIEF}", brief),
                           ("{ORDERS}", orders), ("{FINDINGS}", findings_file)):
         prompt = prompt.replace(marker, value)
 
@@ -437,7 +475,7 @@ def cmd_run(args, home: str, tasks_file: str, task_id: str) -> int:
         return fail(f"{len(fixable)} finding(s) to fix", FIX)
 
     write_record(out, {"task": task_id, "branch": branch, "head": head,
-                       "base": str(base), "at": started, "verdict": "passed",
+                       "base": base, "at": started, "verdict": "passed",
                        "steps": steps})
     print(f"\npassed   {branch} at {head[:12]}")
     print(f"recorded {out}")

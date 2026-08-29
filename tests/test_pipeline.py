@@ -178,6 +178,22 @@ class Pipeline(HomeTest):
                        "# Brief\n\n## The task\n\nAdd b.txt.\n")
         return worktree
 
+    def diverged(self):
+        """A side branch the work starts on, and a main line that has moved since.
+
+        The shape a rebase leaves behind: replaying the work onto `main` succeeds by
+        putting it where `old` is not, so the ref the task recorded as its base ends
+        up sharing nothing with the result but a fork point."""
+        self.git("checkout", "-q", "-b", "old")
+        self.write(self.repo, "old.txt", "the line the work started on\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "old line")
+        self.git("checkout", "-q", "main")
+        self.write(self.repo, "main.txt", "the line it is replayed onto\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "main moves on")
+        return "old"
+
     def commit_in(self, worktree, name="b.txt", text="work\n"):
         self.write(worktree, name, text)
         self.git("add", "-A", cwd=worktree)
@@ -250,6 +266,79 @@ class Run(Pipeline):
         out = self.pipe("run", cwd=wt)
         self.assertRefused(out, "cannot tell what", "forked from")
 
+    def test_a_base_the_head_was_replayed_off(self):
+        """The base is an ancestor or there is no review to run.
+
+        Reproduces the failure this refusal exists for: the task recorded a real ref
+        as its base, the work was rebased onto another line, and every later reader
+        of `base..HEAD` got that whole line instead of the one commit."""
+        marker = self.at("ship-ran")
+        self.project(ship=f"touch {marker}")
+        self.diverged()
+        wt = self.dispatched(base="old")
+        self.commit_in(wt)
+        self.git("rebase", "-q", "main", cwd=wt)
+        head = self.git("rev-parse", "HEAD", cwd=wt).strip()
+        out = self.pipe("run", cwd=wt)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertRefused(out, "base old is not an ancestor", head[:12],
+                           "every commit either line has made since")
+        self.assertFalse(os.path.exists(marker), "the ship command ran anyway")
+        self.assertFalse(self.reviewed())
+        self.assertEqual(self.record()["verdict"], "failed")
+
+    def test_a_base_that_moves_off_a_head_that_did_not(self):
+        # The one way a pass could outlive this refusal. A ref can stop being an
+        # ancestor without the branch moving at all, and `check` compares the head,
+        # so the refusal is recorded rather than only printed.
+        self.project()
+        self.diverged()
+        wt = self.dispatched(base="old")
+        self.commit_in(wt)
+        self.assertAccepted(self.pipe("run", cwd=wt))
+        self.git("branch", "-f", "old", "main")
+        self.assertEqual(self.pipe("run", cwd=wt).returncode, 2)
+        self.assertRefused(self.pipe("check", cwd=wt), "did not pass",
+                           "is not an ancestor")
+
+    def test_the_projects_target_is_a_base_like_any_other(self):
+        # The fallback is measured the same way. A task queued with no base of its
+        # own is reviewed against `target`, and against that commit only.
+        self.project(target="main")
+        wt = self.dispatched(base=None)
+        self.commit_in(wt)
+        self.assertAccepted(self.pipe("run", cwd=wt))
+        self.assertEqual(self.record()["base"],
+                         self.git("rev-parse", "main").strip())
+
+    def test_a_target_the_branch_is_not_on(self):
+        self.project(target="old")
+        self.diverged()
+        wt = self.dispatched(base=None)
+        self.commit_in(wt)
+        out = self.pipe("run", cwd=wt)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertRefused(out, "base old is not an ancestor")
+
+    def test_the_base_is_pinned_before_anything_reads_it(self):
+        """A ref moves, and a commit does not.
+
+        What the reviewer was given and what the record says it measured have to keep
+        meaning the same work after the run, or the green describes a range nobody
+        can reconstruct."""
+        self.project()
+        self.diverged()
+        wt = self.dispatched(base="old")
+        self.commit_in(wt)
+        pinned = self.git("rev-parse", "old").strip()
+        self.assertAccepted(self.pipe("run", cwd=wt))
+        self.assertIn(pinned, self.prompt())
+        self.assertNotIn("base    old", self.prompt())
+        self.assertEqual(self.record()["base"], pinned)
+        self.git("branch", "-D", "old")
+        self.assertEqual(self.record()["base"], pinned)
+        self.assertIn(pinned, self.assertAccepted(self.pipe("check", cwd=wt)))
+
     def test_a_missing_brief(self):
         self.project()
         wt = self.dispatched(brief=False)
@@ -290,7 +379,7 @@ class Run(Pipeline):
         prompt = self.prompt()
         self.assertIn(self.at("briefs", f"{self.TASK}.md"), prompt)
         self.assertIn(f"siana/{self.TASK}", prompt)
-        self.assertIn("base    main", prompt)
+        self.assertIn(f"base    {self.git('rev-parse', 'main').strip()}", prompt)
         self.assertNotIn("{", prompt.split("## How to report")[0])
 
     def test_the_reviewer_is_told_where_the_conventions_are(self):
