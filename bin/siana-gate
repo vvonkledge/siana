@@ -363,9 +363,13 @@ def decide(home, klass, task_id, record, verdict, reason, grant):
 def listed(record, field):
     """One of the record's list fields, as a list.
 
-    A caller that wrote a bare string where a list belongs has said something, and it
-    is more useful in the ledger than dropped: the shape check below is what refuses
-    it, and this is only what survives long enough to be refused in writing."""
+    A caller that wrote a bare string where a list belongs has said something, and a
+    one-item list is what it said. `shape` below asks only whether a field carries
+    anything, so such a record is recorded rather than refused, and that is the
+    lenient half deliberately: what the field is for is the captain reading it in the
+    morning, and `evidence: ["just one thing"]` reads exactly as thin as it is. A
+    refusal here would instead drop the only account of a decision SIANA reached over
+    a JSON bracket."""
     value = record.get(field)
     if isinstance(value, list):
         return value

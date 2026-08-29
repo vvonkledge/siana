@@ -435,8 +435,25 @@ def main() -> None:
     body = "\n".join(body)
 
     # The queue's refusals are all above: they say this verdict does not authorise a
-    # publish. What follows asks whether the world can carry one out, which is a
-    # different failure and worth reaching in a different order.
+    # publish, and that is true whoever is asking. This asks who is asking, and it
+    # comes before everything below because all of that is about whether this machine
+    # could carry the publish out - a different question, and not one an advisory
+    # night needs answered. A proposal has to be recorded on a machine whose registry
+    # path has been moved, whose repository has no `origin`, whose remote is on a
+    # forge nobody here recognises, or that has no forge CLI installed at all. Each
+    # of those exited before this was asked, and a decision SIANA reached was
+    # discarded with nothing in the ledger - which is the one failure that reads in
+    # the morning as a quiet night.
+    #
+    # A dry run is exempt, and exempt here rather than by falling through the block
+    # below, for the same reason it needs no record: it changes nothing, and a
+    # proposal written for a command that was never going to run would put a decision
+    # in front of the captain that SIANA did not make.
+    if gated and not args.dry_run:
+        raise SystemExit(propose(args.task_id, args.record))
+
+    # What follows asks whether the world can carry the publish out, which is a
+    # different failure from any above and worth reaching in a different order.
     path = os.path.abspath(os.path.expanduser(str(project["path"])))
     if not os.path.isdir(path):
         die(f"{handle} points at {path}, which is not a directory",
@@ -481,15 +498,6 @@ def main() -> None:
             print(f"warning: {cli} is not installed here, so a real run would refuse",
                   file=sys.stderr)
         return
-
-    # Every refusal above says this verdict does not authorise a publish or that the
-    # branch it names is not there, and both are true whoever is asking. This asks
-    # who is asking, and it comes before the checks below because those are about
-    # whether this machine could carry the publish out - which is a different
-    # question, and not one an advisory night needs answered. A proposal has to be
-    # recorded on a machine that has no forge CLI installed at all.
-    if gated:
-        raise SystemExit(propose(args.task_id, args.record))
 
     # Checked before the push, not after it. A missing CLI discovered later leaves
     # the branch published with no merge request and nothing saying why.

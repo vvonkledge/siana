@@ -105,6 +105,33 @@ class WithoutASession(Advisory):
         # unreplayable in exactly the way the field exists to prevent.
         self.assertIsNone(rec["grant"])
 
+    def test_a_proposal_carries_the_reason_it_is_only_a_proposal(self):
+        # `schema-decisions.yaml` describes `reason` as what the gate said, and it
+        # says something on every path. It once described it as absent on a proposal,
+        # which is the contract disagreeing with the ledger the captain reads it to
+        # interpret.
+        self.decide()
+        rec, = self.ledger()
+        self.assertEqual(rec["verdict"], "proposed")
+        self.assertIn("no advisory session is in force", rec["reason"])
+
+    def test_a_refusal_reached_with_no_session_names_no_grant(self):
+        # The shape check comes before the session is looked at, so this refusal is
+        # written with `grant` absent. `schema-decisions.yaml` has to say so: a
+        # captain reading `refused` as "a session said no" would conclude one was in
+        # force on a night that had none.
+        self.decide(record=self.proposal(principles=[]))
+        rec, = self.ledger()
+        self.assertEqual(rec["verdict"], "refused")
+        self.assertIsNone(rec["grant"])
+
+    def test_a_stop_file_refusal_with_no_session_names_no_grant_either(self):
+        open(self.at("afk.stop"), "w").close()
+        self.decide()
+        rec, = self.ledger()
+        self.assertEqual(rec["verdict"], "refused")
+        self.assertIsNone(rec["grant"])
+
     def test_the_record_carries_the_evidence_and_what_was_rejected(self):
         # The captain reads the ledger instead of a merge request, so what SIANA read
         # and what it turned down have to survive into it verbatim.
@@ -180,6 +207,15 @@ class TheRecordFile(Advisory):
     def test_a_confidence_the_contract_does_not_know_is_refused(self):
         out = self.decide(record=self.proposal(confidence="certain"))
         self.assertRefused(out, "confidence is 'certain'")
+
+    def test_a_bare_string_where_a_list_belongs_is_recorded_as_one_item(self):
+        # Lenient on purpose, and `listed`'s comment says so. Refusing it would drop
+        # the only account of a decision SIANA reached over a JSON bracket, and the
+        # ledger reads `["just one thing"]`, which is exactly as thin as it is.
+        self.decide(record=self.proposal(evidence="just one thing"))
+        rec, = self.ledger()
+        self.assertEqual(rec["evidence"], ["just one thing"])
+        self.assertNotIn("cites no evidence", rec["reason"])
 
     def test_a_record_that_names_no_action_records_nothing(self):
         # Refused rather than faulted, and nothing is written: a record with no

@@ -128,7 +128,14 @@ def fault(lines):
 
 def fold(store, key):
     """The last record for each key in an append-only store. Reads only, and a store
-    with no writes yet has no file at all, which is empty rather than a fault."""
+    with no writes yet has no file at all, which is empty rather than a fault.
+
+    A line that will not parse refuses, and refuses because `siana-gate` faults on
+    the same line. Skipped here, one corrupt line in the ledger left `--status` - and
+    `just doctor`, which runs it - printing `ok      advisory session running` over a
+    fleet where every gate call was exiting 2 and recording nothing. A health check
+    that reads healthy off a store the mechanism it describes cannot use is the same
+    false green `still_running` exists to prevent for the other half of this state."""
     out = {}
     if not os.path.isfile(store):
         return out
@@ -140,7 +147,11 @@ def fold(store, key):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
-                continue
+                die(f"{store} has a line that is not JSON",
+                    "every reader of it faults on that line, so nothing here can",
+                    "say what it holds",
+                    f"run `datafile -f {os.path.basename(store)} repair` to "
+                    "quarantine it")
             rid = rec.get(key)
             if rid is None:
                 continue
@@ -246,7 +257,17 @@ def when(text):
     m = re.fullmatch(r"(\d+)([hm])", text)
     if m:
         n = int(m.group(1)) * (3600 if m.group(2) == "h" else 60)
-        return now() + timedelta(seconds=n)
+        try:
+            return now() + timedelta(seconds=n)
+        except OverflowError:
+            # A refusal and never a traceback, for the reason `read_record` gives
+            # above: this is typed at the helm and read by `just doctor`, and a stack
+            # trace where a refusal belongs says nothing about what to type instead.
+            # The ceiling below would have refused this anyway; it just never got the
+            # chance, because the arithmetic that reaches it ran first.
+            die(f"--until {text!r} is further out than a date can be",
+                f"the ceiling is {CEILING_H} hours, so this was a typo long before",
+                "it was too large to work out")
     try:
         dt = datetime.fromisoformat(text)
     except ValueError:
@@ -306,14 +327,15 @@ def release(home):
         pass
 
 
-def decisions_under(home, started):
-    """How many decisions this session has recorded, folded from the ledger.
+def decisions_under(ledger, started):
+    """How many of the folded ledger's decisions this session recorded.
 
     Folded and never counted into a file of its own. A second number can disagree
     with the record, and the record is the audit trail, so there must not be a second
-    number for it to disagree with."""
-    return sum(1 for rec in fold(os.path.join(home, LEDGER), "id").values()
-               if rec.get("grant") == started)
+    number for it to disagree with. Given the fold rather than reading it, because
+    its caller has to report what folding refused on before it reports anything as
+    healthy."""
+    return sum(1 for rec in ledger.values() if rec.get("grant") == started)
 
 
 def status(home):
@@ -329,6 +351,17 @@ def status(home):
         rec = read_record(path, "advisory session")
     except Refusal as r:
         return fault(r.lines)
+    # Read before anything below is called healthy, and read whether or not a session
+    # is in force. `siana-gate` faults on a ledger line it cannot parse, so one of
+    # those is a fleet where no decision can be recorded at all; asking only while a
+    # session was running would still print `ok` over exactly that state on the night
+    # before the captain starts one.
+    try:
+        ledger = fold(os.path.join(home, LEDGER), "id")
+    except Refusal as r:
+        return fault([*r.lines,
+                      "`siana-gate` faults on that line and records nothing, so",
+                      "every decision it is asked is being lost rather than refused"])
     if os.path.exists(stop) and rec is not None:
         return fault([f"an advisory session is halted by {stop}",
                       "every decision refuses while that file is there, and the",
@@ -347,7 +380,7 @@ def status(home):
                       "nothing was decided in the interval, because permission was",
                       "never in that file; every gate call has been refusing",
                       f"read {path}, then `siana-afk --stop` clears it"])
-    n = decisions_under(home, rec.get("started"))
+    n = decisions_under(ledger, rec.get("started"))
     print(f"  ok      advisory session running (pid {rec['pid']}, until "
           f"{rec.get('until')}, {n} decision(s) recorded)")
     print("  ok      read them with `siana-gate log --full <id>`")
