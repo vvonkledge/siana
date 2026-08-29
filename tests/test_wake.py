@@ -61,6 +61,17 @@ def node():
 NODE = node()
 
 
+def exported(name):
+    """A constant read out of the extension itself, so a bound asserted here cannot
+    drift from the one the code ships."""
+    out = subprocess.run(
+        [NODE, "-e", f"import({json.dumps(EXTENSION)}).then(m => "
+                     f"console.log(m.{name}))"],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip()
+
+
 class Session:
     """One scripted pi session, driven a command at a time.
 
@@ -374,6 +385,31 @@ class Unwritable(WakeTest):
         self.assertEqual(self.consumed(), 1)
         self.assertEqual(len(state["sent"]), 1)
 
+    def test_the_retry_runs_on_the_poll_and_is_never_fed_by_its_own_watch(self):
+        # The write is staged beside the counter, inside the directory the extension
+        # watches, so an unfiltered watch hands the failed retry its own event and
+        # the retry stages the file again. On Linux inotify delivers every one of
+        # those: the loop measured ~14,200 writes a second, the event loop never
+        # reached stdin again, and this suite hung until CI's guard killed the job
+        # at fifteen minutes. macOS coalesces the same storm to ~17 a second, which
+        # is why it stayed green here while three CI runs died. So the bound is the
+        # poll and not the platform, and it is asserted rather than left to whichever
+        # one the suite happens to run on next.
+        quiet_ms = 1500
+        poll_ms = int(exported("POLL_MS"))
+        pi = self.session()
+        pi("start")
+        pi("refuse-writes", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        before = len(pi("state")["writes"])
+        state = pi("quiet", ms=quiet_ms)
+        retries = len(state["writes"]) - before
+        self.assertLessEqual(
+            retries, 2 * quiet_ms // poll_ms,
+            f"the mark was retried {retries} times in {quiet_ms}ms with a "
+            f"{poll_ms}ms poll: the retry is feeding its own watch")
+
 
 class TheEditor(WakeTest):
     """The captain's draft, which is the whole reason this lives inside pi."""
@@ -474,12 +510,7 @@ class Watching(WakeTest):
         # inside the cadence it warns on.
         with open(EXTENSION) as fh:
             source = fh.read()
-        poll = subprocess.run(
-            [NODE, "-e", f"import({json.dumps(EXTENSION)}).then(m => "
-                         "console.log(m.POLL_MS))"],
-            capture_output=True, text=True, timeout=60)
-        self.assertEqual(poll.returncode, 0, poll.stderr)
-        self.assertLessEqual(int(poll.stdout.strip()), 2000)
+        self.assertLessEqual(int(exported("POLL_MS")), 2000)
         self.assertIn("POLL_MS", source)
 
 

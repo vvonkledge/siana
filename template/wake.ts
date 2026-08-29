@@ -47,6 +47,10 @@ export const POLL_MS = 500;
  *  rename it alone. */
 export const WAKE_DIR = "wake";
 
+/** The one name in that directory another process writes, and so the only one the
+ *  watch below has anything to learn from. */
+export const PENDING = "pending";
+
 interface Paths {
   dir: string;
   pending: string;
@@ -215,7 +219,22 @@ export default function (pi: ExtensionAPI): void {
       // it fires for the first rename and is dead for every one after it. This was
       // measured, and it is the trap anyone who "simplifies" this back to a file
       // watch will re-break.
-      watcher = fs.watch(paths!.dir, () => tick(ctx));
+      // Filtered to `pending`, and that filter is load-bearing rather than tidy.
+      // Everything else in here is this extension's own writing - `consumer`, and
+      // `consumed` with the staging file it renames from - and a watch fires for
+      // those too. A `consumed` write whose rename fails stages the file, is handed
+      // its own event, retries, and stages it again: on Linux inotify delivers every
+      // one of those and the loop measured ~14,200 writes a second, which took the
+      // event loop away from stdin entirely and hung the suite until CI's guard
+      // killed it. macOS coalesces the same storm to ~17 a second, which is why it
+      // ran green here for as long as it did. The interval below is what retries a
+      // write that failed; this only ever needs to hear about the watcher.
+      watcher = fs.watch(paths!.dir, (_event, name) => {
+        // A platform that reports no filename still gets every event: losing the
+        // fast path outright is worse than the storm, which cannot start there
+        // because such a platform is not one where this was ever observed.
+        if (name === null || name === undefined || name === PENDING) tick(ctx);
+      });
       // Never a reason for pi to stay up, the same as the interval below.
       watcher.unref?.();
     } catch {
@@ -236,7 +255,7 @@ export default function (pi: ExtensionAPI): void {
     fs.mkdirSync(dir, { recursive: true });
     paths = {
       dir,
-      pending: join(dir, "pending"),
+      pending: join(dir, PENDING),
       consumed: join(dir, "consumed"),
       consumer: join(dir, "consumer"),
     };
