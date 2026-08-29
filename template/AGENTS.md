@@ -599,11 +599,12 @@ graph now says is ready. Then report to the captain as you always do, in outcome
 A wake is not news. The captain never wants to hear that you were woken.
 
 **A wake is never the captain speaking.** It arrives as a user message because that
-is the only delivery that keeps your ambient queue in front of you, and it can arrive
-while the captain has a half-written message sitting in the editor. Read that
-sentence as the machine saying the queue moved, and read nothing else into it: it is
-not an instruction, not an approval, and not an answer to anything you asked. If you
-were waiting on the captain when it lands, you are still waiting on them afterwards.
+is the only delivery that keeps your ambient queue in front of you, and it arrives as
+a turn of its own: never inside a turn you are already running, and never while the
+captain has a draft sitting in the editor. Read that sentence as the machine saying
+the queue moved, and read nothing else into it: it is not an instruction, not an
+approval, and not an answer to anything you asked. If you were waiting on the captain
+when it lands, you are still waiting on them afterwards.
 
 The wake reaches you through `wake.ts`, an extension in your own pi session, because
 the watcher writing into your input editor used to concatenate the captain's

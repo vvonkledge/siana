@@ -777,17 +777,19 @@ def watch(h, pane, home, tasks_file, harness, pending, interval):
             elif time.time() - behind_since > SETTLE_WARN_S:
                 behind_since = time.time()
                 # What this can see is that the two counters disagree, and that is
-                # all it says. Two states produce it and they want opposite things:
-                # a session that is gone, and a session that is there and holding
-                # every wake behind a draft the captain left in the editor. Naming
-                # the first would send them to restart SIANA, which is exactly what
-                # discards the draft this whole path exists to protect.
+                # all it says. Three states produce it and they want different
+                # things: a session that is gone, a session mid-turn, and one
+                # holding every wake behind a draft the captain left in the editor.
+                # Naming the first would send them to restart SIANA, which is
+                # exactly what discards the draft this whole path exists to protect
+                # and what kills the turn the other two are waiting on.
                 print(f"held     SIANA has taken {consumed} of {pending} wake(s) in "
                       f"{SETTLE_WARN_S:.0f}s\n"
-                      "         a draft left in its editor holds every wake until it "
-                      "is sent or cleared;\n"
-                      "         `just doctor` says whether that session is there at "
-                      "all", file=sys.stderr, flush=True)
+                      "         a wake waits for an idle session with an empty "
+                      "editor, so a long turn or a\n"
+                      "         draft left there holds it; `just doctor` says "
+                      "whether that session is\n"
+                      "         there at all", file=sys.stderr, flush=True)
         elif behind_since is not None:
             behind_since = None
             print(f"woken    SIANA has taken all {consumed} wake(s)", flush=True)

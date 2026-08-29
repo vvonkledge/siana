@@ -8,6 +8,12 @@ it had already gone. The rule that replaces it is not "check first" - every chec
 before a write is a window - it is that the send and the editor read happen in one
 synchronous block on pi's event loop, where no keystroke can land between them.
 
+The second rule is that a wake only ever goes into an idle session. Pi hands a
+message to a turn in flight by queueing it, and it empties that queue back into the
+editor when the captain interrupts with Escape, so a queued wake is the same bug one
+keystroke later. `tests/fake_pi.mjs` models both the queue and the restore, which is
+why `Busy` below can drive the whole reproduction rather than assert on an argument.
+
 So these drive the extension rather than read it. It runs on the real node event
 loop, against a real filesystem, with its own directory watch and its own interval;
 what is scripted is pi's side of the six calls it makes, in `tests/fake_pi.mjs`. No
@@ -158,22 +164,15 @@ class Delivery(WakeTest):
         self.assertNotIn("wrongApi", state["sent"][0], state["sent"])
 
     def test_an_idle_session_is_woken_at_once_and_never_queued(self):
+        # A turn of its own, which is the only delivery with no shared surface: a
+        # queued message is one pi can later empty into the captain's editor.
         self.raise_wake()
         pi = self.session()
         pi("start")
         state = pi("settle", sent=1)
         self.assertIsNone(state["sent"][0]["options"])
-
-    def test_a_wake_that_lands_mid_turn_waits_rather_than_steering_the_turn(self):
-        # A steer would arrive inside a turn already in flight, which is the same
-        # hazard the watcher used to guard against by refusing to poke a working
-        # agent. `followUp` waits for it to finish its tool calls.
-        pi = self.session()
-        pi("start")
-        pi("idle", value=False)
-        self.raise_wake()
-        state = pi("settle", sent=1)
-        self.assertEqual(state["sent"][0]["options"], {"deliverAs": "followUp"})
+        self.assertEqual(state["queued"], [])
+        self.assertTrue(state["sent"][0]["idleAtSend"])
 
     def test_wakes_that_were_raised_together_cost_one_message(self):
         self.raise_wake(count=3)
@@ -200,6 +199,112 @@ class Delivery(WakeTest):
             state = pi("settle", sent=n)
             self.assertEqual(len(state["sent"]), n, state["sent"])
             self.assertEqual(self.consumed(), n)
+
+
+class Busy(WakeTest):
+    """A session mid-turn, which has no collision-free delivery at all.
+
+    Pi's one way to hand a message to a turn in flight is a queued follow-up, and
+    its TUI empties that queue back into the input editor when the captain
+    interrupts with Escape: the queued text joined ahead of whatever they had
+    started typing. So a wake handed to a working session is machine text in the
+    captain's editor one keystroke later, which is the bug this whole path exists to
+    remove. It waits instead, and nothing is recorded about it until it has gone."""
+
+    DRAFT = "do NOT ship anything to main tonight"
+
+    def test_a_wake_that_lands_mid_turn_is_held_and_never_queued(self):
+        pi = self.session()
+        pi("start")
+        pi("idle", value=False)
+        self.raise_wake()
+        state = pi("quiet")
+        self.assertEqual(state["sent"], [], "a wake was handed to a turn in flight")
+        self.assertEqual(state["queued"], [])
+
+    def test_a_wake_held_mid_turn_never_advances_the_high_water_mark(self):
+        # The mark is the promise that the wake was delivered, and the watcher stops
+        # warning once the two counters agree. Advanced on a queued send, a wake pi
+        # later tipped into the editor would be gone with nothing left saying so.
+        pi = self.session()
+        pi("start")
+        pi("idle", value=False)
+        self.raise_wake()
+        pi("quiet")
+        self.assertEqual(self.consumed(), 0)
+
+    def test_the_wake_goes_out_as_a_turn_of_its_own_once_the_session_is_idle(self):
+        pi = self.session()
+        pi("start")
+        pi("idle", value=False)
+        self.raise_wake()
+        pi("quiet")
+        pi("idle", value=True)
+        state = pi("settle", sent=1)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.assertIsNone(state["sent"][0]["options"], "the wake was queued")
+        self.assertEqual(self.consumed(), 1)
+
+    def test_interrupting_a_turn_restores_no_wake_into_the_editor(self):
+        # The reproduction, end to end. Editor empty, turn in flight, wake raised;
+        # the captain then types and hits Escape. Under a queued delivery pi sets
+        # the editor to the wake joined ahead of their draft, and the mark already
+        # says the wake was taken - machine text in the editor and a lost wake in
+        # one keystroke.
+        pi = self.session()
+        pi("start")
+        pi("idle", value=False)
+        self.raise_wake()
+        pi("quiet")
+        pi("editor", text=self.DRAFT)
+        state = pi("interrupt")
+        self.assertEqual(state["editor"], self.DRAFT)
+        self.assertEqual(state["editorWrites"], [],
+                         "something wrote into the editor the captain is typing in")
+        self.assertEqual(self.consumed(), 0, "the held wake was recorded as taken")
+
+    def test_the_wake_survives_the_interruption_and_arrives_after_it(self):
+        pi = self.session()
+        pi("start")
+        pi("idle", value=False)
+        self.raise_wake()
+        pi("quiet")
+        pi("editor", text=self.DRAFT)
+        pi("interrupt")
+        # The draft the captain kept still holds it, so this is the wake outliving
+        # the interruption rather than racing it.
+        self.assertEqual(self.consumed(), 0)
+        pi("editor", text="")
+        state = pi("settle", sent=1)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.assertEqual(self.consumed(), 1)
+
+    def test_wakes_raised_through_one_long_turn_cost_one_message(self):
+        pi = self.session()
+        pi("start")
+        pi("idle", value=False)
+        self.raise_wake(count=3)
+        pi("quiet")
+        pi("idle", value=True)
+        pi("settle", sent=1)
+        state = pi("quiet")
+        self.assertEqual(len(state["sent"]), 1, state["sent"])
+        self.assertEqual(self.consumed(), 3, "the high-water mark is what was raised")
+
+    def test_a_wake_held_mid_turn_is_still_there_after_a_restart(self):
+        # Nothing was recorded, so nothing was lost. A captain who quits SIANA in
+        # the middle of a turn gets the held wake when the next session comes up.
+        pi = self.session()
+        pi("start")
+        pi("idle", value=False)
+        self.raise_wake()
+        pi("quiet")
+        pi("shutdown", reason="quit")
+        again = self.session()
+        again("start")
+        state = again("settle", sent=1)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.assertEqual(self.consumed(), 1)
 
 
 class Refused(WakeTest):

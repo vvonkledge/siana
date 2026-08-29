@@ -16,7 +16,7 @@
  * the ones that ship. What is faked is the six calls it makes back into pi, and
  * each of those records what it was given rather than answering from a script.
  *
- * Two of the recordings are the point rather than a convenience:
+ * Three of the recordings are the point rather than a convenience:
  *
  * - `sameTick` says whether the editor was read in the same synchronous block as
  *   the send. A microtask queued at read time has run by the time any `await`
@@ -26,6 +26,11 @@
  * - `reads` is every path the extension asked the filesystem for. The extension
  *   must never learn about work from the queue itself, and a test can only hold
  *   that by watching what it actually opens.
+ * - `queued` is pi's follow-up buffer, and the `interrupt` command below is what
+ *   makes it dangerous the way the real one is. Modelled rather than asserted
+ *   against, because "the extension passed no `deliverAs`" is a statement about
+ *   one argument, and what has to hold is that nothing the extension does can put
+ *   machine text in the captain's editor.
  *
  * Protocol: one JSON command per line on stdin, one JSON reply per line on stdout.
  * Every reply carries the whole state, so a test asserts on what it wants without
@@ -82,6 +87,10 @@ const sent = [];
 // and still did not record the wake as taken.
 const refused = [];
 let sendThrows = false;
+// Pi's follow-up buffer: a message handed to a turn in flight waits here rather
+// than being appended. It is a real queue here and not a counter because
+// `interrupt` empties it back into the editor, which is what pi does.
+const queued = [];
 const editorWrites = [];
 let editor = "";
 let idle = true;
@@ -105,6 +114,9 @@ const pi = {
       editorAtSend: editor,
       idleAtSend: idle,
     });
+    // A follow-up is queued, not appended. Recorded in `sent` as well, so a test
+    // can still see that the extension tried to send something.
+    if (options?.deliverAs === "followUp") queued.push(content);
   },
   // Present so that reaching for either is a recorded failure rather than a
   // TypeError that reads like a harness bug. The wake must never arrive as a
@@ -145,8 +157,8 @@ const ctx = {
 };
 
 function state(extra = {}) {
-  return { pid: process.pid, sent, refused, editor, editorWrites, reads, writes,
-           removed, ...extra };
+  return { pid: process.pid, sent, refused, queued, editor, editorWrites, reads,
+           writes, removed, ...extra };
 }
 
 async function fire(event, payload) {
@@ -206,6 +218,19 @@ async function run(command) {
       return {};
     case "idle":
       idle = command.value;
+      return {};
+    case "interrupt":
+      // Escape during a streaming turn. Pi's TUI calls
+      // `restoreQueuedMessagesToEditor({abort: true})`, which sets the editor to
+      // the queued text joined ahead of whatever the captain had already typed:
+      // `setText([queuedText, currentText].filter(Boolean).join("\n\n"))`. That is
+      // the whole reason a wake is never handed to a turn in flight, so it is
+      // modelled here rather than described in a test name. Written straight to
+      // `editor` and not through `ctx.ui`, because this is pi writing and
+      // `editorWrites` is the record of what the extension wrote.
+      editor = [queued.join("\n\n"), editor].filter(Boolean).join("\n\n");
+      queued.length = 0;
+      idle = true;
       return {};
     case "settle":
       return settle(command.sent, command.timeout ?? 10_000);

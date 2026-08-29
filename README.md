@@ -262,6 +262,15 @@ something you are half way through typing. The watcher used to write the wake in
 that editor through herdr, which concatenated your unsubmitted draft with it and
 submitted both as one message under your name.
 
+**A wake waits for an idle session.** It goes out only when SIANA is between turns
+and the editor is empty, and it always arrives as a turn of its own. There is no
+delivery into a turn in flight: pi's only way to hand one a message is to queue it,
+and pressing Escape to interrupt empties that queue into the input editor - your
+draft with the wake pasted in front of it, which is the same bug from the other end.
+So a wake raised while SIANA is working is held, not queued, and goes out when the
+turn ends. Nothing is lost by waiting: the count is on disk and nothing records it as
+taken until it has actually been sent.
+
 So the watcher checks that SIANA's session is reading before it starts, and refuses
 with what to do about it when it is not:
 
@@ -280,8 +289,10 @@ session drains it as it starts.
 
 If wakes stop being taken while the watcher runs, it says so on its stderr every
 five minutes and keeps counting. It cannot say why, and it does not guess. There are
-two reasons and they want opposite things from you:
+three reasons and they want different things from you:
 
+- **SIANA is mid-turn.** A long turn holds every wake raised during it. Nothing to
+  do: the wake goes out within half a second of the turn ending.
 - **A draft left in SIANA's editor.** The extension holds every wake while there is
   text in the input, so that one never arrives in the middle of something you are
   half way through typing. Send that message or clear it, and the held wake goes out
@@ -289,6 +300,10 @@ two reasons and they want opposite things from you:
   throw the draft away.
 - **The session is gone.** `just doctor` says whether one is running. Start SIANA
   again and it drains everything counted while it was away.
+
+Only the last of those is a reason to restart anything, which is why the warning
+names all three and diagnoses none: restarting SIANA over one of the first two
+discards the draft, or the turn, that the wake was waiting on.
 
 ### A rigor the minion drives
 

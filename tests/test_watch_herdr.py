@@ -433,21 +433,24 @@ class Waking(WatchTest):
         # is the failure this whole path was rewritten to remove.
         self.assertEqual(self.herdr_methods(), ["agent.get"])
 
-    def test_the_held_warning_names_both_causes_and_diagnoses_neither(self):
-        # All this can see is that the two counters disagree. A session that is
-        # gone and a session holding every wake behind a draft the captain left in
-        # the editor both look like this, and they want opposite things: naming the
-        # first would send the captain to restart SIANA, which throws away the very
-        # draft the extension is holding the wake to protect.
+    def test_the_held_warning_names_every_cause_and_diagnoses_none(self):
+        # All this can see is that the two counters disagree. Three states look like
+        # this: a session that is gone, a session mid-turn, and one holding every
+        # wake behind a draft the captain left in the editor. They want different
+        # things, and naming only the first would send the captain to restart SIANA
+        # - which throws away the draft the extension is holding the wake to protect
+        # and kills the turn the other two are waiting to finish.
         self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA), SIANA,
                          SIANA, TAKEOVER)
 
         with mock.patch.object(w, "SETTLE_WARN_S", 0.01):
             result = self.watch(interval="0.02")
 
-        self.assertIn("a draft left in its editor holds every wake", result.err)
-        self.assertIn("`just doctor` says whether that session is there at all",
+        self.assertIn("a wake waits for an idle session with an empty editor",
                       result.err)
+        self.assertIn("a long turn or a", result.err)
+        self.assertIn("draft left there holds it", result.err)
+        self.assertIn("`just doctor` says whether that session is", result.err)
 
     def test_a_wake_that_is_taken_is_said_out_loud_and_the_warning_stops(self):
         self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA),

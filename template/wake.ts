@@ -133,23 +133,30 @@ export default function (pi: ExtensionAPI): void {
    * turns the exclusion back into a window, and it would be a window nothing here
    * could detect.
    *
-   * The editor check is politeness rather than safety: `sendUserMessage` leaves the
-   * draft alone either way. What it buys is that a wake does not start a turn while
-   * the captain is mid-sentence, which would force their draft to arrive after it
-   * as a steer.
+   * A wake goes out only into an idle session with an empty editor, and the idle
+   * half is safety rather than manners. A busy session has no collision-free
+   * delivery at all: pi's one way to hand a message to a turn in flight is a queued
+   * follow-up, and its TUI restores queued messages into the input editor when the
+   * captain interrupts with Escape - it sets the editor to the queued text joined
+   * ahead of whatever they had started typing. That is machine text in the
+   * captain's editor, which is the exact surface and the exact shape of the bug
+   * this whole path removes. So a busy session holds, and the wake goes out as a
+   * turn of its own once it is not. Holding costs a delay and never a wake: the
+   * count is durable and nothing below moves until a send has actually gone.
+   *
+   * The editor half is the softer of the two: `sendUserMessage` leaves the draft
+   * alone either way. What it buys is that a wake does not start a turn while the
+   * captain is mid-sentence, which would force their draft to arrive after it as a
+   * steer.
    */
   function flush(ctx: ExtensionContext): void {
     if (held > consumed) {
       // No editor at all - print mode, rpc - is an empty editor: there is no draft
       // to arrive in the wrong order behind the wake.
       const draft = ctx.hasUI ? ctx.ui.getEditorText() : "";
-      if (draft.trim() === "") {
+      if (ctx.isIdle() && draft.trim() === "") {
         const mark = held;
-        if (ctx.isIdle()) pi.sendUserMessage(WAKE);
-        // Mid-turn. `followUp` waits for the agent to finish its tool calls rather
-        // than steering the turn already in flight, which is the same hazard the
-        // watcher used to guard against by refusing to poke a working agent.
-        else pi.sendUserMessage(WAKE, { deliverAs: "followUp" });
+        pi.sendUserMessage(WAKE);
         // Here, and never after the write below. This is what makes delivery
         // once-only, and the wake has now been delivered: left behind `held` by a
         // write that threw, the next tick would send the same wake again half a
