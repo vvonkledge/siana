@@ -105,13 +105,49 @@ class Parsing(unittest.TestCase):
     def test_a_note_at_the_end_of_a_line_leaves_the_line_where_it_was(self):
         # Only the whitespace holding the comment apart from the prose belongs to the
         # comment. The whitespace the line opens with is markdown: taking it too
-        # unindents a nested bullet and turns an indented example into a paragraph,
-        # which is the body silently re-rendered rather than the body as written.
-        text = ("## Hotspots\n\n- top\n  - nested <!-- a note -->\n\nand:\n\n"
-                "    siana-handoff x <!-- another -->\n")
+        # unindents a nested bullet, which is the body silently re-rendered rather
+        # than the body as written.
+        text = "## Hotspots\n\n- top\n  - nested <!-- a note -->\nlast.\n"
+        self.assertEqual(handoff.sections(text),
+                         [("Hotspots", "- top\n  - nested\nlast.")])
+
+    def test_an_indented_example_is_quoted_the_way_a_fenced_one_is(self):
+        # The other way markdown quotes a block, and the way this project writes
+        # every example. A scaffold comment shown in one is what the section is
+        # about, so it survives whole rather than being read as guidance.
+        text = ("## Solution\n\nThe scaffold now says:\n\n"
+                "    <!-- what to write here -->\n\nand nothing else.\n")
         self.assertEqual(
             handoff.sections(text),
-            [("Hotspots", "- top\n  - nested\n\nand:\n\n    siana-handoff x")])
+            [("Solution", "The scaffold now says:\n\n"
+                          "    <!-- what to write here -->\n\nand nothing else.")])
+
+    def test_a_wrapped_line_is_prose_and_not_an_example(self):
+        # An indented block is code where markdown says one starts: after a blank
+        # line. A comment continued onto a second line is indented and is not code,
+        # and reading it as one would publish the guidance it was holding.
+        text = ("## Hotspots\n\n<!-- say why,\n     as concretely as you can -->\n"
+                "the empty queue.\n")
+        self.assertEqual(handoff.sections(text), [("Hotspots", "the empty queue.")])
+
+    def test_a_marker_between_backticks_is_prose_about_a_marker(self):
+        # A handoff for work on this parser has to quote `<!--`. Read as a marker, it
+        # deleted the words up to the next quoted `-->` and merged the two lines into
+        # one, with nothing said about either.
+        text = ("## Hotspots\n\nthe stripper: a line holding `<!--` keeps its\n"
+                "prose now, and a `-->` nobody wrote is not invented.\n")
+        self.assertEqual(
+            handoff.sections(text),
+            [("Hotspots", "the stripper: a line holding `<!--` keeps its\n"
+                          "prose now, and a `-->` nobody wrote is not invented.")])
+
+    def test_a_quoted_marker_does_not_refuse_the_document(self):
+        # The other half of the same failure: the opening marker quoted on its own
+        # refused the whole document for a comment nobody had opened, which is a
+        # statement about it that is not true.
+        text = "## Hotspots\n\na line holding `<!--` keeps its prose.\n"
+        self.assertEqual(handoff.sections(text),
+                         [("Hotspots", "a line holding `<!--` keeps its prose.")])
 
     def test_a_comment_the_line_opens_with_leaves_the_indent_alone(self):
         text = "## Hotspots\n\n- top\n  <!-- a note --> nested\n"

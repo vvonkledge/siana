@@ -94,6 +94,44 @@ def preamble(text: str) -> str:
     return text.split("\n## ", 1)[0]
 
 
+# A run of backticks, which is how markdown quotes a piece of syntax inside a line.
+CODE_RUN = re.compile(r"`+")
+
+
+def quoted(text: str):
+    """The half-open ranges of `text` that markdown reads as inline code.
+
+    A run of backticks opens a span that the next run of the same length closes; a
+    run nothing closes is backticks and opens nothing."""
+    spans, runs = [], list(CODE_RUN.finditer(text))
+    i = 0
+    while i < len(runs):
+        for j in range(i + 1, len(runs)):
+            if runs[j].group() == runs[i].group():
+                spans.append((runs[i].start(), runs[j].end()))
+                i = j
+                break
+        i += 1
+    return spans
+
+
+def unquoted(text: str, needle: str) -> int:
+    """Where `needle` first appears outside a code span, or -1.
+
+    A `<!--` between backticks is one the author was writing about rather than one
+    they were writing, and a handoff for work on this parser has to quote it. Read as
+    a marker, it deleted the words up to the next quoted `-->` and merged two lines
+    into one, or refused the document for a comment nobody had opened. It is the same
+    rule a fence already carries on its own marker."""
+    spans = quoted(text)
+    at = text.find(needle)
+    while at >= 0:
+        if not any(start <= at < end for start, end in spans):
+            return at
+        at = text.find(needle, at + 1)
+    return -1
+
+
 def fence_opens(line: str):
     """The marker a fence opens with, or `None` for a line that opens none.
 
@@ -141,10 +179,12 @@ def uncomment(line: str, in_comment: bool):
                 break
             in_comment = False
             continue
-        before, opened, rest = rest.partition("<!--")
-        kept.append(before)
-        if not opened:
+        at = unquoted(rest, "<!--")
+        if at < 0:
+            kept.append(rest)
             break
+        kept.append(rest[:at])
+        rest = rest[at + len("<!--"):]
         had, in_comment = True, True
     if not had:
         return line, in_comment
@@ -177,17 +217,34 @@ def sections(text: str, path: str = "the handoff"):
     agents are briefed with - and reading one as a heading refused the document with
     a statement about it that was not true.
 
+    Markdown's other way of quoting a block is indented, and it is read past for the
+    same reason: an example of a scaffold comment, laid out the way this project lays
+    out every example, is what the section is about.
+
     A fence or a comment nobody closed is refused rather than run to the end of the
     document. Either one silently swallows every section after it, and a handoff
     missing four of its five sections is reported as the wrong fault entirely."""
     found, heading, body = [], None, []
-    fence, in_comment = None, False
+    fence, in_comment, in_code, blank_before = None, False, False, True
     for line in text.splitlines():
+        blank = not line.strip()
         if fence is not None:
             if heading is not None:
                 body.append(line)
             if fence_closes(fence, line):
                 fence = None
+            blank_before = blank
+            continue
+        if not in_comment:
+            # An indented block is code where markdown says one starts: after a blank
+            # line. Without that condition a wrapped bullet or a comment continued
+            # onto a second line would be read as an example, and both are prose.
+            indented = line.startswith("    ") or line.startswith("\t")
+            in_code = (indented or blank) if in_code else (blank_before and indented)
+        blank_before = blank
+        if in_code:
+            if heading is not None:
+                body.append(line)
             continue
         if not in_comment:
             opens = fence_opens(line)
