@@ -247,8 +247,9 @@ tell that minion, not to edit the file underneath it.
 
 `brief-ship.md`, `brief-scout.md` and `brief-qa.md` in this directory are the
 templates, and they are yours to evolve like `orders.md`. `review.md` beside them is
-what the pipeline's review step is told, and it is yours on the same terms. An
-upgrade preserves your copy of each and leaves the diff beside it.
+what the pipeline's review step is told, and `handoff.md` is what a ship minion
+writes the merge request in; both are yours on the same terms. An upgrade preserves
+your copy of each and leaves the diff beside it.
 
 In a project that sets `qa`, `--ship` also queues the QA task that will judge the
 work. See "Independent validation".
@@ -276,6 +277,10 @@ Its verdict comes back through the queue like any other:
 - `done` means it exercised the work and the work does what its brief asked.
 - `blocked` means it does not. That is a finding and not a stall, and
   `reports/<qa-id>.md` holds what was run, what broke, and where.
+
+It judges the ship minion's handoff too, because that document is the whole of what a
+human outside this fleet ever reads about the work, and QA is the last reading before
+it goes to one.
 
 Acting on a rejection is yours. Queue the fix as ship work in the same project
 with `--base <the ship branch>`, which the ship task's brief names on one line, so
@@ -309,10 +314,23 @@ so a restart between a verdict and this call leaves you unable to say whether th
 merge request exists. Do not go looking: run it again. It asks the forge, reports what
 is already open, and exits without opening a second one.
 
-**Only two sections of the ship brief travel**: `## The task` and `## Done when`. The
-rest of a brief is background, scope, and a minion's standing limits, written for one
-agent in this fleet. The QA report never travels at all - it is written for you, and
-it stays in `$SIANA_HOME`.
+**The brief does not travel, and neither does the QA report.** What a human reads is
+the handoff the ship minion wrote at `$SIANA_HOME/handoffs/<ship-id>.md`: the intent,
+the solution, the validation, the hotspots, and the risks and boundaries. Publishing
+assembles those five sections into the body and takes the title off the same
+document, adding one sentence for the independent review, which is a fact about the
+queue rather than a judgment about the work.
+
+A brief was written before the work existed, so it can say what was asked for and not
+what was built. Merge requests made out of one read as instructions to their own
+implementer, which is what the first two on this project did.
+
+**A handoff that is missing, unfilled, malformed or stale refuses the publish.** It
+records the commit it describes, and this compares that against the head QA accepted,
+so a copy a later commit left behind stops here rather than travelling with work it
+does not describe. That refusal is where you find out a ship minion skipped it, and
+the fix is a handoff written by an agent that understands the change - never one you
+invent from the diff, which is the guess the whole arrangement exists to prevent.
 
 `--dry-run` prints the branch, the target, the title and the body, and changes
 nothing. Worth one look before a project's first publish.

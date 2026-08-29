@@ -37,7 +37,8 @@ class TypedFlow(HomeTest):
     def setUp(self):
         super().setUp()
         self.contract("projects")
-        self.template("brief-ship.md", "brief-qa.md", "orders.md", "review.md")
+        self.template("brief-ship.md", "brief-qa.md", "orders.md", "review.md",
+                      "handoff.md")
         self.queue()
         self.repo = self.at("repo")
         os.makedirs(self.repo)
@@ -85,6 +86,18 @@ class TypedFlow(HomeTest):
         out = self.tasks("list")
         return [line.strip().split(",")[0] for line in out.splitlines()
                 if line.startswith("  ") and "," in line]
+
+    def fill_handoff(self, task_id, head):
+        """A scaffolded handoff, filled in the way its minion would: a title, the
+        head its last commit is at, and prose under every heading the template
+        offers rather than under a list this test keeps its own copy of."""
+        path = self.at("handoffs", f"{task_id}.md")
+        with open(path) as fh:
+            text = fh.read()
+        text = text.replace("{TITLE}", "The guide a reader can follow without asking")
+        text = text.replace("{HEAD}", head)
+        with open(path, "w") as fh:
+            fh.write(re.sub(r"<!--.*?-->", "what this section says.", text, flags=re.S))
 
     def fake_reviewer(self):
         bindir = self.at("fakebin")
@@ -150,8 +163,9 @@ class TypedFlow(HomeTest):
         self.assertIn(branch, out)
 
         # SIANA fills the rest of the brief, as it would before dispatching. The
-        # branch is not one of them: the script wrote that, and publishing refuses a
-        # brief still carrying a placeholder.
+        # branch is not one of them: the script wrote that, and every step below
+        # reads it back off this file. An unfilled one is the minion's own `block`
+        # now that no part of a brief reaches a forge; nothing in `bin/` refuses it.
         self.fill(ship)
 
         # 2. The QA task is queued behind it, cut from that same branch.
@@ -206,6 +220,15 @@ class TypedFlow(HomeTest):
                           "--reason", "wrote it"], env={**pipe_env, "PATH": bare}),
             "siana-pipeline check", "127")
 
+        # The other half of what a ship minion delivers: the copy a human reads on
+        # the merge request, written after the last commit and bound to it. Driven
+        # here rather than written by hand, because the shape of that document is the
+        # scaffold's to state and a test carrying its own idea of it would pass
+        # against one the real command refuses.
+        self.assertAccepted(self.run_bin("siana-handoff", ship, "--scaffold"))
+        self.fill_handoff(ship, head)
+        self.assertAccepted(self.run_bin("siana-handoff", ship, "--head", head))
+
         self.tasks("done", ship, "--reason", "wrote it", env=pipe_env)
         self.assertEqual(self.record(ship)["status"], "done")
 
@@ -219,6 +242,10 @@ class TypedFlow(HomeTest):
                    env={"SIANA_TASK_ID": qa})
         out = self.assertAccepted(self.run_bin("siana-publish", qa, "--dry-run"))
         self.assertIn(f"branch:  {branch}", out)
+        # And what it would open is the minion's own copy, bound to the head the
+        # pipeline validated and QA then accepted.
+        self.assertIn("title:   The guide a reader can follow without asking", out)
+        self.assertIn("Shipped by", out)
         self.git("remote", "remove", "origin")
 
         # 7. The captain lands it. Reaping now finds the branch and hands it back as

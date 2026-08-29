@@ -95,9 +95,10 @@ init: _contract-drift
     } > "$home/siana.env"
 
     # SIANA can evolve its own instructions, the orders its minions are started with,
-    # and the brief templates it scaffolds a task contract from, so a home copy that
-    # has diverged is the captain's work, not drift to be cleaned up. Never clobber it.
-    for f in AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md; do
+    # the brief templates it scaffolds a task contract from, and the handoff a minion
+    # writes the merge request in, so a home copy that has diverged is the captain's
+    # work, not drift to be cleaned up. Never clobber it.
+    for f in AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "wrote    $home/$f"
@@ -225,7 +226,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline siana-afk siana-gate; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -271,7 +272,7 @@ upgrade: _initialized init
     backup="$home/upgrade/$stamp"
     kept=""
     echo
-    for f in AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md; do
+    for f in AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md; do
         if [ ! -f "$home/$f" ]; then
             cp "$distro/template/$f" "$home/$f"
             echo "restored $home/$f (it was missing)"
@@ -402,7 +403,7 @@ doctor: _contract-drift
     set -uo pipefail
     home='{{home}}'
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md principles.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-tasks.yaml; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-tasks.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -513,7 +514,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline siana-afk siana-gate; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

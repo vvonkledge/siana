@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Publish the branch a QA minion accepted: push it, and open the merge request.
 
-Opening a merge request is exact. The branch is named on the QA task, the target
-is named on the project, the contract comes from the ship task's own brief, and the
-forge is whatever `origin` points at. No step of it needs understanding, so it lives
-in a script rather than in instructions an agent has to be trusted to follow.
+Opening a merge request is exact. The branch is named on the QA task, the target is
+named on the project, and the forge is whatever `origin` points at. No step of it
+needs understanding, so it lives in a script rather than in instructions an agent
+has to be trusted to follow.
+
+What a human reads on it is not exact, and is not made here. The ship minion writes
+it at `$SIANA_HOME/handoffs/<ship-id>.md` once its work is finished, and
+`siana-handoff` validates that document and assembles the title and body out of it.
+This passes the head QA accepted, so a copy describing an earlier commit refuses the
+publish rather than travelling with work it does not describe. Nothing here asks a
+model: publishing stays a deterministic assembly of prose an agent already wrote and
+a second minion already accepted.
 
 What is deliberately not here: merging. The boundary this script reaches is the push
 target. What lands is the captain's, in person, every time.
@@ -85,40 +93,6 @@ def fold(store: str, key: str):
             else:
                 out[rid] = rec
     return out
-
-
-def section(brief: str, heading: str):
-    """One `## ` section of a brief, as prose fit to read outside the fleet.
-
-    The `<!-- SIANA: ... -->` blocks are instructions for whoever filled the brief
-    in, not content, so they never travel to the forge. An unfilled `{...}`
-    placeholder is returned as-is for the caller to refuse on: a merge request
-    describing the work as `{TASK}` is worse than no merge request, because it looks
-    like a description and is not one.
-
-    Returns None when the section is absent, which several of them are allowed to
-    be."""
-    lines = brief.splitlines()
-    body, taking, in_comment = [], False, False
-    for line in lines:
-        if line.startswith("## "):
-            if taking:
-                break
-            taking = line[3:].strip().lower() == heading.lower()
-            continue
-        if not taking:
-            continue
-        if "<!--" in line:
-            in_comment = "-->" not in line
-            continue
-        if in_comment:
-            in_comment = "-->" not in line
-            continue
-        body.append(line)
-    if not taking and not body:
-        return None
-    text = "\n".join(body).strip()
-    return text or None
 
 
 # The one line in a ship brief that a script reads. Indented and a single token, so
@@ -241,6 +215,65 @@ def create(forge: str, path: str, branch: str, target: str, title: str, body: st
         if word.startswith("http"):
             return word.strip()
     return out.stdout.strip()
+
+
+def copy(ship_id: str, head: str, qa_id: str):
+    """The title and the body a human reads, from the handoff the ship minion wrote.
+
+    Resolved beside this script for the reason `siana-gate` is: a `siana-handoff`
+    that is not there has to be a refusal, never a merge request opened with
+    whatever description a lookup that came back empty left behind.
+
+    Its stderr is not captured, so its refusal reaches whoever is reading in its own
+    words: it is the one place that knows which rule the document broke, and a
+    caller paraphrasing it would decide half of it on the way past. Its exit code is
+    passed through, so a malformed handoff and a fault stay distinguishable.
+
+    The head is passed rather than looked up here, so a copy written against an
+    earlier commit stops the publish. `--accepted-by` is the one thing a script adds
+    to a body: that a second agent exercised this and accepted it is a fact about
+    the queue, and the minion that wrote the copy finished before any of it
+    happened."""
+    handoff = os.path.join(os.path.dirname(os.path.abspath(__file__)), "siana-handoff")
+    if not os.path.isfile(handoff):
+        die(f"there is no {handoff}",
+            "it is what turns the ship minion's handoff into a title and a body, so",
+            "without it there is nothing to describe this work with",
+            "run `just init` in the distro")
+    out = subprocess.run([handoff, ship_id, "--head", head, "--accepted-by", qa_id,
+                          "--json"], stdout=subprocess.PIPE, text=True)
+    if out.returncode != 0:
+        print("nothing was pushed and no merge request was opened", file=sys.stderr)
+        raise SystemExit(out.returncode)
+    made = json.loads(out.stdout)
+    return made["title"], made["body"]
+
+
+def update(forge: str, path: str, branch: str, title: str, body: str):
+    """Put the accepted copy onto a merge request that is already open.
+
+    Re-running is the intended recovery from an interrupted publish, and the copy
+    can have moved between the two runs: a rejected round is repaired, the handoff
+    is rewritten against the new head, and the second run is the one carrying what
+    QA actually accepted. Reporting the open merge request and leaving it as it was
+    would make that the one run whose copy never arrived.
+
+    It overwrites whatever description is there, including one a human typed. That
+    is the tradeoff taken deliberately: the description of a merge request the fleet
+    opened is generated from the handoff every run, so an edit that should survive
+    belongs in the handoff, and copy that silently disagreed with what QA accepted
+    would be the worse of the two failures."""
+    if forge == "gitlab":
+        argv = ["glab", "mr", "update", branch, "--title", title,
+                "--description", body]
+    else:
+        argv = ["gh", "pr", "edit", branch, "--title", title, "--body", body]
+    out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    if out.returncode != 0:
+        die(f"{forge} refused to update the merge request for {branch}",
+            (out.stderr or out.stdout).strip(),
+            "the branch is pushed and the merge request is open, so it is still",
+            "there to read; it is carrying copy from an earlier run")
 
 
 def propose(task_id: str, record: str) -> int:
@@ -401,38 +434,8 @@ def main() -> None:
             "so publishing it would ship the state before the work",
             "pass the QA task whose verdict authorises this instead")
 
-    ship = fold(tasks_file, "id").get(ship_id)
-    if ship is None:
+    if fold(tasks_file, "id").get(ship_id) is None:
         die(f"{args.task_id} depends on {ship_id}, which is not in the queue")
-
-    if not os.path.isfile(brief_path):
-        die(f"no brief at {brief_path}",
-            "the brief is what says what was asked, and it is the only part of this",
-            "fleet's record that belongs in a merge request; a minion refuses to",
-            "work without one, so its absence here means something else went wrong")
-    brief = open(brief_path).read()
-
-    # Only these two sections travel. The rest of a brief is background, scope and
-    # the minion's own standing limits: written for one agent in this fleet, not for
-    # whoever reviews the merge request. The QA report never travels at all.
-    asked = section(brief, "The task")
-    done_when = section(brief, "Done when")
-    if not asked:
-        die(f"{brief_path} has no `## The task` section",
-            "there is nothing to describe the work with, and a merge request whose",
-            "description is empty is worse than one that was never opened")
-    for part in (asked, done_when):
-        if part and "{" in part and "}" in part:
-            die(f"{brief_path} still carries an unfilled placeholder",
-                "a merge request describing the work as `{TASK}` looks like a",
-                "description and is not one")
-
-    title = str(ship.get("title") or ship_id)
-    body = [asked, ""]
-    if done_when:
-        body += ["## Done when", "", done_when, ""]
-    body += ["---", f"Shipped by `{ship_id}`, accepted by `{args.task_id}`."]
-    body = "\n".join(body)
 
     # The queue's refusals are all above: they say this verdict does not authorise a
     # publish. What follows asks whether the world can carry one out, which is a
@@ -446,12 +449,17 @@ def main() -> None:
         die(f"{handle} is at {path}, which is not a git repository",
             "there is no branch to push and nothing to open a merge request from")
 
-    if git(path, "rev-parse", "--verify", branch, check=False).returncode != 0:
+    at = git(path, "rev-parse", "--verify", f"{branch}^{{commit}}", check=False)
+    if at.returncode != 0:
         die(f"{path} has no branch {branch}",
             "the work this verdict accepted is not there under that name; it may",
             "have been landed and deleted, or the worktree removed with it",
             "look before deciding: a verdict about a branch nobody can find is",
             "not evidence about anything that exists now")
+    # The head QA accepted, and the whole of what binds the copy below to this work:
+    # the handoff records the commit it describes, so a document written before a
+    # later commit refuses here instead of describing something that has moved.
+    head = at.stdout.strip()
 
     remote = git(path, "remote", "get-url", "origin", check=False)
     if remote.returncode != 0:
@@ -466,6 +474,12 @@ def main() -> None:
 
     cli = "glab" if forge == "gitlab" else "gh"
     missing = shutil.which(cli) is None
+
+    # Before the dry run, because a dry run whose job is to show the exact title and
+    # body cannot show them without this. Before the gate, because a proposal is a
+    # record of a publish SIANA was ready to carry out, and one whose copy does not
+    # assemble was never that.
+    title, body = copy(ship_id, head, args.task_id)
 
     if args.dry_run:
         print(f"branch:  {branch}")
@@ -507,8 +521,10 @@ def main() -> None:
 
     open_mr = existing(forge, path, branch)
     if open_mr:
+        update(forge, path, branch, title, body)
         print(f"already open: {open_mr}")
-        print(f"pushed {branch} (no second merge request opened)")
+        print(f"  copy   updated to what {args.task_id} accepted")
+        print(f"  branch {branch} pushed (no second merge request opened)")
         return
 
     url = create(forge, path, branch, target, title, body)

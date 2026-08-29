@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""The copy a human reads on the merge request: validated here, assembled here.
+
+A merge request used to be made out of the ship brief: the task's title became the
+title, and two sections of the contract became the body. Both were written before
+the work existed, by an agent briefing a minion, so what reached the forge said what
+was asked for and could not say what was built, what it was checked with, or where a
+reviewer's attention was worth most. The two merged that way read as instructions to
+their own implementer.
+
+So the copy is written by the minion that did the work, once the work is finished,
+at `$SIANA_HOME/handoffs/<ship-task-id>.md`. That is judgment, and it stays with an
+agent. What is exact stays here: the shape of that document, what may be missing
+from it, and how its sections become one title and one body. Nothing in this file
+reads a diff or asks a model, so publishing stays a deterministic assembly of prose
+somebody already wrote and a second minion already accepted.
+
+The head is what ties the two together. A handoff records the commit it describes,
+and `siana-publish` refuses one that names anything other than the head QA accepted,
+so a copy left behind by a later commit stops the publish instead of travelling with
+work it does not describe.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+
+# The five sections, in the order they are published in. They are a reader's
+# questions in the order a reader asks them: what was wrong, what was done, how do
+# I know, where do I look, and what did it cost.
+#
+# The list is exact, and an unknown heading is refused rather than dropped. A
+# section an author wrote and nobody ever saw is worse than a refusal, because the
+# refusal is the only thing that can tell them.
+SECTIONS = ["Intent", "Solution", "Validation", "Hotspots", "Risks and boundaries"]
+
+# What a merge request title may be. 72 is the git subject-line width this fleet
+# already commits at, and a forge truncates past roughly that in every list view a
+# reviewer scans, so a longer one is a title whose end nobody reads.
+TITLE_LIMIT = 72
+
+# The scaffolding markers, in the shape `siana-brief` writes and greps for. Read out
+# of the preamble alone, because that is where the scaffold's are: `{TITLE}` and
+# `{HEAD}` both sit above the first heading, and a section nobody filled in is caught
+# by being empty once its guidance comment is stripped.
+#
+# Over the whole document it refused prose instead. This distro's templates are made
+# of these tokens, so a handoff for work on one of them could not say what it
+# changed: a `Hotspots` line naming `{SHIP_TASK}` was rejected as an unfilled
+# placeholder, with no way to escape it, and the section exists for exactly that kind
+# of concrete detail.
+PLACEHOLDER = re.compile(r"\{[A-Z_]+\}")
+
+
+def die(message: str, *hints: str):
+    print(f"error: {message}", file=sys.stderr)
+    for hint in hints:
+        print(f"  {hint}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def keyed(text: str, name: str):
+    """Every indented `<name> <value>` line, as the brief records a branch on one.
+
+    Indented and keyed so that prose about the title cannot be mistaken for the
+    record of it, and returned as a list so that two of them is a refusal rather
+    than a silent choice between them."""
+    return re.findall(rf"^[ \t]+{name}[ \t]+(\S.*?)[ \t]*$", text, re.M)
+
+
+def preamble(text: str) -> str:
+    """Everything before the first `## `.
+
+    The keyed lines are read from here and nowhere else, for the reason the brief
+    reads its branch out of one section: a line inside `Solution` describing what
+    the change titles something is prose, and a reader that scanned the whole file
+    would publish it."""
+    return text.split("\n## ", 1)[0]
+
+
+def sections(text: str):
+    """The `## ` sections, as (heading, body) in the order they appear.
+
+    `<!-- ... -->` blocks are guidance to whoever fills the template in, so they
+    are stripped rather than published. Duplicates are kept rather than folded:
+    two `## Hotspots` is a document whose author lost track of one of them, and
+    which of the two travels is not a choice this may make on their behalf."""
+    found, heading, body, in_comment = [], None, [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if heading is not None:
+                found.append((heading, "\n".join(body).strip()))
+            heading, body, in_comment = line[3:].strip(), [], False
+            continue
+        if heading is None:
+            continue
+        if in_comment:
+            in_comment = "-->" not in line
+            continue
+        if "<!--" in line:
+            in_comment = "-->" not in line
+            continue
+        body.append(line)
+    if heading is not None:
+        found.append((heading, "\n".join(body).strip()))
+    return found
+
+
+def refuse_local(path: str, where: str, text: str, home: str):
+    """Refuse a path that only means something on the captain's machine.
+
+    The home holds the queue, the briefs and every QA report, so a path into it is
+    either a pointer nobody outside this machine can follow or a quote from something
+    written for SIANA alone. Neither is review material.
+
+    Both spellings, because a minion writes the resolved path as often as the
+    variable it read it from, and the variable is the more misleading of the two on a
+    forge: it looks like a path anyone could follow.
+
+    Applied to the title as well as to the sections. The title is the single most
+    visible line on the page, so it is the last place a leak should have been allowed
+    to go unread."""
+    for local in (home, "$SIANA_HOME"):
+        if local in text:
+            die(f"{where} of {path} names {local}",
+                "that path is the captain's machine and nowhere else, and what",
+                "it holds is written for this fleet rather than for a reviewer",
+                "say where it is in words instead: a reader who cannot follow the",
+                "pointer is better served by the sentence than by the path")
+
+
+def read(path: str, task_id: str, home: str, head: str = None):
+    """One handoff, checked against every rule a script can state, as (title, body).
+
+    Every refusal here is a way the forge could receive copy that does not describe
+    this work: absent, half-written, describing a commit that is no longer the head,
+    or carrying a path that only exists on the captain's machine."""
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except OSError:
+        die(f"no handoff for {task_id} at {path}",
+            "it is the title and the body a human reads on the merge request, and",
+            "the minion that did the work writes it before the work is accepted",
+            f"  siana-handoff {task_id} --scaffold   # then fill it in")
+
+    unfilled = PLACEHOLDER.search(preamble(text))
+    if unfilled:
+        die(f"{path} still carries {unfilled.group()}",
+            "a merge request describing the work as `{TITLE}` looks like a",
+            "description and is not one")
+
+    titles = keyed(preamble(text), "title")
+    if not titles:
+        die(f"{path} records no title",
+            "the preamble needs an indented line of exactly:",
+            "    title  <what the merge request is called>")
+    if len(titles) > 1:
+        die(f"{path} records more than one title: {', '.join(titles)}",
+            "which of them names the work is not a choice a script may make")
+    title = titles[0]
+    if len(title) > TITLE_LIMIT:
+        die(f"the title in {path} is {len(title)} characters, and {TITLE_LIMIT} is "
+            "the limit",
+            "a forge truncates past roughly that wherever a reviewer scans a list",
+            f"  {title}")
+    if title == task_id:
+        die(f"the title in {path} is the task id",
+            "a task id names a row in a queue nobody outside this fleet can read;",
+            "the title says what changed and why it matters")
+    refuse_local(path, "the title", title, home)
+
+    heads = keyed(preamble(text), "head")
+    if not heads:
+        die(f"{path} records no head",
+            "the head is the commit this copy describes, and without it nothing",
+            "can tell a current handoff from one a later commit left behind",
+            "the preamble needs an indented line of exactly:",
+            "    head  <full commit sha>")
+    if len(heads) > 1:
+        die(f"{path} records more than one head: {', '.join(heads)}",
+            "a copy describes one commit, and which one is not a script's to pick")
+    if not re.fullmatch(r"[0-9a-f]{40}", heads[0]):
+        die(f"{path} records the head as {heads[0]!r}",
+            "it has to be the full sha, because an abbreviation is a prefix and a",
+            "prefix cannot be compared for equality with the head that was accepted",
+            "  head  $(git rev-parse HEAD)")
+    if head is not None and heads[0] != head:
+        die(f"the handoff for {task_id} describes {heads[0][:12]}, and the branch is "
+            f"at {head[:12]}",
+            "so this copy was written before the commit it would be published",
+            "against, and it cannot say what that commit does",
+            "rewrite it against the head that was accepted:",
+            f"  siana-handoff {task_id} --head {head}")
+
+    found = sections(text)
+    headings = [heading for heading, _ in found]
+    unknown = [h for h in headings if h not in SECTIONS]
+    if unknown:
+        die(f"{path} has sections nothing publishes: {', '.join(unknown)}",
+            "the body is these five, in this order, and nothing else travels:",
+            f"  {', '.join(SECTIONS)}",
+            "a section written and never read is worse than one refused")
+    missing = [h for h in SECTIONS if h not in headings]
+    if missing:
+        die(f"{path} has no `## {missing[0]}` section",
+            "the body is these five, and each of them is a question the reviewer",
+            f"asks: {', '.join(SECTIONS)}")
+    repeated = sorted({h for h in headings if headings.count(h) > 1})
+    if repeated:
+        die(f"{path} has more than one `## {repeated[0]}` section",
+            "which of them travels is not a choice a script may make for its author")
+
+    body = dict(found)
+    for heading in SECTIONS:
+        if not body[heading]:
+            die(f"the `## {heading}` section of {path} is empty",
+                "a heading with nothing under it answers the question by pretending",
+                "it was asked; write the section or say why it does not apply")
+        refuse_local(path, f"the `## {heading}` section", body[heading], home)
+    return title, body
+
+
+def assemble(body: dict, ship_id: str = None, qa_id: str = None) -> str:
+    """The five sections as one document, in the published order.
+
+    `qa_id` is what a script may add and an author may not: it is a fact about the
+    queue rather than a judgment about the work, and the minion that wrote the copy
+    finished before any of it happened. Without it this is the author's own copy,
+    which is what they see while they are still writing it."""
+    out = []
+    for heading in SECTIONS:
+        text = body[heading]
+        if heading == "Validation" and qa_id:
+            text += ("\n\nIndependently reviewed and accepted by a second agent "
+                     "that did not write it.")
+        out += [f"## {heading}", "", text, ""]
+    if qa_id:
+        out += ["---", f"Shipped by `{ship_id}`, accepted by `{qa_id}`."]
+    return "\n".join(out).strip() + "\n"
+
+
+def scaffold(home: str, path: str, task_id: str):
+    template = os.path.join(home, "handoff.md")
+    if not os.path.isfile(template):
+        die(f"no handoff template at {template}",
+            "SIANA owns its home copy and can evolve it",
+            "run `just init` in the distro to lay one down")
+    if os.path.exists(path):
+        die(f"{task_id} already has a handoff at {path}",
+            "a handoff is rewritten by editing it, never by scaffolding over it:",
+            "a QA minion may already have read this one")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    shutil.copy(template, path)
+    print(f"scaffolded  {path}")
+    print("  fill    the title, the head, and every section")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Validate and assemble the copy a human reads on the merge "
+                    "request for a ship task.")
+    ap.add_argument("task_id", help="the ship task whose work this describes")
+    ap.add_argument("--scaffold", action="store_true",
+                    help="write the template to fill in, and check nothing")
+    ap.add_argument("--head", metavar="SHA",
+                    help="refuse unless the handoff describes this commit")
+    ap.add_argument("--accepted-by", metavar="QA-TASK",
+                    help="the QA task that accepted the work; adds the independent "
+                         "review to the body, which is not the author's to write")
+    ap.add_argument("--json", action="store_true",
+                    help="print the title and body as one object, for a caller")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    path = os.path.join(home, "handoffs", f"{args.task_id}.md")
+
+    if args.scaffold:
+        scaffold(home, path, args.task_id)
+        return
+
+    title, body = read(path, args.task_id, home, args.head)
+    text = assemble(body, args.task_id, args.accepted_by)
+
+    if args.json:
+        json.dump({"title": title, "body": text}, sys.stdout)
+        return
+    print(f"title:  {title}")
+    print("body:")
+    for line in text.splitlines():
+        print(f"  {line}")
+
+
+if __name__ == "__main__":
+    main()
