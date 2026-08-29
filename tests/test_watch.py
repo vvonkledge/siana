@@ -129,6 +129,12 @@ class ReadSession(HomeTest):
         text = str(cm.exception)
         self.assertIn("outside herdr", text)
         self.assertIn("4242", text)
+        # And it names the failure it exists to prevent, which is no longer that the
+        # wake cannot be delivered - the extension reads a file and does not care
+        # where its session runs. It is that nothing could ever tell this watcher
+        # that session had gone.
+        self.assertIn("nothing here can tell when", text)
+        self.assertIn("a watcher that outlives SIANA", text)
 
     def test_a_recorded_pane_and_harness_are_returned(self):
         self.store("session", "SIANA_PID=4242", "SIANA_PANE=w3D:p2",

@@ -163,19 +163,24 @@ class Herdr:
 
 
 def read_session(home):
-    """SIANA's pane id and the harness in it, the only durable handle back to its
-    session.
+    """SIANA's pane id and the harness in it.
+
+    The pane is what liveness is asked about. Nothing is delivered through it any
+    more, so it is not the wake path: it is the one handle by which this process can
+    find out that the session it is the grant for has gone.
 
     Herdr's labels are not unique and its pane metadata is wiped when its server
     restarts, so this reads what `siana` recorded and never searches for an agent
     that looks about right. A stale file names a pane that is gone or now holds
-    something else, and both are refusals rather than a wake raised for whatever
-    happens to be there now.
+    something else, and both are refusals rather than a watcher raising wakes for
+    whatever happens to be there now.
 
-    The harness travels with the pane because herdr answers with the name of the
-    agent it detected, and SIANA's session can be either of two. Recorded rather
-    than inferred from the home: what is installed there is what SIANA could have
-    started in, and this has to be what it did start in."""
+    The harness travels with the pane for two reasons now. Herdr answers with the
+    name of the agent it detected, so the liveness check has to know which name is
+    SIANA's; and only `pi` has an extension that takes a wake, so it is also what
+    says whether there is a delivery path at all. Recorded rather than inferred from
+    the home: what is installed there is what SIANA could have started in, and this
+    has to be what it did start in."""
     path = os.path.join(home, "session")
     if not os.path.isfile(path):
         die(f"no SIANA session recorded at {path}",
@@ -193,12 +198,21 @@ def read_session(home):
     # only thing the file could have meant.
     harness = fields.get("SIANA_HARNESS", "pi")
     if not pane:
-        # A SIANA outside herdr is a working SIANA, just one with no pane to prompt.
+        # A SIANA outside herdr is a working SIANA, just one this cannot watch for.
+        # The wake itself would reach it perfectly well, because the extension reads
+        # a file and does not care where its session runs. What is missing is the
+        # other half: with no pane, nothing here can ever find out that the session
+        # has exited, and a watcher still running after that is the captain's
+        # autonomy grant outliving the thing it was given for.
+        #
         # Saying which of the two it is beats reporting a missing session that is
         # sitting right there in front of the captain.
         die(f"SIANA (pid {fields.get('SIANA_PID', '?')}) is running outside herdr",
-            "nothing can wake a session herdr does not host; restart SIANA inside",
-            "herdr if you want the fleet to advance while you are away")
+            "the wake would reach it, but with no pane nothing here can tell when",
+            "that session has gone, and a watcher that outlives SIANA is a grant",
+            "the captain never withdrew",
+            "restart SIANA inside herdr if you want the fleet to advance while you",
+            "are away")
     return pane, harness
 
 
