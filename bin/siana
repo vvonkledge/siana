@@ -149,10 +149,10 @@ prompt=()
 # one of two agents with no way to tell which.
 #
 # It carries the pid, because that is what liveness can be asked about, and the pane
-# id when there is one, because that is how `siana-watch` wakes this session. The
-# pane id comes from the environment herdr sets, never from searching for an agent
-# that looks about right: herdr's labels are not unique, so a search could poke the
-# wrong session.
+# id when there is one, because that is the pane `siana-watch` confirms this session
+# is still in. The pane id comes from the environment herdr sets, never from
+# searching for an agent that looks about right: herdr's labels are not unique, so a
+# search would leave the watcher watching a pane this session was never in.
 session="$home/session"
 
 # Whether the recorded session is still running. A pid alone is not enough, because
@@ -175,12 +175,13 @@ claim() {
     {
         printf 'SIANA_PID=%s\n' "$$"
         [ -n "${HERDR_PANE_ID:-}" ] && printf 'SIANA_PANE=%s\n' "$HERDR_PANE_ID"
-        # Which harness is in that pane. `siana-watch` will not poke a pane herdr
-        # reports a different agent in, because that pane has been taken over and
-        # every poke would be typed into somebody else's session. Herdr names the
-        # agent it detected, so the watcher needs to know which name is SIANA's -
-        # and asking the home would answer with what is installed rather than with
-        # what started.
+        # Which harness is in that pane. `siana-watch` reads it twice: it stops
+        # when herdr reports a different agent there, because a pane this session
+        # has left means nobody is reading the wakes it raises, and it refuses to
+        # start at all against `claude`, which has no collision-free path into a
+        # running session and so has no watcher. Herdr names the agent it detected,
+        # so the watcher needs to know which name is SIANA's - and asking the home
+        # would answer with what is installed rather than with what started.
         printf 'SIANA_HARNESS=%s\n' "$harness"
     } > "$tmp"
     if ln "$tmp" "$session" 2>/dev/null; then

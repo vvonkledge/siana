@@ -207,6 +207,18 @@ class Doctor(Recipe):
         self.just("doctor")
         self.assertTrue(os.path.exists(path))
 
+    @unittest.skipUnless(has("pi"), "the wake extension is reported for pi only")
+    def test_a_pi_home_without_the_wake_extension_is_named_as_missing(self):
+        # The watcher refuses to start without it, so a home missing it is one where
+        # the fleet cannot advance unattended - and the captain would otherwise only
+        # find that out at the moment they walked away.
+        os.makedirs(self.at(".pi"), exist_ok=True)
+        with open(self.at(".pi", "settings.json"), "w") as fh:
+            fh.write("{}\n")
+        out = self.just("doctor").stdout
+        self.assertIn("missing .pi/extensions/wake.ts", out)
+        self.assertIn("`siana-watch` refuses to start", out)
+
 
 class Suite(unittest.TestCase):
     """The one flag in `just test` whose cost is paid outside the suite."""
@@ -250,7 +262,11 @@ class Init(Recipe):
         for f in ("siana.env", "AGENTS.md", "orders.md", "review.md",
                   "brief-ship.md", "brief-scout.md", "brief-qa.md",
                   "schema-projects.yaml", "schema-obligations.yaml",
-                  "schema-tasks.yaml"):
+                  "schema-tasks.yaml",
+                  # The wake consumer. Without it `siana-watch` refuses to start,
+                  # so a home it was left out of is a home that cannot advance the
+                  # fleet unattended.
+                  os.path.join(".pi", "extensions", "wake.ts")):
             self.assertTrue(os.path.exists(self.at(f)), f"init left out {f}")
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
                   "siana-owe", "siana-retire", "siana-publish", "siana-reap",
@@ -274,6 +290,26 @@ class Init(Recipe):
                    if "missing " in line]
         self.assertEqual(missing, [])
 
+    def test_the_wake_extension_is_the_distros_and_is_refreshed_on_every_init(self):
+        # Distro-owned and never the captain's work, so it is overwritten rather
+        # than kept: an old copy is an extension that does not match the watcher
+        # shipping beside it. This is also what an upgrade relies on, since
+        # `upgrade` reaches this by depending on `init`.
+        self.assertEqual(self.just("init").returncode, 0)
+        installed = self.at(".pi", "extensions", "wake.ts")
+        with open(installed, "w") as fh:
+            fh.write("// a copy from an older distro\n")
+        again = self.just("init")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        with open(installed) as fh:
+            copy = fh.read()
+        with open(os.path.join(DISTRO, "template", "wake.ts")) as fh:
+            self.assertEqual(copy, fh.read())
+        # And never inside the tasks package, which `init` regenerates from
+        # scratch: anything put there is gone on the next install.
+        self.assertFalse(os.path.exists(
+            self.at("pi-agent-tasks", "extensions", "wake.ts")))
+
     def test_the_claude_queue_integration_is_installed_beside_the_pi_one(self):
         # Both halves, because the pi package carries both and a home that gains
         # only the skill opens a session that has to remember to go and ask - which
@@ -296,6 +332,9 @@ class Init(Recipe):
         out = self.just("init", env={"PATH": path})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertTrue(os.path.exists(self.at(".claude", "settings.json")))
+        # No pi, so no pi extension either. The watcher refuses a claude SIANA
+        # outright, and an extension nothing could load would only read as one more
+        # thing to go looking for.
         self.assertFalse(os.path.exists(self.at(".pi")))
         self.assertFalse(os.path.exists(self.at("pi-agent-tasks")))
         doctor = self.just("doctor", env={"PATH": path})

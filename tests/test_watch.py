@@ -1,18 +1,18 @@
-"""siana-watch's mechanics: what it reads off the queue, who it will poke, and
-whether anyone can tell it is running.
+"""siana-watch's mechanics: what it reads off the queue, whose session it is for,
+and whether anyone can tell it is running.
 
 The watcher is the captain's autonomy grant, so its two failure modes are both
 severe and both silent. Reading the queue wrong drops a minion's report for good,
 and the report is the only thing that ever reaches SIANA. Resolving the session
-wrong types a poke into a stranger's pane.
+wrong leaves it raising wakes for a session that is not there.
 
 The third silence is the fleet's: a watcher that stopped looks exactly like a fleet
 with nothing to report. That is what the status record answers, and every reading of
 it is here, driven off written records rather than off live processes - the one
 process any of these needs is the test itself.
 
-What it does with a report once it has one - who it pokes, and when it stops - is in
-`test_watch_herdr.py`, where herdr is scripted.
+The wake it raises is in `test_watch_wake.py`, and what the loop does with a report
+once it has one is in `test_watch_herdr.py`, where herdr is scripted.
 """
 
 import io
@@ -40,7 +40,7 @@ class Reports(HomeTest):
         self.assertEqual(offset, os.path.getsize(q))
 
     def test_only_terminal_records_are_reported(self):
-        # SIANA's own writes - add, start, dep - must not poke SIANA. Only what a
+        # SIANA's own writes - add, start, dep - must not wake SIANA. Only what a
         # minion appends is a report.
         q = self.store("tasks.jsonl",
                        {"id": "t1", "status": "todo"},
@@ -82,7 +82,7 @@ class Reports(HomeTest):
         self.assertEqual(w.reports(q, 0), ([], 0))
 
     def test_a_log_shorter_than_the_offset_reports_once_and_resumes_from_the_end(self):
-        # A compacted or rolled store. Something certainly happened, and the poke
+        # A compacted or rolled store. Something certainly happened, and the wake
         # carries no content that could be wrong about what.
         q = self.store("tasks.jsonl", {"id": "t1", "status": "done"})
         found, offset = w.reports(q, os.path.getsize(q) + 500)
@@ -129,6 +129,12 @@ class ReadSession(HomeTest):
         text = str(cm.exception)
         self.assertIn("outside herdr", text)
         self.assertIn("4242", text)
+        # And it names the failure it exists to prevent, which is no longer that the
+        # wake cannot be delivered - the extension reads a file and does not care
+        # where its session runs. It is that nothing could ever tell this watcher
+        # that session had gone.
+        self.assertIn("nothing here can tell when", text)
+        self.assertIn("a watcher that outlives SIANA", text)
 
     def test_a_recorded_pane_and_harness_are_returned(self):
         self.store("session", "SIANA_PID=4242", "SIANA_PANE=w3D:p2",
@@ -192,7 +198,7 @@ class GrantRecord(GrantTest):
         self.assertTrue(rec["started"])
 
     def test_a_second_watcher_is_refused_while_the_first_still_holds_it(self):
-        # Two would poke SIANA twice for every report, and only one of them could be
+        # Two would raise two wakes for every report, and only one of them could be
         # recorded, so the captain would be told about a watcher while another ran
         # unaccounted for.
         w.claim_grant(self.home, "w1:p1")
@@ -295,7 +301,7 @@ class GrantStatus(GrantTest):
         self.mine(command="/usr/bin/something-that-is-not-a-watcher")
         code, said = self.read()
         self.assertEqual(code, 1)
-        self.assertIn("not the watcher that recorded it", said)
+        self.assertIn("not the process that recorded it", said)
 
     def test_a_record_that_cannot_say_what_its_process_was_is_not_a_grant(self):
         self.mine(command="")

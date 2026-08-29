@@ -101,6 +101,9 @@ Into the home:
   installing it project-locally. For `claude`, `.claude/settings.json` carrying the
   SessionStart hook and `.claude/skills/agent-tasks/`. Both are written when you
   have both. See [The queue integration](#the-queue-integration).
+- `.pi/extensions/wake.ts`, when you have `pi`. It is what delivers `siana-watch`'s
+  wake into SIANA's session, and the watcher refuses to start without it. See
+  [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl` - are
 not written here. `datafile` creates each on its first append, so a contract with no
@@ -146,7 +149,8 @@ retype.
 ## Run SIANA
 
 SIANA runs inside a `herdr` session, because that is how it starts minions and how
-`siana-watch` wakes it. Start herdr, then start SIANA in a pane:
+`siana-watch` confirms the session it is watching for is still there. Start herdr,
+then start SIANA in a pane:
 
     herdr
     siana
@@ -156,7 +160,8 @@ open obligations appended to its system prompt. Talk to it there. You never talk
 a minion, and no minion talks to you.
 
 It starts outside herdr too, and says so when it does: with no pane there is nothing
-for `siana-watch` to wake, so the fleet only advances on your turns.
+for `siana-watch` to confirm it is watching for, so it refuses and the fleet only
+advances on your turns.
 
 **One SIANA leads the fleet.** Starting a second is refused, and the refusal tells
 you the pane the first is in so you can attach to it. Two would race each other for
@@ -194,10 +199,11 @@ to say otherwise for a single start. Everything after the flag is the session's:
 A name that is neither is refused rather than guessed at, because falling back to the
 default would open a session you did not ask for and say nothing about it.
 
-`siana` records the harness it started alongside the pane, and `siana-watch` pokes
-that pane only while herdr still reports that same agent in it. So the watcher
-follows whichever harness you chose, and a pane that has been taken over by the
-other one is a stop rather than a poke typed into somebody else's session.
+`siana` records the harness it started alongside the pane, and `siana-watch` runs
+only while herdr still reports that same agent in it. So a pane that has been taken
+over by the other harness stops the watcher rather than leaving it raising wakes for
+a session that has gone. It also runs only for `pi`, for the reason under
+[Leave it running](#leave-it-running).
 
 ### Register a project
 
@@ -239,7 +245,7 @@ branch once the work has landed.
 
     siana-watch
 
-`siana-watch` watches the queue and pokes SIANA when a minion reports, so the fleet
+`siana-watch` watches the queue and wakes SIANA when a minion reports, so the fleet
 does not idle between your turns. Start it after SIANA is up: it finds the session
 through the home.
 
@@ -247,6 +253,57 @@ through the home.
 ready work without you in the room. The grant is the process: you give it by starting
 this and withdraw it by stopping it with Ctrl-C. Nothing outlives it, so no session
 can inherit an autonomy you did not choose to leave running.
+
+**It never types into SIANA's pane.** It raises a counter under `~/.siana/wake/`, and
+the `wake.ts` extension `init` installed into SIANA's pi session is what reads it and
+delivers the wake. That split is the whole point: the extension can read the input
+editor and send in the same breath, so a wake can never arrive in the middle of
+something you are half way through typing. The watcher used to write the wake into
+that editor through herdr, which concatenated your unsubmitted draft with it and
+submitted both as one message under your name.
+
+**A wake waits for an idle session.** It goes out only when SIANA is between turns
+and the editor is empty, and it always arrives as a turn of its own. There is no
+delivery into a turn in flight: pi's only way to hand one a message is to queue it,
+and pressing Escape to interrupt empties that queue into the input editor - your
+draft with the wake pasted in front of it, which is the same bug from the other end.
+So a wake raised while SIANA is working is held, not queued, and goes out when the
+turn ends. Nothing is lost by waiting: the count is on disk and nothing records it as
+taken until it has actually been sent.
+
+So the watcher checks that SIANA's session is reading before it starts, and refuses
+with what to do about it when it is not:
+
+- **Nothing is reading.** The session is not up yet, or the home predates the
+  extension. Start SIANA first, and run `just init` in the distro if `just doctor`
+  reports `.pi/extensions/wake.ts` missing.
+- **The recorded session is gone.** A pi killed hard enough leaves its record
+  behind. Start SIANA again; it rewrites the record as it comes up.
+- **SIANA is running in Claude Code.** There is no collision-free path into a
+  running claude session, so there is no watcher for one either, and no fallback to
+  the old write. Restart SIANA with `siana --harness pi`, or accept that the fleet
+  advances only on your turns.
+
+A wake raised while SIANA is down is not lost: the counter is on disk, and the
+session drains it as it starts.
+
+If wakes stop being taken while the watcher runs, it says so on its stderr every
+five minutes and keeps counting. It cannot say why, and it does not guess. There are
+three reasons and they want different things from you:
+
+- **SIANA is mid-turn.** A long turn holds every wake raised during it. Nothing to
+  do: the wake goes out within half a second of the turn ending.
+- **A draft left in SIANA's editor.** The extension holds every wake while there is
+  text in the input, so that one never arrives in the middle of something you are
+  half way through typing. Send that message or clear it, and the held wake goes out
+  within half a second. Nothing else is needed, and restarting SIANA here would
+  throw the draft away.
+- **The session is gone.** `just doctor` says whether one is running. Start SIANA
+  again and it drains everything counted while it was away.
+
+Only the last of those is a reason to restart anything, which is why the warning
+names all three and diagnoses none: restarting SIANA over one of the first two
+discards the draft, or the turn, that the wake was waiting on.
 
 ### A rigor the minion drives
 
@@ -292,11 +349,16 @@ other instruction file in the home.
 
     just test
 
-About 35 seconds. Standard-library `unittest`, no dependencies to install. It drives
-the pure mechanics in-process and drives the commands as real processes against a
-real `tasks` and `datafile`, into throwaway homes, because a stubbed store would only
-ever agree with the suite. Unittest arguments pass through, so `just test -v` is
-verbose and `just test -k <slug>` runs one rule.
+Three or four minutes. Standard-library `unittest`, no dependencies to install. It
+drives the pure mechanics in-process and drives the commands as real processes
+against a real `tasks` and `datafile`, into throwaway homes, because a stubbed store
+would only ever agree with the suite. Unittest arguments pass through, so `just test
+-v` is verbose and `just test -k <slug>` runs one rule.
+
+It reports a line per test as it goes, rather than unittest's dots, and puts a
+watchdog around each one: a test that stalls dumps every thread's stack and takes the
+run down instead of sitting there. That is `tests/run.py`, and it is there because a
+run killed by a hang guard printed dots that no line-oriented reader ever showed.
 
 `ORDERS.md` is the rest of the contract for changing anything here, and the parts of
 it that can be checked exactly are checked by the suite.

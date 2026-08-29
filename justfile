@@ -167,6 +167,24 @@ init: _contract-drift
         # untrusted directory, and re-running init must not be a first-run-only path.
         (cd "$home" && pi install -l -a "$(cd "$pkg" && pwd)" >/dev/null)
         echo "wrote    $home/.pi/settings.json"
+
+        # The wake consumer. `siana-watch` no longer types into SIANA's pane - that
+        # concatenated the captain's unsubmitted draft with the wake and submitted
+        # both - so it raises a counter under $home/wake and this extension is what
+        # reads it and delivers the wake inside the session. Without it the watcher
+        # refuses to start, so this is not an optional extra.
+        #
+        # `.pi/extensions/*.ts` is a documented pi auto-discovery location, `siana`
+        # runs in $home so that is the project directory, and it starts pi with
+        # --approve, which is the project-local trust that gates loading it.
+        #
+        # Never into $home/pi-agent-tasks: `tasks pi-package` regenerates that
+        # directory on every init and anything added there is lost. Overwritten
+        # every time, like siana.env and the package, because it is the distro's
+        # file and never the captain's work.
+        mkdir -p "$home/.pi/extensions"
+        cp "$distro/template/wake.ts" "$home/.pi/extensions/wake.ts"
+        echo "wrote    $home/.pi/extensions/wake.ts"
     fi
 
     # The same two halves the pi package carries in one, which is why both are
@@ -323,6 +341,13 @@ _contract-drift:
 
 # Run the distro's tests. Pass unittest arguments through: `just test -v`, or
 # `just test -k slug` for one rule.
+#
+# Through `tests/run.py` rather than `-m unittest` directly, because unittest's own
+# progress is dots with no newline until the summary and a line-oriented reader -
+# the GitHub Actions runner is one - shows none of it. Three CI runs on this project
+# were killed by the hang guard having printed nothing at all. That file is the whole
+# of the difference: a line per test before it runs, and a watchdog that dumps every
+# thread's stack rather than letting a stall eat the job's wall clock in silence.
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -337,8 +362,8 @@ test *args:
     # directly never writes its own, and the `bin/` commands import stdlib only. What
     # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
     # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner against the 40s baseline in .github/workflows/ci.yml. Invisible
-    # locally, where the captain's uv cache is already warm.
+    # on a cold runner, against a suite that already takes three or four minutes.
+    # Invisible locally, where the captain's uv cache is already warm.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`
@@ -349,7 +374,10 @@ test *args:
     # installed to run these: they drive the commands where the mechanics are pure,
     # and drive them as processes against a real `tasks` and `datafile` where they
     # are not, because a stubbed store would only ever agree with this suite.
-    python3 -B -m unittest discover -s tests {{args}}
+    # `-u` as well as the flushes in `tests/run.py`, so that nothing this recipe
+    # runs can hold a line back: the point of the whole arrangement is that what
+    # has been printed has really left the process.
+    python3 -B -u tests/run.py {{args}}
 
 # Report SIANA's state without changing anything
 doctor: _contract-drift
@@ -397,6 +425,20 @@ doctor: _contract-drift
             starts="$starts $cmd"
         else
             echo "  missing $f (\`just init\` writes it)"
+        fi
+        # The wake consumer, reported only for the harness that has one. It is what
+        # delivers `siana-watch`'s wake inside the session without writing into the
+        # editor the captain types in, and the watcher refuses to start without it,
+        # so a home missing it is one where the fleet cannot advance unattended.
+        # Asked only of an installed pi, so its absence is never a fault on a home
+        # that has no pi to load it.
+        if [ "$cmd" = pi ] && [ -e "$home/$f" ]; then
+            if [ -e "$home/.pi/extensions/wake.ts" ]; then
+                echo "  ok      .pi/extensions/wake.ts"
+            else
+                echo "  missing .pi/extensions/wake.ts (\`just init\` writes it;" \
+                     "without it \`siana-watch\` refuses to start)"
+            fi
         fi
     done
     if [ -n "$starts" ]; then
