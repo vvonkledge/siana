@@ -31,11 +31,17 @@ import unittest
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 
-# The watchdog, and it is a hang guard rather than a budget. The slowest test here
-# is under five seconds, so this is an order of magnitude clear of anything the
-# suite legitimately does, and it is far enough inside CI's own fifteen-minute
-# guard that the stack always beats the kill.
-STALL_S = 60
+# The watchdog, and it is a hang guard rather than a budget. Sized against what this
+# suite already calls acceptable rather than against what it usually takes: a test
+# here may make two `just` calls at `tests/test_justfile.py`'s 180-second timeout
+# apiece, so 360 seconds is legitimately slow and only past that is a stall. On a
+# cold CI runner those really are slow - `just init` drives `tasks`, a `uv run
+# --script` program resolving its dependencies from the network the first time
+# anything reaches for them. A watchdog under that turns one slow-but-passing test
+# into a red run, and `exit=True` means `_exit`, so it would take every `addCleanup`
+# with it and strand the children they remove. Eight minutes leaves seven of CI's
+# fifteen-minute guard, so the stack always beats the kill.
+STALL_S = 480
 
 # The suite's size, for the progress line. Set by the runner below, which is the
 # only thing that has counted the tests before they start.

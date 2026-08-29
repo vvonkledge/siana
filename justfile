@@ -362,8 +362,8 @@ test *args:
     # directly never writes its own, and the `bin/` commands import stdlib only. What
     # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
     # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner against the 40s baseline in .github/workflows/ci.yml. Invisible
-    # locally, where the captain's uv cache is already warm.
+    # on a cold runner, against a suite that already takes three or four minutes.
+    # Invisible locally, where the captain's uv cache is already warm.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`

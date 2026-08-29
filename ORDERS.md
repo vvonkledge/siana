@@ -26,9 +26,9 @@ this file is how you drive it. The first thing a run of it executes is the suite
 
     just test
 
-About a minute. It drives the pure mechanics in-process and drives the commands as
-real processes against a real `tasks` and `datafile`, because a stubbed store would
-only ever agree with the suite.
+Three or four minutes. It drives the pure mechanics in-process and drives the
+commands as real processes against a real `tasks` and `datafile`, because a stubbed
+store would only ever agree with the suite.
 
 Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
 and answers when it answers, so the answers that matter most - herdr slow, wrong, or
@@ -84,7 +84,7 @@ shipping, you are driving a run, and work that never reached a passing one canno
 verify.
 
 A run is two steps, in that order. First it executes this project's own `ship`
-command, which is the `just test` above: exact, about a minute, and yours to get
+command, which is the `just test` above: exact, a few minutes, and yours to get
 green before you spend a run on it. Then it puts an agent on your diff, read against
 your brief and against these orders. That second step is why the rigor is a pipeline
 and not a command: it is judgment, it costs tokens, and every finding it raises costs
