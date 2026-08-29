@@ -194,6 +194,28 @@ class Pipeline(HomeTest):
         self.git("commit", "-qm", "main moves on")
         return "old"
 
+    def advance(self, ref="main"):
+        """One more commit on the line the work lands on, after it was cut from there.
+
+        The ordinary thing that happens to a project's `target` while a task is in
+        flight: something else lands. Nothing about this task moved."""
+        self.git("checkout", "-q", ref)
+        with open(os.path.join(self.repo, f"{ref}-moved.txt"), "a") as fh:
+            fh.write("landed while the work was out\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", f"{ref} moves on")
+        return self.git("rev-parse", ref).strip()
+
+    def unrelated(self, name="elsewhere"):
+        """A ref with no commit in common with this repository's line at all.
+
+        A parentless commit, so there is no fork point to fall back to and nothing
+        that could be mistaken for one."""
+        tree = self.git("rev-parse", "main^{tree}").strip()
+        sha = self.git("commit-tree", tree, "-m", "another history entirely").strip()
+        self.git("branch", name, sha)
+        return name
+
     def commit_in(self, worktree, name="b.txt", text="work\n"):
         self.write(worktree, name, text)
         self.git("add", "-A", cwd=worktree)
@@ -311,14 +333,76 @@ class Run(Pipeline):
         self.assertEqual(self.record()["base"],
                          self.git("rev-parse", "main").strip())
 
-    def test_a_target_the_branch_is_not_on(self):
-        self.project(target="old")
-        self.diverged()
+    def test_a_target_that_moved_on_while_the_work_was_out(self):
+        """The one case the ancestor rule must not catch, and what it is measured from.
+
+        A task that named no base is cut from the project's `target`, and that ref is
+        the line the work lands on: something else merging into it is ordinary and
+        makes it stop being an ancestor without this branch moving at all. The fork
+        point is still exactly where the work starts, so the review is measured from
+        there and the run is not refused."""
+        ran = self.at("ship-log")
+        self.project(target="main", ship=f"echo ran >> {ran}")
+        wt = self.dispatched(base=None)
+        forked = self.git("rev-parse", "main").strip()
+        self.commit_in(wt)
+        self.advance()
+
+        self.assertAccepted(self.pipe("run", cwd=wt))
+        self.assertEqual(self.record()["base"], forked)
+        self.assertIn(forked, self.prompt())
+        self.assertTrue(self.reviewed())
+        # Appended to rather than touched: a fallback that re-resolved and started
+        # over would pay for the suite twice and read as a pass either way.
+        with open(ran) as fh:
+            self.assertEqual(fh.read(), "ran\n", "the ship command ran twice")
+
+    def test_a_target_that_moved_on_is_pinned_like_any_other_base(self):
+        # The fork point is a commit, and the ref it was found through keeps moving
+        # after the run. What the reviewer read and what the record says it measured
+        # have to go on meaning the same work.
+        self.project(target="main")
+        wt = self.dispatched(base=None)
+        forked = self.git("rev-parse", "main").strip()
+        self.commit_in(wt)
+        self.advance()
+        self.assertAccepted(self.pipe("run", cwd=wt))
+        self.advance()
+        self.assertEqual(self.record()["base"], forked)
+        self.assertIn(forked, self.assertAccepted(self.pipe("check", cwd=wt)))
+
+    def test_a_target_that_shares_no_history(self):
+        # A fork point is a fallback, not a guess: without one there is no range that
+        # is this task's change, so this blocks exactly as a bad explicit base does.
+        self.project(target=self.unrelated())
         wt = self.dispatched(base=None)
         self.commit_in(wt)
         out = self.pipe("run", cwd=wt)
         self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
-        self.assertRefused(out, "base old is not an ancestor")
+        self.assertRefused(out, "target elsewhere shares no history",
+                           "no fork point to measure this change from")
+        self.assertFalse(self.reviewed())
+        self.assertEqual(self.record()["verdict"], "failed")
+
+    def test_a_named_base_is_never_widened_to_a_fork_point(self):
+        """The exception belongs to the target, and to nothing else.
+
+        The very same ref, moved the very same way: `main` gains a commit while the
+        work is out. A task that named it as its base is still refused, because a
+        named base is the contract the queue wrote and this cannot tell a ref that
+        advanced from one the work was replayed off. Only the fallback is known to be
+        the line ahead rather than a line beside."""
+        marker = self.at("ship-ran")
+        self.project(target="main", ship=f"touch {marker}")
+        wt = self.dispatched(base="main")
+        self.commit_in(wt)
+        self.advance()
+        out = self.pipe("run", cwd=wt)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertRefused(out, "base main is not an ancestor")
+        self.assertFalse(os.path.exists(marker), "the ship command ran anyway")
+        self.assertFalse(self.reviewed())
+        self.assertEqual(self.record()["verdict"], "failed")
 
     def test_the_base_is_pinned_before_anything_reads_it(self):
         """A ref moves, and a commit does not.

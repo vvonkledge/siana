@@ -25,9 +25,16 @@ impossible rather than merely discouraged.
 **The review is measured from one commit, and that commit is behind the head.** A
 task records its base as a ref, and a ref moves; work whose whole job is to move a
 branch leaves the ref it started from off this line altogether. So the base is
-resolved to a commit before anything reads it, and a commit the branch does not
-contain is refused: a range measured from a fork point reviews both lines, which is
-mostly somebody else's work with this change buried in it.
+resolved to a commit before anything reads it, and a base the branch does not contain
+is refused: a range measured from a fork point reviews both lines, which is mostly
+somebody else's work with this change buried in it.
+
+**A task that named no base is measured from where it forked.** Then the base is the
+project's `target`, which is the line the work lands on and gains commits while the
+work is in flight, so it stops being an ancestor without anything being wrong. That
+one case takes the merge-base of the target and this head, which is the fork point the
+task was cut from. A base the task named itself is never widened this way: it is the
+queue's contract, and a contract that does not hold is SIANA's to settle.
 
 **Nothing is pushed here.** A run happens inside the ship task, which is before any
 independent minion has accepted the work, and nothing leaves the machine before then.
@@ -318,7 +325,8 @@ def cmd_run(args, home: str, tasks_file: str, task_id: str) -> int:
     # project was checked out to, and the branch a merge request targets is the only
     # other thing that can honestly be called the fork point. Neither is guessed: a
     # diff against the wrong base is a review of somebody else's work.
-    base_ref = task.get("base") or project.get("target")
+    named = task.get("base")
+    base_ref = named or project.get("target")
     if not base_ref:
         die(f"cannot tell what {branch} forked from",
             f"{task_id} records no `base`, and {handle} records no `target`",
@@ -364,25 +372,48 @@ def cmd_run(args, home: str, tasks_file: str, task_id: str) -> int:
     # onto another line and the ref they came from shares nothing with the result but
     # a fork point, so `{BASE}..HEAD` answers with every commit either line has made
     # since. That is how a review of one rebased commit came back a review of
-    # eighteen, and read as green. Refused rather than repaired, because nothing here
-    # can say which commit was meant: a merge-base would review a range nobody chose,
-    # and the base is the queue's contract, which a minion may not rewrite.
+    # eighteen, and read as green.
     #
-    # Recorded as a failed run before the refusal, and not only printed. The head does
+    # Recorded as a failed run before any refusal, and not only printed. The head does
     # not have to have moved for a base to stop being an ancestor - the ref can move
     # instead - and a prior pass at this same head would otherwise still read as green
     # to `check`.
+    forked = False
     if git(root, "merge-base", "--is-ancestor", base, head, check=False).returncode:
-        fail(f"{base_ref} is not an ancestor of {head}", BLOCK)
-        die(f"base {base_ref} is not an ancestor of {branch} at {head[:12]}",
-            f"it resolves to {base[:12]}, which this branch's history does not have",
-            "they share only a fork point, so the review would be measured from",
-            "there and would judge every commit either line has made since",
-            "this is not yours to work around: `block` and relay it. Whether the",
-            "base is wrong or the branch has to be replayed onto it is SIANA's")
+        # A base the task named is refused, not repaired. Nothing here can say which
+        # commit was meant, and the base is the queue's contract: a minion that
+        # rewrites the thing it is judged against has judged itself. That holds even
+        # when the named ref only moved forward, because from here that reads exactly
+        # like the rebase above.
+        if named:
+            fail(f"{base_ref} is not an ancestor of {head}", BLOCK)
+            die(f"base {base_ref} is not an ancestor of {branch} at {head[:12]}",
+                f"it resolves to {base[:12]}, which this branch's history lacks",
+                "they share only a fork point, so the review would be measured from",
+                "there and would judge every commit either line has made since",
+                "this is not yours to work around: `block` and relay it. Whether the",
+                "base is wrong or the branch has to be replayed onto it is SIANA's")
+
+        # The task named no base, so this is the project's `target`: the line the work
+        # lands on, which gains commits while the work is in flight. Nothing replayed
+        # this branch anywhere, so the fork point is still exactly where the work
+        # starts, and `{BASE}..HEAD` from there is this task's commits and no others.
+        # Taken only here, because only here is the ref known to be the line ahead
+        # rather than a line beside.
+        found = git(root, "merge-base", base, head, check=False)
+        if found.returncode:
+            fail(f"{base_ref} shares no history with {head}", BLOCK)
+            die(f"target {base_ref} shares no history with {branch} at {head[:12]}",
+                f"it resolves to {base[:12]}, and the two have no commit in common,",
+                "so there is no fork point to measure this change from",
+                "this is not yours to work around: `block` and relay it. Whether",
+                f"{handle} names the wrong target or this branch was cut from",
+                "somewhere else is SIANA's")
+        base, forked = found.stdout.strip(), True
 
     print(f"pipeline {task_id}")
-    print(f"  branch {branch} at {head[:12]} (base {base_ref} at {base[:12]})")
+    where = "forked from" if forked else "base"
+    print(f"  branch {branch} at {head[:12]} ({where} {base_ref} at {base[:12]})")
 
     print(f"\n=== test: {step_command}")
     tested = subprocess.run(step_command, shell=True, cwd=root)
