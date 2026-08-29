@@ -107,6 +107,47 @@ class HomeTest(unittest.TestCase):
         out = self.run_cmd(["tasks", "init"], cwd=self.home)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
+    def distro_path(self, *first):
+        """A PATH on which this checkout's `bin/` is the only SIANA there is.
+
+        `run_bin` reaches a command by the path this suite already knows, so most
+        of the suite never needs one. A verify does: `siana-pipeline check` is a
+        string on a task, and the queue runs it through a shell. Both halves of
+        this are what make that resolve to the code under test.
+
+        `bin/` goes on the front, because without it nothing answers to the name at
+        all. That is the exit 127 a clean runner hits.
+
+        Every installed copy comes off, because the captain has one on their PATH
+        and it would otherwise answer instead - the suite going green against a
+        distro nobody changed, which is how the same failure stayed invisible here
+        until CI found it. A directory holding one is mirrored without it rather
+        than dropped: `~/.local/bin` holds `tasks` too, and losing that would fail
+        the suite on a store it needs instead of on the SIANA it is hiding.
+        """
+        owned = {n for n in os.listdir(BIN)
+                 if os.path.isfile(os.path.join(BIN, n))}
+        out = []
+        for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                # An unreadable or absent PATH entry finds nothing either way, so
+                # it is passed through rather than made this fixture's problem.
+                out.append(d)
+                continue
+            if not owned.intersection(entries):
+                out.append(d)
+                continue
+            mirror = self.at(f"path-{i}")
+            os.makedirs(mirror, exist_ok=True)
+            for entry in entries:
+                link = os.path.join(mirror, entry)
+                if entry not in owned and not os.path.lexists(link):
+                    os.symlink(os.path.join(d, entry), link)
+            out.append(mirror)
+        return os.pathsep.join([*first, BIN, *out])
+
     def run_cmd(self, argv, cwd=None, env=None, timeout=120):
         e = dict(os.environ)
         e["SIANA_HOME"] = self.home

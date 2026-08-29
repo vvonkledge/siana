@@ -39,6 +39,13 @@ class Reap(HomeTest):
         if landed:
             self.git("merge", "--no-ff", "-m", f"land {name}", name)
 
+    def brief(self, tid, branch):
+        """A ship brief recording the branch its task's work lives on, which is the
+        fleet's only record of the commit type in that name."""
+        os.makedirs(os.path.join(self.home, "briefs"), exist_ok=True)
+        with open(os.path.join(self.home, "briefs", f"{tid}.md"), "w") as fh:
+            fh.write(f"# Brief\n\n## Delivery: ship\n\n    branch  {branch}\n")
+
     def task(self, tid, status, base=None):
         rec = {"id": tid, "title": tid, "status": status, "verify": "true",
                "verify_kind": "cmd", "deps": [], "context": [], "project": "demo",
@@ -97,11 +104,39 @@ class Reap(HomeTest):
         self.branch("siana/held", landed=True)
         checkout = os.path.join(self.home, "wt")
         self.git("worktree", "add", checkout, "siana/held")
+        self.task("held", "done")
         self.project("demo", path=self.repo, target="main")
         text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes"))
         self.assertIn("siana-retire held", text)
         self.assertTrue(os.path.isdir(checkout))
         self.assertIn("siana/held", self.git("branch", "--list", "siana/held"))
+
+    def test_a_typed_branch_is_handed_back_as_its_task_and_not_as_its_name(self):
+        """`siana-retire` takes a task id, and a ship branch carries a commit type
+        no task id has. Trimming `siana/` off the branch used to be the whole of
+        this hint; on `siana/docs/write-it` it prescribes `siana-retire
+        docs/write-it`, which retires nothing and reads like the captain's typo."""
+        self.branch("siana/docs/write-it", landed=True)
+        checkout = os.path.join(self.home, "wt")
+        self.git("worktree", "add", checkout, "siana/docs/write-it")
+        self.brief("write-it", "siana/docs/write-it")
+        self.task("write-it", "done")
+        self.project("demo", path=self.repo, target="main")
+        text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes"))
+        self.assertIn("siana-retire write-it", text)
+        self.assertNotIn("siana-retire docs/write-it", text)
+
+    def test_a_branch_no_task_claims_is_not_given_an_invented_task_id(self):
+        """A branch whose task record is gone has no task to name, and `siana-retire`
+        refuses anything else. Saying so beats prescribing a command that cannot
+        work, which is what trimming the prefix produced whenever it was wrong."""
+        self.branch("siana/orphan", landed=True)
+        checkout = os.path.join(self.home, "wt")
+        self.git("worktree", "add", checkout, "siana/orphan")
+        self.project("demo", path=self.repo, target="main")
+        text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes"))
+        self.assertIn("no task in the queue claims it", text)
+        self.assertTrue(os.path.isdir(checkout))
 
     def test_an_ignored_file_is_never_this_command_s_to_judge(self):
         # The bug this reconcile removes: a `.env` in an otherwise clean worktree.

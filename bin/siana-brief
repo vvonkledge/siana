@@ -10,16 +10,24 @@
 # The mechanics are here instead: pick the right contract for the delivery kind,
 # refuse a task that does not exist, and never clobber a brief that already does.
 #
-# Usage: siana-brief <task-id> --ship | --scout
+# Usage: siana-brief <task-id> --ship --type <type> | --scout
 #
-#   --ship   the work lands. The minion commits on `siana/<task-id>` and the branch
-#            is the deliverable; SIANA lands it.
+#   --ship   the work lands. The minion commits on `siana/<type>/<task-id>` and the
+#            branch is the deliverable; SIANA lands it.
 #   --scout  the work reports. The minion writes $SIANA_HOME/reports/<task-id>.md and
 #            lands nothing; its worktree is scratch.
+#   --type   the Conventional Commit type a ship task's commits will carry, and the
+#            middle segment of its branch. Required for --ship, refused for --scout.
+#
+# The type is stated here and nowhere else. Nothing downstream reads it back off a
+# title, a diff, a commit or a minion's report, because by then it would be a guess
+# about what the work turned out to be rather than a statement of what it is for.
+# This writes the branch that follows from it into the brief, and every command that
+# needs to know where the work lives reads that one line.
 #
 # A ship task in a project whose registry record carries a `qa` command is paired
 # here with a QA task of its own: it depends on the ship task, so the queue makes
-# it ready the moment that work comes back, and its `base` is `siana/<task-id>`,
+# it ready the moment that work comes back, and its `base` is that same branch,
 # so its minion is put on the branch it was queued to judge. The pairing happens
 # here because this is the only place a task's delivery kind is ever stated, and a
 # QA task nobody remembered to queue is exactly the false-green that registry
@@ -104,26 +112,79 @@ print(qa)
 PYEOF
 }
 
+# The eleven Conventional Commit types, and the whole of what may stand between
+# `siana/` and a task id. A branch named for anything else announces a commit its
+# project's CI will reject, so the list is checked here rather than trusted.
+TYPES="build chore ci docs feat fix perf refactor revert style test"
+
 id=""
 kind=""
-for arg in "$@"; do
-    case "$arg" in
+type=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         -h|--help) usage; exit 0 ;;
         --ship)  [ -z "$kind" ] || die "--ship and --scout are the two kinds; pick one"
                  kind=ship ;;
         --scout) [ -z "$kind" ] || die "--ship and --scout are the two kinds; pick one"
                  kind=scout ;;
-        -*) die "unknown option: $arg" "run \`siana-brief --help\`" ;;
-        *)  [ -z "$id" ] || die "one task at a time; got '$id' and '$arg'"
-            id="$arg" ;;
+        --type)  [ $# -ge 2 ] || die "--type needs a Conventional Commit type" \
+                     "one of: $TYPES"
+                 [ -z "$type" ] || die "one type at a time; got '$type' and '$2'"
+                 type="$2"; shift ;;
+        # Accepted as well as the spaced form, because the near miss is otherwise an
+        # `unknown option` that says nothing about the type being the problem, and a
+        # retype here costs SIANA a whole turn.
+        --type=*) [ -z "$type" ] || die "one type at a time; got '$type' and '${1#--type=}'"
+                 type="${1#--type=}" ;;
+        -*) die "unknown option: $1" "run \`siana-brief --help\`" ;;
+        *)  [ -z "$id" ] || die "one task at a time; got '$id' and '$1'"
+            id="$1" ;;
     esac
+    shift
 done
 
-[ -n "$id" ] || die "which task?" "usage: siana-brief <task-id> --ship | --scout"
+[ -n "$id" ] || die "which task?" \
+    "usage: siana-brief <task-id> --ship --type <type> | --scout"
 [ -n "$kind" ] || die "$id needs a delivery kind: --ship or --scout" \
     "ship work lands through the project's rigor; scout work leaves a report" \
     "and lands nothing. Neither is inferred, because a wrong guess here is a" \
     "minion shipping what was only meant to be investigated"
+
+# Argument checks before anything is resolved or written, so a missing or misspelt
+# type costs a retype and never a half-scaffolded task: a brief this refuses to
+# rewrite, or a QA task queued against a branch no minion will be put on.
+branch=""
+if [ "$kind" = ship ]; then
+    [ -n "$type" ] || die "$id needs a commit type: --type <type>" \
+        "a ship branch is siana/<type>/<task-id>, and the type says which of the" \
+        "eleven Conventional Commit categories the work lands under" \
+        "you state it here, because everything downstream would be reading it back" \
+        "off a title or a diff, which is a guess about what the work turned out to" \
+        "be rather than a statement of what it is for" \
+        "one of: $TYPES"
+    # Compared whole against one type at a time. The membership test this replaces,
+    # `case " $TYPES " in *" $type "*)`, matched any adjacent run of the list -
+    # `--type 'ci docs'` is a substring of the haystack, bounded by spaces on both
+    # sides - and went on to write `siana/ci docs/<id>`: a name git refuses to create
+    # and that no reader can read back, because the branch line holds one \S+ token.
+    # Every command then fell to the legacy `siana/<id>` while the QA task queued
+    # just below waited on a base nobody had ever made, and the first refusal came
+    # from a QA dispatch long after the ship work was finished.
+    supported=""
+    for known in $TYPES; do
+        if [ "$type" = "$known" ]; then supported=yes; break; fi
+    done
+    [ -n "$supported" ] || die "$type is not a Conventional Commit type" \
+        "the eleven are: $TYPES" \
+        "a branch named for anything else announces a commit that this" \
+        "project's CI rejects on the merge request"
+    branch="siana/$type/$id"
+elif [ -n "$type" ]; then
+    die "--type is for ship work, and $id was briefed --scout" \
+        "a scout lands nothing, so there is no commit for a type to describe" \
+        "its branch is siana/<task-id>, which is a role in this fleet rather than" \
+        "a category of change"
+fi
 
 home="${SIANA_HOME:-$HOME/.siana}"
 tasks_file="${SIANA_TASKS_FILE:-$home/tasks.jsonl}"
@@ -171,9 +232,42 @@ if [ "$kind" = ship ]; then
 fi
 
 mkdir -p "$home/briefs"
-cp "$template" "$brief"
+# The branch is substituted rather than left as a placeholder for SIANA to fill. It
+# is the one thing in a brief a script derives rather than judges, and a name typed
+# twice is a name that can disagree with itself; every command downstream reads this
+# line, so the copy in the brief is the only record there is.
+sed -e "s|{SHIP_BRANCH}|$branch|g" "$template" > "$brief"
+
+# The substitution is checked, not assumed. Every command reads the branch back out
+# of this file the same way: an indented `branch <name>` line, inside the brief's own
+# `## Delivery: ship` section and nowhere else. The home's copy of this template is
+# the captain's to evolve, and `just init` keeps a diverged one on purpose, so a
+# template that has lost the marker, carries it in a sentence, or has moved it under
+# a heading of its own writes a brief the readers find no branch in. The QA task
+# queued below would then be cut from siana/<type>/<id> while every reader answered
+# siana/<id>, and that split stays invisible until a QA dispatch fails on a base
+# nobody ever created, long after the ship work is finished.
+#
+# So what is checked is the section the readers read, and not the file: a check with
+# a wider reach than theirs passes exactly where they would have found nothing.
+delivery_section() {
+    awk '/^## / { taking = ($0 ~ /^## Delivery: ship[[:space:]]*$/); next } taking' "$1"
+}
+
+if [ -n "$branch" ] && ! delivery_section "$brief" |
+        grep -q "^[[:space:]]\{1,\}branch[[:space:]]\{1,\}$branch[[:space:]]*$"; then
+    rm -f "$brief"
+    die "$template does not record the branch where every command looks for it" \
+        "$id would be briefed with no branch in it, and every command would read" \
+        "siana/$id while the QA task behind it judged $branch" \
+        "the '## Delivery: ship' section needs an indented line of exactly:" \
+        "    branch  {SHIP_BRANCH}" \
+        "under any other heading it is prose, and no command reads it" \
+        "nothing has been written and nothing has been queued"
+fi
 
 echo "briefed  $brief ($kind)"
+[ -n "$branch" ] && echo "  branch $branch"
 
 # Filling this in is the whole point of scaffolding it, so say what is still empty.
 # The minion refuses to work on an unfilled placeholder, which keeps a forgotten one
@@ -195,7 +289,7 @@ if [ -n "$qa_cmd" ]; then
     verify='test -s "$SIANA_HOME/reports/$SIANA_TASK_ID.md" && '"$qa_cmd"
     if ! added="$(tasks --file "$tasks_file" add "QA $id" --project "$handle" \
             --cwd "$qa_path" --verify "$verify" --dep "$id" \
-            --base "siana/$id" 2>&1)"; then
+            --base "$branch" 2>&1)"; then
         die "$id is briefed, but the QA task behind it was not created" \
             "$(printf '%s' "$added" | head -1)" \
             "queue it by hand before dispatching $id, or dispatch knowing this" \
@@ -207,7 +301,7 @@ if [ -n "$qa_cmd" ]; then
     # Nothing in a QA brief is SIANA's to fill: what the work was asked to do is
     # the ship task's own brief, and what to run is the project's QA command. That
     # is what makes QA cost nothing per task and therefore get used.
-    sed -e "s|{SHIP_TASK}|$id|g" -e "s|{SHIP_BRANCH}|siana/$id|g" \
+    sed -e "s|{SHIP_TASK}|$id|g" -e "s|{SHIP_BRANCH}|$branch|g" \
         "$home/brief-qa.md" > "$home/briefs/$qa_id.md"
     echo "paired   $home/briefs/$qa_id.md (qa $qa_id, waiting on $id)"
     echo "  runs   $qa_cmd"
@@ -218,4 +312,14 @@ fi
 if printf '%s' "$show" | grep -q '^  status: doing$'; then
     echo "  late   $id is already dispatched; its minion started without this brief" >&2
     echo "         fill it, then tell that minion to read it" >&2
+    # Its worktree was cut before this brief existed, so dispatch had no branch to
+    # read and fell back to `siana/<task-id>`. Everything downstream now reads the
+    # line written above instead, and the two disagree: the pipeline refuses that
+    # worktree as being on the wrong branch, and it is right to. Said here because
+    # this is the moment it becomes true, and nothing later can tell it happened.
+    if [ -n "$branch" ]; then
+        echo "         its worktree predates this brief, so it is on siana/$id and" >&2
+        echo "         not $branch; that minion has to be re-dispatched, or this" >&2
+        echo "         brief has to name the branch it is actually on" >&2
+    fi
 fi

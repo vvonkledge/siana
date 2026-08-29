@@ -13,7 +13,12 @@ import json
 import os
 import unittest
 
-from helpers import HomeTest
+from helpers import HomeTest, script
+
+# The branch reader, through one of the five commands that carry it.
+# `tests/test_ship_branch.py::OneReader` compares the five copies as
+# text, so what this one answers is what all five answer.
+d = script("siana-dispatch")
 
 
 class Brief(HomeTest):
@@ -53,6 +58,10 @@ class Brief(HomeTest):
         self.assertIsNotNone(found, f"no record for {task_id}")
         return found
 
+    def brief_text(self, task_id):
+        with open(self.at("briefs", f"{task_id}.md")) as fh:
+            return fh.read()
+
     def show(self, task_id):
         return self.assertAccepted(
             self.run_cmd(["tasks", "--file", self.at("tasks.jsonl"), "show", task_id]))
@@ -91,6 +100,213 @@ class Arguments(Brief):
         out = self.assertAccepted(self.brief("--help"))
         self.assertIn("--ship", out)
         self.assertIn("--scout", out)
+        self.assertIn("--type", out)
+
+
+class CommitType(Brief):
+    """The one place a ship task's Conventional Commit type is ever stated.
+
+    Everything downstream reads the branch that follows from it, so a type guessed
+    later - off a title, a diff, a commit - would be a statement about what the work
+    turned out to be, made by something that never held the contract. There is
+    nowhere else to state it, so every way of getting it wrong has to stop here.
+    """
+
+    def test_ship_work_with_no_type_is_refused(self):
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        self.assertRefused(self.brief(tid, "--ship"), "needs a commit type")
+        # Nothing half-made: no brief to refuse to rewrite, and no QA task queued
+        # against a branch no minion will ever be put on.
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+        self.assertEqual(self.ids(), [tid])
+
+    def test_a_type_that_is_not_a_conventional_commit_type_is_refused(self):
+        # A branch named for anything else announces a commit the project's CI
+        # rejects on the merge request.
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        out = self.brief(tid, "--ship", "--type", "wip")
+        self.assertRefused(out, "wip is not a Conventional Commit type", "refactor")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+        self.assertEqual(self.ids(), [tid])
+
+    def test_a_run_of_valid_types_is_not_a_valid_type(self):
+        """The gate this replaces asked whether `" $type "` fell inside
+        `" build chore ci docs feat fix perf refactor revert style test "`, so any
+        adjacent run of the list matched it, bounded by spaces on both sides.
+        `--type 'ci docs'` was accepted and wrote `siana/ci docs/<id>`: a name git
+        refuses to create, and one the branch line cannot carry back, because it
+        holds a single token. Every reader then answered the legacy `siana/<id>`
+        while the QA task queued here waited on a base nobody ever made, so the
+        split first showed up at a QA dispatch, long after the work was finished."""
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        for bad in ("ci docs", "chore ci", "revert style test",
+                    "build chore ci docs feat fix perf refactor revert style test"):
+            with self.subTest(bad=bad):
+                self.assertRefused(self.brief(tid, "--ship", "--type", bad),
+                                   "is not a Conventional Commit type")
+                # Refused before the home is touched, so there is no brief to
+                # rewrite and no QA task standing on an impossible base.
+                self.assertFalse(os.path.exists(self.at("briefs")))
+                self.assertEqual(self.ids(), [tid])
+
+    def test_a_type_carrying_whitespace_is_refused(self):
+        # The whole argument is what is compared, so a type wearing a space, a tab
+        # or a newline is not that type. Any of them would reach the branch name.
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        for bad in (" docs", "docs ", "\tdocs", "docs\t", "\ndocs", "docs\n",
+                    "do cs", "docs\ndocs"):
+            with self.subTest(bad=repr(bad)):
+                self.assertRefused(self.brief(tid, "--ship", "--type", bad),
+                                   "is not a Conventional Commit type")
+                self.assertFalse(os.path.exists(self.at("briefs")))
+                self.assertEqual(self.ids(), [tid])
+
+    def test_a_type_shaped_like_a_glob_is_refused(self):
+        # Matched, never pattern-matched: a type is compared for equality, so a
+        # metacharacter is a character and stands for nothing but itself.
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        for bad in ("*", "?", "[cf]i", "d*", "doc?", "fea*"):
+            with self.subTest(bad=bad):
+                self.assertRefused(self.brief(tid, "--ship", "--type", bad),
+                                   "is not a Conventional Commit type")
+                self.assertFalse(os.path.exists(self.at("briefs")))
+                self.assertEqual(self.ids(), [tid])
+
+    def test_a_type_that_is_part_of_a_type_is_refused(self):
+        # A near miss is a miss. `doc` names no Conventional Commit category, and a
+        # branch built from one announces a commit its project's CI rejects.
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        for bad in ("doc", "docs2", "Docs", "re", "fi", "cs fea"):
+            with self.subTest(bad=bad):
+                self.assertRefused(self.brief(tid, "--ship", "--type", bad),
+                                   "is not a Conventional Commit type")
+                self.assertFalse(os.path.exists(self.at("briefs")))
+                self.assertEqual(self.ids(), [tid])
+
+    def test_an_empty_type_is_refused_as_a_missing_one(self):
+        # Both spellings of nothing. There is no type to state, and stating none is
+        # the case the required flag already covers.
+        self.project("proj")
+        tid = self.add("Build a thing")
+        self.assertRefused(self.brief(tid, "--ship", "--type", ""),
+                           "needs a commit type")
+        self.assertRefused(self.brief(tid, "--ship", "--type="),
+                           "needs a commit type")
+        self.assertFalse(os.path.exists(self.at("briefs")))
+
+    def test_every_supported_type_is_accepted_whole_and_read_back_the_same(self):
+        """The writer and the readers have to agree on one name. They disagreed for
+        any type the old gate let through in more than one word, and that
+        disagreement was silent: what was written was unreadable, so the readers
+        answered `siana/<id>` and the QA task queued beside it named the other. Each
+        of the eleven, stated whole, is accepted and comes back exactly as written -
+        out of the brief, out of the reader, and off the QA task's base."""
+        self.project("proj", qa="just qa")
+        for type_ in ("build", "chore", "ci", "docs", "feat", "fix", "perf",
+                      "refactor", "revert", "style", "test"):
+            with self.subTest(type=type_):
+                tid = self.add(f"Do the {type_} thing")
+                out = self.assertAccepted(
+                    self.brief(tid, "--ship", "--type", type_))
+                branch = f"siana/{type_}/{tid}"
+                self.assertIn(branch, out)
+                self.assertIn(f"    branch  {branch}", self.brief_text(tid))
+                self.assertEqual(d.ship_branch(self.home, tid), branch)
+                self.assertEqual(self.record(f"qa-{tid}")["base"], branch)
+
+    def test_a_type_with_no_value_is_refused(self):
+        self.project("proj")
+        tid = self.add("Build a thing")
+        self.assertRefused(self.brief(tid, "--ship", "--type"), "--type needs a")
+
+    def test_two_types_are_refused(self):
+        self.project("proj")
+        tid = self.add("Build a thing")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "feat",
+                                      "--type", "fix"), "one type at a time")
+
+    def test_the_joined_spelling_is_accepted_too(self):
+        # The near miss is otherwise `unknown option`, which says nothing about the
+        # type, and a retype costs SIANA a whole turn.
+        self.project("proj")
+        tid = self.add("Build a thing")
+        self.assertAccepted(self.brief(tid, "--ship", "--type=perf"))
+        self.assertIn(f"siana/perf/{tid}", self.brief_text(tid))
+
+    def test_scout_work_is_refused_a_type(self):
+        # A scout lands nothing, so there is no commit for a type to describe.
+        self.project("proj")
+        tid = self.add("Learn a thing")
+        self.assertRefused(self.brief(tid, "--scout", "--type", "docs"),
+                           "--type is for ship work")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_the_ship_brief_records_the_branch_the_type_makes(self):
+        # The brief is the fleet's only record of the type, so this line is what
+        # dispatch, the pipeline, publishing, retiring and reaping all read.
+        self.project("proj")
+        tid = self.add("Write the guide")
+        out = self.assertAccepted(self.brief(tid, "--ship", "--type", "docs"))
+        self.assertIn(f"siana/docs/{tid}", out)
+        text = self.brief_text(tid)
+        self.assertIn(f"    branch  siana/docs/{tid}", text)
+        # Filled in by the script, so it is never one of the placeholders SIANA is
+        # asked to fill: a branch name typed twice is one that can disagree.
+        self.assertNotIn("{SHIP_BRANCH}", text)
+        self.assertNotIn("{SHIP_BRANCH}", out)
+
+    def test_a_ship_template_that_records_no_branch_is_refused(self):
+        """The home's copy of this template is the captain's to evolve, and `just
+        init` keeps a diverged one on purpose. One that has lost the marker writes a
+        brief recording no branch, so every reader answers `siana/<id>` while the QA
+        task queued behind it is cut from the typed branch. That split is invisible
+        until a QA dispatch fails on a base nobody created."""
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\nCommit on {SHIP_BRANCH}.\n")
+        out = self.brief(tid, "--ship", "--type", "feat")
+        self.assertRefused(out, "does not record the branch where every command")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+        self.assertEqual(self.ids(), [tid])
+
+    def test_the_branch_line_under_another_heading_is_refused(self):
+        """The readers only look inside `## Delivery: ship`, so a template keeping
+        the exact line but moving it under a heading of its own is the same split
+        wearing a passing check: what this verifies has to be the line they find."""
+        self.project("proj", qa="just qa")
+        tid = self.add("Build a thing")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\nYour work lands.\n\n"
+                     "## Your branch\n\n    branch  {SHIP_BRANCH}\n")
+        out = self.brief(tid, "--ship", "--type", "feat")
+        self.assertRefused(out, "where every command looks for it",
+                           "under any other heading it is prose")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+        self.assertEqual(self.ids(), [tid])
+
+    def test_a_ship_template_that_lost_the_marker_entirely_is_refused(self):
+        self.project("proj")
+        tid = self.add("Build a thing")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\nYour work lands.\n")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "feat"),
+                           "does not record the branch where every command")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_scout_brief_names_no_branch(self):
+        # Its name is a role in this fleet and not a category of change, so there is
+        # nothing to record and `siana/<task-id>` is what every command falls to.
+        self.project("proj")
+        tid = self.add("Learn a thing")
+        self.assertAccepted(self.brief(tid, "--scout"))
+        self.assertNotIn("branch  siana/", self.brief_text(tid))
 
 
 class Refusals(Brief):
@@ -120,7 +336,8 @@ class Refusals(Brief):
     def test_a_ship_task_naming_an_unknown_project_is_refused(self):
         # Dispatch would refuse it for the same reason, so it stops here.
         tid = self.add("Do a thing", project="ghost")
-        self.assertRefused(self.brief(tid, "--ship"), "unknown project: ghost")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "feat"),
+                           "unknown project: ghost")
 
 
 class Scaffolding(Brief):
@@ -142,7 +359,7 @@ class Scaffolding(Brief):
     def test_a_ship_brief_is_the_ship_template(self):
         self.project("proj")
         tid = self.add("Build a thing")
-        self.assertAccepted(self.brief(tid, "--ship"))
+        self.assertAccepted(self.brief(tid, "--ship", "--type", "feat"))
         with open(self.at("briefs", f"{tid}.md")) as fh:
             self.assertIn("Delivery: ship", fh.read())
 
@@ -163,9 +380,15 @@ class Scaffolding(Brief):
         self.assertAccepted(self.run_cmd(
             ["tasks", "--file", self.at("tasks.jsonl"), "start", tid,
              "--owner", "claude@w1:p1"]))
-        out = self.assertAccepted(self.brief(tid, "--ship"))
+        out = self.assertAccepted(self.brief(tid, "--ship", "--type", "fix"))
         self.assertIn("late", out)
         self.assertTrue(os.path.exists(self.at("briefs", f"{tid}.md")))
+        # Its worktree was cut before this brief named a branch, so dispatch fell
+        # back to `siana/<id>` and everything downstream now reads a different name.
+        # The pipeline refuses that worktree for it, and this is the moment it
+        # became true, so it is the moment to say so.
+        self.assertIn(f"it is on siana/{tid} and", out)
+        self.assertIn(f"not siana/fix/{tid}", out)
 
 
 class QaPairing(Brief):
@@ -176,20 +399,21 @@ class QaPairing(Brief):
         self.project("proj")
         tid = self.add("Build a thing")
         before = self.ids()
-        self.assertAccepted(self.brief(tid, "--ship"))
+        self.assertAccepted(self.brief(tid, "--ship", "--type", "feat"))
         self.assertEqual(self.ids(), before)
 
     def test_a_project_with_qa_queues_the_task_that_will_judge_the_work(self):
         self.project("proj", qa="just qa")
         tid = self.add("Build a thing")
-        out = self.assertAccepted(self.brief(tid, "--ship"))
+        out = self.assertAccepted(self.brief(tid, "--ship", "--type", "docs"))
         self.assertIn("paired", out)
         self.assertIn("just qa", out)
         new = [i for i in self.ids() if i != tid]
         self.assertEqual(len(new), 1, self.ids())
         qa = self.record(new[0])
         self.assertEqual(qa["deps"], [tid])          # ready the moment the work is back
-        self.assertEqual(qa["base"], f"siana/{tid}")  # cut from the branch it judges
+        # Cut from the branch it judges, type and all.
+        self.assertEqual(qa["base"], f"siana/docs/{tid}")
         self.assertEqual(qa["project"], "proj")
         self.assertIn("just qa", qa["verify"])       # runs the project's own command
         self.assertIn("reports/$SIANA_TASK_ID.md", qa["verify"])  # report must exist
@@ -199,12 +423,12 @@ class QaPairing(Brief):
         # What makes QA cost nothing per task, and therefore get used.
         self.project("proj", qa="just qa")
         tid = self.add("Build a thing")
-        self.assertAccepted(self.brief(tid, "--ship"))
+        self.assertAccepted(self.brief(tid, "--ship", "--type", "refactor"))
         qa_id = [i for i in self.ids() if i != tid][0]
         with open(self.at("briefs", f"{qa_id}.md")) as fh:
             text = fh.read()
         self.assertIn(tid, text)
-        self.assertIn(f"siana/{tid}", text)
+        self.assertIn(f"siana/refactor/{tid}", text)
         self.assertNotIn("{SHIP_TASK}", text)
         self.assertNotIn("{SHIP_BRANCH}", text)
 
@@ -220,14 +444,16 @@ class QaPairing(Brief):
         # project is recorded as having neither.
         self.project("proj", qa="just qa", worktree="false")
         tid = self.add("Build a thing")
-        self.assertRefused(self.brief(tid, "--ship"), "git cannot branch it")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "feat"),
+                           "git cannot branch it")
         self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
 
     def test_a_missing_qa_template_is_refused_before_briefing(self):
         os.remove(self.at("brief-qa.md"))
         self.project("proj", qa="just qa")
         tid = self.add("Build a thing")
-        self.assertRefused(self.brief(tid, "--ship"), "no qa brief template")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "feat"),
+                           "no qa brief template")
         self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
 
     def test_a_qa_command_spanning_two_lines_is_refused(self):
@@ -235,14 +461,15 @@ class QaPairing(Brief):
         # would leave a QA task verifying something nobody wrote.
         self.project("proj", qa="just qa\necho hi")
         tid = self.add("Build a thing")
-        self.assertRefused(self.brief(tid, "--ship"), "more than one line")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "feat"),
+                           "more than one line")
 
     def test_a_qa_command_carrying_a_colon_survives_intact(self):
         # Read from the registry rather than parsed out of `tasks show`, because
         # TOON escapes a value like this on the way out.
         self.project("proj", qa='pytest -k "a: b"')
         tid = self.add("Build a thing")
-        self.assertAccepted(self.brief(tid, "--ship"))
+        self.assertAccepted(self.brief(tid, "--ship", "--type", "feat"))
         qa_id = [i for i in self.ids() if i != tid][0]
         self.assertIn('pytest -k "a: b"', self.record(qa_id)["verify"])
 

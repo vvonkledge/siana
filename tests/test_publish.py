@@ -146,6 +146,23 @@ class Refusals(HomeTest):
         self.assertRefused(out, "is not a QA task",
                            "publishing it would ship the state before the work")
 
+    def test_a_missing_ship_brief_says_so_and_not_something_false(self):
+        """The branch a verdict judged is read out of the ship task's brief, so a
+        brief that is not there makes that read answer `siana/<ship-id>` - a name
+        typed work never had. Asked in that order, this refused with "is not a QA
+        task", which is a false statement about the queue standing in for a true one
+        about a missing file."""
+        self.store("tasks.jsonl", self.qa_task(base="siana/feat/add-json"))
+        self.store("tasks.jsonl",
+                   {"id": "add-json", "title": "Add a --json flag", "status": "done",
+                    "verify": "just test", "verify_kind": "cmd", "deps": [],
+                    "context": [], "project": "demo",
+                    "updated": "2026-08-28T09:00:00Z"})
+        self.project("demo", target="main")
+        out = self.run_bin("siana-publish", "qa-add-json")
+        self.assertRefused(out, "no brief at")
+        self.assertNotIn("is not a QA task", out.stdout + out.stderr)
+
     def test_a_project_that_is_not_a_repository(self):
         # `git rev-parse --verify` fails the same way in a non-repository as it does
         # for a branch that is genuinely gone, and the two are fixed differently.
