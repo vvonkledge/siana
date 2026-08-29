@@ -8,6 +8,11 @@ Whoever reads it has not read your brief, was not told what this fleet is, and i
 deciding whether to merge. Write for them. Past tense, about what the change does
 and what it costs, never about the task that produced it.
 
+Nothing in it may point into this fleet's own home: not the resolved path, not
+`$SIANA_HOME`, and not `~/.siana`. A reviewer cannot follow any of those, and what
+they hold was written for SIANA rather than for a reader. Say where a thing is in
+words instead.
+
 Write it after your last commit, because the head below binds this copy to that
 commit and publication refuses a copy that describes an older one. Then check it:
 

@@ -260,7 +260,10 @@ validates the document and assembles it: five sections, none of them empty, one 
 inside a subject line's width, and a recorded commit that has to be the head the QA
 minion accepted. A handoff that is missing, still carrying its scaffolding, malformed
 or left behind by a later commit refuses the publish rather than travelling with work
-it does not describe, and nothing in that path asks a model.
+it does not describe, and nothing in that path asks a model. So does one that points
+into `~/.siana`, in any of the ways that directory gets written: a reviewer cannot
+follow a path onto the captain's machine, and what is under it was written for SIANA
+and not for them.
 
 The brief never travels. It was written before the work existed, by an agent briefing
 a minion, so it can say what was asked for and not what was built, what it was

@@ -54,6 +54,19 @@ TITLE_LIMIT = 72
 # of concrete detail.
 PLACEHOLDER = re.compile(r"\{[A-Z_]+\}")
 
+# Where the home sits when nothing overrode it. Read by `main` and by the guard that
+# refuses a path into it, so the default and the spellings of it cannot drift apart:
+# a guard that did not know the default would let the README's own way of writing it
+# through.
+DEFAULT_HOME = "~/.siana"
+
+# A fenced block opens here: the marker, then whatever info string follows it. Both
+# markers, and any length from three up, because a longer run is how a fence quotes a
+# shorter one and an example of this very document needs exactly that. Up to three
+# leading spaces, which is what markdown itself reads as a fence rather than as
+# indented code.
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
 
 def die(message: str, *hints: str):
     print(f"error: {message}", file=sys.stderr)
@@ -81,32 +94,128 @@ def preamble(text: str) -> str:
     return text.split("\n## ", 1)[0]
 
 
-def sections(text: str):
+def fence_opens(line: str):
+    """The marker a fence opens with, or `None` for a line that opens none.
+
+    A backtick fence's info string may not itself hold a backtick, which is markdown's
+    own rule and the one that keeps a sentence beginning with a code span from being
+    read as the start of a block nothing ever closes."""
+    opens = FENCE.match(line)
+    if not opens or (opens.group(1)[0] == "`" and "`" in opens.group(2)):
+        return None
+    return opens.group(1)
+
+
+def fence_closes(marker: str, line: str) -> bool:
+    """A line that closes a fence opened with `marker`.
+
+    The same character and at least as many of them, with nothing else on the line.
+    Both halves matter: a shorter run of the same marker is how a fenced example
+    quotes another fence, and a run of the other marker is content."""
+    return bool(re.fullmatch(rf" {{0,3}}{marker[0]}{{{len(marker)},}}[ \t]*", line))
+
+
+def uncomment(line: str, in_comment: bool):
+    """The line with its `<!-- ... -->` spans cut out, and whether one is still open.
+
+    Returns `None` for a line that held nothing but comment, so a scaffold's guidance
+    block disappears while a blank line an author typed survives it.
+
+    The prose on either side of a comment is kept, both sides of it. Dropping the
+    whole line was the inherited behaviour, and it deleted a sentence outright
+    whenever an author wrote a note at the end of one, without saying so - the same
+    choice this file refuses to make for a duplicate section, made silently.
+
+    A comment is cut out as a whole word rather than as characters: what is left is
+    joined by a single space, because the whitespace around a comment was holding it
+    apart from the prose and belongs to it."""
+    kept, rest, had = [], line, in_comment
+    while rest:
+        if in_comment:
+            _, closed, rest = rest.partition("-->")
+            if not closed:
+                break
+            in_comment = False
+            continue
+        before, opened, rest = rest.partition("<!--")
+        kept.append(before)
+        if not opened:
+            break
+        had, in_comment = True, True
+    if not had:
+        return line, in_comment
+    return " ".join(p for p in (k.strip() for k in kept) if p) or None, in_comment
+
+
+def sections(text: str, path: str = "the handoff"):
     """The `## ` sections, as (heading, body) in the order they appear.
 
-    `<!-- ... -->` blocks are guidance to whoever fills the template in, so they
-    are stripped rather than published. Duplicates are kept rather than folded:
-    two `## Hotspots` is a document whose author lost track of one of them, and
-    which of the two travels is not a choice this may make on their behalf."""
-    found, heading, body, in_comment = [], None, [], False
+    `<!-- ... -->` blocks are guidance to whoever fills the template in, so they are
+    stripped rather than published. Duplicates are kept rather than folded: two
+    `## Hotspots` is a document whose author lost track of one of them, and which of
+    the two travels is not a choice this may make on their behalf.
+
+    Nothing inside a fenced block is read at all: a `## Intent` in a quoted markdown
+    example is what the example says and not a second section. That case is not
+    exotic here - this fleet's work on its own distro is mostly the markdown other
+    agents are briefed with - and reading one as a heading refused the document with
+    a statement about it that was not true.
+
+    A fence or a comment nobody closed is refused rather than run to the end of the
+    document. Either one silently swallows every section after it, and a handoff
+    missing four of its five sections is reported as the wrong fault entirely."""
+    found, heading, body = [], None, []
+    fence, in_comment = None, False
     for line in text.splitlines():
-        if line.startswith("## "):
+        if fence is not None:
             if heading is not None:
-                found.append((heading, "\n".join(body).strip()))
-            heading, body, in_comment = line[3:].strip(), [], False
+                body.append(line)
+            if fence_closes(fence, line):
+                fence = None
             continue
-        if heading is None:
-            continue
-        if in_comment:
-            in_comment = "-->" not in line
-            continue
-        if "<!--" in line:
-            in_comment = "-->" not in line
-            continue
-        body.append(line)
+        if not in_comment:
+            opens = fence_opens(line)
+            if opens is not None:
+                fence = opens
+                if heading is not None:
+                    body.append(line)
+                continue
+            if line.startswith("## "):
+                if heading is not None:
+                    found.append((heading, "\n".join(body).strip()))
+                # Read through the same stripper as the body, so a heading carrying a
+                # note is the section it names rather than an unknown one.
+                named, in_comment = uncomment(line, False)
+                heading, body = (named or "")[3:].strip(), []
+                continue
+        kept, in_comment = uncomment(line, in_comment)
+        if heading is not None and kept is not None:
+            body.append(kept)
+    if fence is not None:
+        die(f"{path} opens a fenced block that nothing closes",
+            "everything after it reads as part of the example, so the sections",
+            "below it are not sections and this document is not the one you wrote",
+            f"close it with a line of {fence} on its own")
+    if in_comment:
+        die(f"{path} opens a `<!--` that nothing closes",
+            "everything after it is a comment, so the prose and the sections below",
+            "it would be dropped from the merge request without a word",
+            "close it with `-->`")
     if heading is not None:
         found.append((heading, "\n".join(body).strip()))
     return found
+
+
+def local_forms(home: str):
+    """Every way the captain's home gets written, resolved and unresolved.
+
+    The variable in both of the shapes a shell writes it in, the default directory in
+    both of the ways a path under a home is written, and the resolved directory
+    itself. They all name the same machine, so they are all equally unfollowable to a
+    reviewer who is not on it."""
+    tail = DEFAULT_HOME.lstrip("~")
+    return (home, "$SIANA_HOME", "${SIANA_HOME}",
+            DEFAULT_HOME, f"$HOME{tail}", f"${{HOME}}{tail}")
 
 
 def refuse_local(path: str, where: str, text: str, home: str):
@@ -116,14 +225,22 @@ def refuse_local(path: str, where: str, text: str, home: str):
     either a pointer nobody outside this machine can follow or a quote from something
     written for SIANA alone. Neither is review material.
 
-    Both spellings, because a minion writes the resolved path as often as the
-    variable it read it from, and the variable is the more misleading of the two on a
-    forge: it looks like a path anyone could follow.
+    Every spelling of it, because a minion writes the resolved path as often as the
+    variable it read it from, and neither of those is the only way it gets written.
+    The list was once the resolved path and `$SIANA_HOME` alone, and what walked past
+    it was `~/.siana`, which is how this project's own README spells the directory,
+    and `${SIANA_HOME}`, which is how a shell script writes the variable. A guard that
+    catches one spelling of a path is a guard whose author believes it catches the
+    path.
 
     Applied to the title as well as to the sections. The title is the single most
     visible line on the page, so it is the last place a leak should have been allowed
-    to go unread."""
-    for local in (home, "$SIANA_HOME"):
+    to go unread.
+
+    The form that matched is named and the line carrying it is not: what is around it
+    is the author's prose, and quoting it back would print the captain-local material
+    this exists to keep from travelling."""
+    for local in local_forms(home):
         if local in text:
             die(f"{where} of {path} names {local}",
                 "that path is the captain's machine and nowhere else, and what",
@@ -196,7 +313,7 @@ def read(path: str, task_id: str, home: str, head: str = None):
             "rewrite it against the head that was accepted:",
             f"  siana-handoff {task_id} --head {head}")
 
-    found = sections(text)
+    found = sections(text, path)
     headings = [heading for heading, _ in found]
     unknown = [h for h in headings if h not in SECTIONS]
     if unknown:
@@ -275,7 +392,7 @@ def main() -> None:
                     help="print the title and body as one object, for a caller")
     args = ap.parse_args()
 
-    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    home = os.environ.get("SIANA_HOME", os.path.expanduser(DEFAULT_HOME))
     path = os.path.join(home, "handoffs", f"{args.task_id}.md")
 
     if args.scaffold:

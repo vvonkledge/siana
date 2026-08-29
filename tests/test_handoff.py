@@ -53,6 +53,16 @@ review costs.
 """
 
 
+def printed(block):
+    """A block of the body as the command prints it: every line behind two spaces,
+    the blank ones included.
+
+    Asserted to the character where a defect was prose going missing between the
+    document and the forge. That is the one failure nothing downstream can catch,
+    because what arrives still reads like something somebody wrote."""
+    return "".join(f"  {line}\n" for line in block.splitlines())
+
+
 def filled(head=HEAD, **replace):
     text = FILLED.format(head=head)
     for old, new in replace.items():
@@ -76,6 +86,64 @@ class Parsing(unittest.TestCase):
                 "## Solution\n\nwhat was done.\n")
         self.assertEqual(handoff.sections(text),
                          [("Intent", "the problem."), ("Solution", "what was done.")])
+
+    def test_prose_beside_a_comment_keeps_the_prose(self):
+        # The inherited stripper dropped the whole line whenever `<!--` appeared on
+        # it, so a sentence with a note written at the end of it left the document
+        # without a word said about either.
+        text = ("## Hotspots\n\nThe parser drops a line like this. <!-- a note -->\n"
+                "This line survives.\n")
+        self.assertEqual(
+            handoff.sections(text),
+            [("Hotspots",
+              "The parser drops a line like this.\nThis line survives.")])
+
+    def test_prose_after_a_comment_on_the_same_line_is_kept_too(self):
+        text = "## Hotspots\n\nbefore <!-- a note --> after\n"
+        self.assertEqual(handoff.sections(text), [("Hotspots", "before after")])
+
+    def test_a_comment_spanning_lines_keeps_both_ends_apart(self):
+        # Two lines and not one: prose the author wrote on separate lines is not
+        # merged by a comment happening to run between them.
+        text = "## Hotspots\n\nbefore <!-- a\nb --> after\n"
+        self.assertEqual(handoff.sections(text), [("Hotspots", "before\nafter")])
+
+    def test_a_heading_inside_a_fence_is_body(self):
+        # The example is what the section is about. This distro's work is mostly the
+        # markdown other agents are briefed with, so a handoff that could not quote a
+        # heading could not say what it changed.
+        text = "## Solution\n\n```markdown\n## Intent\n\nwhat was wrong.\n```\n"
+        self.assertEqual(
+            handoff.sections(text),
+            [("Solution", "```markdown\n## Intent\n\nwhat was wrong.\n```")])
+
+    def test_a_tilde_fence_is_a_fence(self):
+        text = "## Solution\n\n~~~markdown\n## Intent\n~~~\n\nafter.\n"
+        found = handoff.sections(text)
+        self.assertEqual([h for h, _ in found], ["Solution"])
+        self.assertTrue(found[0][1].endswith("after."))
+
+    def test_a_fence_closes_on_its_own_marker_at_its_own_length(self):
+        # A longer run is how one fence quotes another, so the three-backtick lines
+        # inside a five-backtick block are content and neither of them ends it.
+        text = "## Solution\n\n`````\n```\n## Intent\n```\n`````\n\nafter.\n"
+        found = handoff.sections(text)
+        self.assertEqual([h for h, _ in found], ["Solution"])
+        self.assertTrue(found[0][1].endswith("after."))
+
+    def test_a_sentence_opening_with_a_code_span_is_not_a_fence(self):
+        # Markdown's own rule: a backtick fence's info string may not hold a
+        # backtick. Without it, prose that starts with a quoted piece of code opens a
+        # block nothing closes, and the document is refused for a fence it never had.
+        text = "## Hotspots\n\n```json``` is the shape a caller reads.\n"
+        self.assertEqual(handoff.sections(text),
+                         [("Hotspots", "```json``` is the shape a caller reads.")])
+
+    def test_a_comment_may_hold_a_heading(self):
+        # Guidance about the sections is guidance, not a section. It is removed with
+        # the rest of the comment rather than splitting the document.
+        text = "## Hotspots\n\n<!-- say why, as in\n## Intent\n-->\nreal prose.\n"
+        self.assertEqual(handoff.sections(text), [("Hotspots", "real prose.")])
 
     def test_a_repeated_section_is_kept_as_two(self):
         # Folded into one, whichever of them travelled would be a choice made for
@@ -197,6 +265,58 @@ class Refusals(HomeTest):
         out = self.check(filled() + "\n## Hotspots\n\nsomething else.\n")
         self.assertRefused(out, "more than one `## Hotspots` section")
 
+    def test_a_line_carrying_a_note_publishes_its_prose(self):
+        """The first of the three the QA of this parser's own branch reproduced.
+
+        Published as written minus the note, and the exact body asserted: a sentence
+        deleted on the way to a forge is the one failure nothing downstream can see,
+        because what arrives still reads like a document somebody wrote."""
+        text = self.assertAccepted(self.check(filled().replace(
+            "`bin/siana-pipeline`, where the base is chosen: a task that names no base"
+            " now\nmeasures from where it forked, and that is the path a legacy task"
+            " takes.",
+            "The parser drops a line like this. <!-- a note to self -->\n"
+            "This line survives."), "--head", HEAD))
+        self.assertIn(printed("## Hotspots\n\nThe parser drops a line like this.\n"
+                              "This line survives."), text)
+        self.assertNotIn("a note to self", text)
+
+    def test_a_markdown_example_of_a_section_is_not_a_section(self):
+        """The second. `## Intent` inside a fenced example was read as a real
+        duplicate, and the document was refused with a statement about itself that
+        was not true."""
+        text = self.assertAccepted(self.check(filled().replace(
+            "The base is taken from the merge base of the recorded target, and an "
+            "explicit base\nthe head is not descended from is refused rather than "
+            "silently widened.",
+            "The template now offers:\n\n```markdown\n## Intent\n\nwhat was "
+            "wrong.\n```\n\nand nothing else."), "--head", HEAD))
+        self.assertIn(printed("## Solution\n\nThe template now offers:\n\n"
+                              "```markdown\n## Intent\n\nwhat was wrong.\n```\n\n"
+                              "and nothing else."), text)
+
+    def test_a_fence_still_leaves_a_real_duplicate_refused(self):
+        # The fence is read past, not read as licence. A second `## Hotspots` outside
+        # one is still a document whose author lost track of a section.
+        out = self.check(filled().replace(
+            "`bin/siana-pipeline`, where",
+            "```markdown\n## Hotspots\n```\n\n`bin/siana-pipeline`, where")
+            + "\n## Hotspots\n\nsomething else.\n")
+        self.assertRefused(out, "more than one `## Hotspots` section")
+
+    def test_a_fence_nothing_closes(self):
+        # Refused rather than run to the end of the document: an unclosed fence
+        # swallows every section after it, and what it reports then is four missing
+        # sections, which is the wrong fault entirely.
+        out = self.check(filled().replace("`bin/siana-pipeline`, where",
+                                          "```markdown\n## Intent\n\nwhere"))
+        self.assertRefused(out, "opens a fenced block that nothing closes", "```")
+
+    def test_a_comment_nothing_closes(self):
+        out = self.check(filled().replace("`bin/siana-pipeline`, where",
+                                          "<!-- a note that never ends. where"))
+        self.assertRefused(out, "opens a `<!--` that nothing closes", "-->")
+
     def test_a_path_that_only_exists_on_the_captains_machine(self):
         out = self.check(filled().replace(
             "`bin/siana-pipeline`, where", f"{self.home}/reports and where"))
@@ -206,6 +326,34 @@ class Refusals(HomeTest):
         out = self.check(filled().replace("`just test` passes",
                                           "see $SIANA_HOME/reports; `just test` passes"))
         self.assertRefused(out, "names $SIANA_HOME")
+
+    def test_the_home_written_the_way_the_readme_writes_it(self):
+        """The third, and the one an author is likeliest to reach for: `~/.siana` is
+        how this project's own README spells the directory."""
+        out = self.check(filled().replace(
+            "`just test` passes", "see ~/.siana/reports; `just test` passes"))
+        self.assertRefused(out, "names ~/.siana", "the captain's machine")
+
+    def test_the_variable_written_the_way_a_script_writes_it(self):
+        out = self.check(filled().replace(
+            "`just test` passes", "see ${SIANA_HOME}/reports; `just test` passes"))
+        self.assertRefused(out, "names ${SIANA_HOME}")
+
+    def test_the_same_directory_reached_through_the_home_variable(self):
+        for form in ("$HOME/.siana", "${HOME}/.siana"):
+            with self.subTest(form=form):
+                out = self.check(filled().replace(
+                    "`just test` passes", f"see {form}/reports; `just test` passes"))
+                self.assertRefused(out, f"names {form}")
+
+    def test_the_refusal_names_the_form_and_not_the_line(self):
+        # What surrounds the path is the author's prose, and a refusal that quoted it
+        # back would print the captain-local material this exists to keep in.
+        out = self.check(filled().replace(
+            "`just test` passes",
+            "the verdict in ~/.siana/reports/qa-add-json.md; `just test` passes"))
+        text = self.assertRefused(out, "names ~/.siana")
+        self.assertNotIn("qa-add-json.md", text)
 
     def test_a_title_that_names_the_captains_machine(self):
         # The title is the single most visible line on the page, and it used to be

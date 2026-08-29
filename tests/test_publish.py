@@ -90,6 +90,13 @@ across versions.
 """
 
 
+def printed(block):
+    """A block of the body as `--dry-run` prints it: every line behind two spaces,
+    the blank ones included. What a dry run is for is showing the exact copy, so what
+    it shows is asserted exactly."""
+    return "".join(f"  {line}\n" for line in block.splitlines())
+
+
 class Forge(unittest.TestCase):
     def test_recognised_hosts(self):
         self.assertEqual(publish.forge_of("git@gitlab.com:apm-dev/apm-web.git"), "gitlab")
@@ -305,6 +312,41 @@ class DryRun(Publishable):
         self.assertNotIn("The parser was rewritten", text)
         self.assertNotIn("Do not touch the config loader", text)
         self.assertNotIn("Your work lands", text)
+
+    def test_a_line_carrying_a_note_publishes_its_prose(self):
+        """The three defects independent QA found in the parser, driven from this end.
+
+        `test_handoff.py` holds the rules; these are the same three documents seen
+        from where they would have reached a forge, because the guarantee that
+        matters is about what a reviewer is sent and not about a return value."""
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "The empty queue prints `[]` and not nothing: a caller piping this into "
+            "`jq` sees a\ndocument either way, and that is the case the old table got "
+            "wrong.",
+            "The empty queue prints `[]` and not nothing. <!-- a note to self -->\n"
+            "A caller piping this into `jq` sees a document either way."))
+        text = self.dry()
+        self.assertIn(printed(
+            "## Hotspots\n\nThe empty queue prints `[]` and not nothing.\n"
+            "A caller piping this into `jq` sees a document either way."), text)
+        self.assertNotIn("a note to self", text)
+
+    def test_a_markdown_example_of_a_section_reaches_the_forge_as_written(self):
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "`--json` prints one object per task, from the same records the table is "
+            "built from,\nso the two cannot disagree about what a task is.",
+            "`--json` prints one object per task, as in:\n\n```markdown\n## Intent\n"
+            "\nwhat was wrong.\n```\n\nand nothing else changes."))
+        self.assertIn(printed(
+            "## Solution\n\n`--json` prints one object per task, as in:\n\n"
+            "```markdown\n## Intent\n\nwhat was wrong.\n```\n\n"
+            "and nothing else changes."), self.dry())
+
+    def test_the_captains_home_written_as_a_tilde_stops_it(self):
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "`just test` covers", "see ~/.siana/reports; `just test` covers"))
+        out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
+        self.assertRefused(out, "names ~/.siana", "nothing was pushed")
 
     def test_no_handoff_stops_it_before_anything_leaves(self):
         os.remove(self.at("handoffs", "add-json.md"))
