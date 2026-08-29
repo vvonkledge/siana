@@ -160,6 +160,28 @@ branch, or a fix that has to build on one. Read that branch off the ship task's 
 brief, which names it on one line; never assemble it from the task id, because a
 ship branch carries a commit type the id does not.
 
+**In a `pipeline` project it is also what the review is measured from**, so a `--base`
+you set has to be an ancestor of what the minion ends up with, and `siana-pipeline`
+refuses a run where it is not. That is a rule about where the work lands, not only
+about where it starts, and there is one kind of task that gets it wrong by succeeding:
+work whose job is to move a branch. A rebase replays the commits onto another line,
+which leaves the branch they came from off the finished history entirely, and a review
+measured from there reads every commit the two lines do not share - the whole of what
+the branch was replayed onto, with the actual change buried in it.
+
+So set `--base` to the ref the work is being replayed **onto**, which is the ancestor
+the finished branch should sit on, and name the branch being moved in the brief or on
+the task's `context` instead. There it is background the minion reads, which is all it
+ever was: the minion can reach any ref in the repository by name, and only one of them
+is what the change should be read against.
+
+Leaving `--base` off does not carry that rule, and this is the reason to keep leaving
+it off for ordinary work. The base is then the project's `target`, which is the line
+the work lands on and gains commits while the work is in flight; `siana-pipeline`
+measures such a task from the fork point it was cut from instead of refusing it. Only
+a base you named is held to the ref itself, because only that one is a contract you
+wrote.
+
 ## Briefing a minion
 
 The task record carries the checkable half of a contract: the project, the directory,

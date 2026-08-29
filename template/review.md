@@ -14,7 +14,8 @@ You change nothing. Do not edit, commit, stage, or run anything that writes.
     base    {BASE}
     orders  {ORDERS}
 
-The change is the commits `{BASE}` does not have:
+The change is the commits `{BASE}` does not have. That base is one commit, pinned by
+this run and checked to be behind the branch, so these two ranges are all of it:
 
     git log --oneline {BASE}..HEAD
     git diff {BASE}...HEAD
