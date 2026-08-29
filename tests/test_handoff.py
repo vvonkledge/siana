@@ -102,6 +102,21 @@ class Parsing(unittest.TestCase):
         text = "## Hotspots\n\nbefore <!-- a note --> after\n"
         self.assertEqual(handoff.sections(text), [("Hotspots", "before after")])
 
+    def test_a_note_at_the_end_of_a_line_leaves_the_line_where_it_was(self):
+        # Only the whitespace holding the comment apart from the prose belongs to the
+        # comment. The whitespace the line opens with is markdown: taking it too
+        # unindents a nested bullet and turns an indented example into a paragraph,
+        # which is the body silently re-rendered rather than the body as written.
+        text = ("## Hotspots\n\n- top\n  - nested <!-- a note -->\n\nand:\n\n"
+                "    siana-handoff x <!-- another -->\n")
+        self.assertEqual(
+            handoff.sections(text),
+            [("Hotspots", "- top\n  - nested\n\nand:\n\n    siana-handoff x")])
+
+    def test_a_comment_the_line_opens_with_leaves_the_indent_alone(self):
+        text = "## Hotspots\n\n- top\n  <!-- a note --> nested\n"
+        self.assertEqual(handoff.sections(text), [("Hotspots", "- top\n  nested")])
+
     def test_a_comment_spanning_lines_keeps_both_ends_apart(self):
         # Two lines and not one: prose the author wrote on separate lines is not
         # merged by a comment happening to run between them.

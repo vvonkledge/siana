@@ -126,10 +126,14 @@ def uncomment(line: str, in_comment: bool):
     whenever an author wrote a note at the end of one, without saying so - the same
     choice this file refuses to make for a duplicate section, made silently.
 
-    A comment is cut out as a whole word rather than as characters: what is left is
-    joined by a single space, because the whitespace around a comment was holding it
-    apart from the prose and belongs to it."""
-    kept, rest, had = [], line, in_comment
+    A comment is cut out as a whole word: the whitespace either side of one was
+    holding it apart from the prose and goes with it, so what is left is joined by a
+    single space. The whitespace the line opens with is not that whitespace, and it
+    stays. Stripping it too kept every character of the prose and still rewrote the
+    document: a note at the end of a nested bullet unindented the bullet, and one at
+    the end of an indented example turned the example into a paragraph. Silently
+    re-rendering the body is the same failure as silently dropping a line of it."""
+    kept, rest, had, started = [], line, in_comment, in_comment
     while rest:
         if in_comment:
             _, closed, rest = rest.partition("-->")
@@ -144,7 +148,19 @@ def uncomment(line: str, in_comment: bool):
         had, in_comment = True, True
     if not had:
         return line, in_comment
-    return " ".join(p for p in (k.strip() for k in kept) if p) or None, in_comment
+    text = ""
+    for i, piece in enumerate(kept):
+        if i or started:
+            # A comment was cut out just before this piece, so the gap it left closes
+            # up: to one space against prose, to nothing against the line's indent.
+            piece = piece.lstrip()
+            if not piece:
+                continue
+            if text.strip():
+                text = f"{text.rstrip()} {piece}"
+                continue
+        text += piece
+    return text.rstrip() or None, in_comment
 
 
 def sections(text: str, path: str = "the handoff"):
