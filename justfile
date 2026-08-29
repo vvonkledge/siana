@@ -113,7 +113,7 @@ init: _contract-drift
     # itself is written by the first `datafile put`, so an empty store is a schema
     # and no log. Never overwritten, for the reason the queue's contract is not: a
     # field dropped from a live contract makes every record carrying it unreadable.
-    for c in schema-projects schema-obligations; do
+    for c in schema-projects schema-obligations schema-decisions; do
         if [ -f "$home/$c.yaml" ]; then
             echo "current  $home/$c.yaml"
         else
@@ -121,6 +121,20 @@ init: _contract-drift
             echo "wrote    $home/$c.yaml"
         fi
     done
+
+    # The captain's principles. Never overwritten and never upgraded, for a reason
+    # neither the instructions nor the contracts have: it is the only file an
+    # advisory session lets SIANA read a principle from, and a distro that could
+    # rewrite it could rewrite what SIANA is held to. It ships with its placeholder
+    # unfilled, and `siana-afk` refuses to start while that placeholder is there, so
+    # a home that has never had principles written cannot run a night of proposals
+    # justified by a template.
+    if [ -f "$home/principles.md" ]; then
+        echo "kept     $home/principles.md (your principles)"
+    else
+        cp "$distro/template/principles.md" "$home/principles.md"
+        echo "wrote    $home/principles.md"
+    fi
 
     # The registry used to be a hand-edited projects.yaml. Say so rather than leave
     # a file that still looks authoritative but is read by nothing.
@@ -211,7 +225,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline siana-afk siana-gate; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -282,9 +296,12 @@ upgrade: _initialized init
     # project-contract drift announces itself, because `datafile` names the field it
     # rejected and `siana` refuses to start on a registry it cannot read.
     echo "kept     $home/projects.jsonl (the captain's registry)"
-    for c in schema-projects schema-obligations schema-tasks; do
+    for c in schema-projects schema-obligations schema-decisions schema-tasks; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
     done
+    # Never upgraded either, and for a different reason: a distro that could rewrite
+    # the principles could rewrite what SIANA is held to while the captain is away.
+    echo "kept     $home/principles.md (your principles)"
 
     # Say nothing worked until the queue has been read through the upgraded home.
     (cd "$home" && tasks >/dev/null) || { echo "the queue is not readable from $home" >&2; exit 1; }
@@ -385,7 +402,7 @@ doctor: _contract-drift
     set -uo pipefail
     home='{{home}}'
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md schema-projects.yaml schema-obligations.yaml schema-tasks.yaml; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md principles.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-tasks.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -399,6 +416,11 @@ doctor: _contract-drift
     if [ -e "$home/obligations.jsonl" ]; then echo "  ok      obligations.jsonl"
     elif [ -e "$home/schema-obligations.yaml" ]; then echo "  ok      obligations.jsonl (empty; written on the first promise)"
     else echo "  missing obligations.jsonl"; fi
+    # A home that has never run an advisory session has no ledger at all, which is
+    # the zero and not a fault, exactly as the three stores above are.
+    if [ -e "$home/decisions.jsonl" ]; then echo "  ok      decisions.jsonl"
+    elif [ -e "$home/schema-decisions.yaml" ]; then echo "  ok      decisions.jsonl (empty; written on the first decision)"
+    else echo "  missing decisions.jsonl"; fi
     for cmd in tasks datafile; do
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
@@ -471,6 +493,11 @@ doctor: _contract-drift
     # how to tell those apart. It reports and never repairs, because removing a
     # stopped watcher's record is deciding the captain has read it.
     SIANA_HOME="$home" "$PWD/bin/siana-watch" --status || true
+    # Whether SIANA is writing down decisions instead of asking. Asked of the command
+    # that wrote the record for the reason the watcher is: a file can say a session
+    # was started and never that one is running, and only the command that wrote it
+    # knows how to tell those apart. It reports and never repairs.
+    SIANA_HOME="$home" "$PWD/bin/siana-afk" --status || true
     # Dispatch does the resolving and holds the pane bindings, so asking it means
     # this cannot drift from what a real dispatch would accept or from where a real
     # minion was put. It reports a dead owner and never reclaims one: `tasks reset`
@@ -486,7 +513,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-publish siana-reap siana-pipeline siana-afk siana-gate; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

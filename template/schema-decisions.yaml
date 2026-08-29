@@ -1,0 +1,117 @@
+# Contract for decisions.jsonl: every gate SIANA reached while the captain was away,
+# what it proposed to do about it, and what the gate answered.
+#
+# This is the captain's audit trail, and it is the whole product of an advisory
+# night. Records are written by `siana-gate`, never by hand and never by `datafile`
+# directly, because the two fields that make a record trustworthy - `id` and `at` -
+# must be stamped by the script and never typed by an agent, for the reason
+# `siana-owe` gives at `bin/siana-owe:12`.
+#
+# Two constraints on how this contract may evolve, and they are stricter than the
+# other stores':
+#
+#   - **It only ever grows.** Removing a live field does not fail loudly: every
+#     record still carrying it vanishes from `get` and `list`, and only `validate`
+#     says why. For an audit trail the captain reads in the morning, a field that
+#     silently deletes history is not a bug class this fleet can carry.
+#   - **`class` and `verdict` are enums**, so a value this contract does not know is
+#     refused at write rather than becoming a decision SIANA believes it recorded.
+#     That is the same argument `schema-projects.yaml` makes for `extra: forbid`.
+#
+# What is deliberately not here yet: `outcome` and `outcome_at`. Advisory is the only
+# mode that exists, so no record can ever read `permitted` and there is no action
+# whose result could be written back. Growing this contract when a class is first
+# allowed is additive and safe; guessing an outcome onto a proposal that never
+# happened is neither, and is the one thing an audit trail must never do.
+
+name: Decision
+key: id
+extra: forbid
+
+fields:
+  id:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{2,47}$'
+    description: derived from the class and the task by `siana-gate`, so it is
+      self-describing in the one line the log has room for
+  at:
+    type: datetime
+    description: stamped by `siana-gate`, because an agent must never type the clock
+  class:
+    type: enum
+    values: [publish]
+    description: the class of action, from `siana-gate`'s own closed enum. A class
+      the script does not know never reaches this store, because it is a fault
+      rather than a decision, and adding one is a code change with its own tests
+  action:
+    type: str
+    min_length: 1
+    max_length: 500
+    description: the exact command SIANA proposed to run, so the captain reads what
+      would have happened rather than a summary of it
+  verdict:
+    type: enum
+    values: [proposed, refused]
+    description: it reads `proposed` when no grant was in force and `refused` when
+      one was and it said no. There is no third value while advisory is the only
+      mode
+  reason:
+    type: str
+    required: false
+    description: what the gate refused on, in the gate's words; absent on a proposal
+  task:
+    type: str
+    required: false
+    description: the queue task this decision is about
+  project:
+    type: str
+    required: false
+    description: the task's project handle, resolved from the queue by `siana-gate`
+  grant:
+    type: str
+    required: false
+    description: the `started` stamp of the grant this was decided under, absent
+      when there was none. With `policy` below it is what names which version of
+      which principles the reasoning was held to, so the record stays replayable
+      after the captain edits their principles
+  policy:
+    type: str
+    required: false
+    description: the sha256 of the principles file that grant was bound to
+  evidence:
+    type: list
+    items: str
+    default: []
+    description: what SIANA read to conclude this - task ids, report paths, a
+      pipeline record, a commit sha. Paths and identifiers, so the captain can go
+      and look rather than take SIANA's summary. The gate refuses an empty one
+  alternatives:
+    type: list
+    items: str
+    default: []
+    description: what else was considered and why it was rejected. The diff records
+      what happened and nothing else records what did not. The gate refuses an
+      empty one
+  principles:
+    type: list
+    items: str
+    default: []
+    description: the principle lines, quoted verbatim from the hashed file. The gate
+      judges that one was cited and never whether it fits, because that is meaning
+      and a script must never adjudicate meaning
+  confidence:
+    type: enum
+    values: [low, medium, high]
+    required: false
+    description: SIANA's own, and an audit field that is never a gate. A
+      self-reported confidence is exactly the number an over-eager or injected agent
+      gets wrong, so nothing may be load-bearing on it. It earns its place across a
+      night, because twenty proposals at low confidence is a finding about the
+      principles
+  reversibility:
+    type: enum
+    values: [R0, R1, R2, R3]
+    required: false
+    description: SIANA's classification of the action, checked by the gate against
+      the class's declared one. A mismatch is refused, because an agent that thinks
+      publishing is reversible has misunderstood what it is about to do

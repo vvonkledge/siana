@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""Start an advisory session, so SIANA writes down what it would decide while the
+captain is away.
+
+The captain answers every gate in this fleet. An advisory session does not move one
+of them: it makes SIANA write each one down instead - the exact command it would run,
+what it read, what it rejected, the principle it is citing, and how sure it is - and
+then hold. In the morning the captain reads a night of decisions they would have been
+asked to make, against principles they wrote, before any of it was real. Principles
+that read well and decide badly are the failure this catches, and nothing else does.
+
+**Nothing here permits anything.** `siana-gate` holds an empty allowlist and there is
+no `--allow` flag, so the only outcomes a session can produce are a proposal and a
+refusal. Starting one changes what is recorded and never what is possible.
+
+**The grant is this process.** It is given by starting it and withdrawn by stopping
+it, exactly as the watcher's is. The record it writes is evidence about a process and
+never a substitute for one: every reader asks the operating system whether that pid is
+alive and whether `ps` still names it this command, so a hand-written file naming a
+live pid is not a session and cannot be made into one.
+
+Three bindings a watcher does not need:
+
+  - **The principles.** `$SIANA_HOME/principles.md` is hashed at activation and
+    re-hashed at every decision, so an edit to it alone fails closed at the next gate
+    rather than quietly changing what SIANA is held to.
+  - **A deadline.** `--until` is wall-clock and is checked by `siana-gate` rather
+    than by this process, so a wedged or stopped session cannot extend its own
+    authority by failing to notice the clock.
+  - **The projects.** Named at activation, resolved against the captain's registry,
+    and gone when the session ends. Scope that lived in the registry would be scope
+    inherited by every future session, which is the thing autonomy-by-inference is.
+
+**Only two fields of the record are verified against the world**, and it is worth
+being exact about which, because the rest read as stronger than they are. `pid` and
+`command` are checked against the operating system at every decision, and that is
+what makes the session a process. `sha256`, `policy`, `until` and `projects` are read
+back out of the file. So all three bindings above hold against the captain from a
+second terminal, a stray script, and an accident, and none of them holds against
+somebody who edits this record as well: rewriting `principles.md` and then `sha256`
+passes the hash check, and `until` can be pushed past the ceiling that was enforced
+when it was typed.
+
+That is the same shape as the `SIANA_TASK_ID` refusal below and it is stated for the
+same reason. Minions run with `--dangerously-skip-permissions` and are unconstrained
+on this filesystem, so nothing kept on this filesystem is a boundary against one. The
+boundary is narrowing those permissions. Until that exists, what contains this is that
+`siana-gate` permits nothing whatever the record says, and that every decision names
+the session it was made under, so a night that does not add up is visible on the
+captain's return.
+
+Usage:
+    siana-afk --until <when> --project <handle> [--project <handle>]... [--dry-run]
+    siana-afk --status
+    siana-afk --stop
+
+`--until` takes a time, or a plain duration like `8h`. It runs until then, until
+Ctrl-C, or until `$SIANA_HOME/afk.stop` appears.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime, timedelta
+
+GRANT = "afk"
+STOP = "afk.stop"
+LEDGER = "decisions.jsonl"
+POLICY = "principles.md"
+WATCH = "watch"
+
+# How far out a deadline may be set. The captain's number, and a ceiling rather than
+# a default: there is no unbounded session and no duration this picks on its own,
+# because a duration nobody typed is a duration nobody chose.
+CEILING_H = 12
+
+# The template's unfilled placeholder. Its presence is what says the captain has not
+# written their principles yet, and it is the whole reason the shipped template has
+# one.
+PLACEHOLDER = "{Replace this whole section"
+
+# How often the session looks at the clock and at the stop file. It is not what
+# enforces the deadline - `siana-gate` reads that out of the record - so this only
+# decides how soon a stopped session stops looking alive.
+TICK_S = 2.0
+
+# How long `--stop` waits for the session to withdraw its own record. Long enough for
+# a process asleep on the tick above to wake and tidy up.
+STOP_WAIT_S = 15.0
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching siana-watch."""
+
+    def __init__(self, lines):
+        self.lines = lines
+        super().__init__(1)
+
+    def __str__(self):
+        return "\n".join(self.lines)
+
+
+def die(*lines):
+    raise Refusal(list(lines))
+
+
+def now():
+    return datetime.now(UTC)
+
+
+def stamp():
+    return now().isoformat()
+
+
+def fault(lines):
+    """A problem in `doctor`'s own shape, on the stream `doctor` puts problems on."""
+    print(f"  stale   {lines[0]}", file=sys.stderr)
+    for line in lines[1:]:
+        print(f"          {line}", file=sys.stderr)
+    return 1
+
+
+def fold(store, key):
+    """The last record for each key in an append-only store. Reads only, and a store
+    with no writes yet has no file at all, which is empty rather than a fault."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def process_command(pid):
+    """What `ps` says that pid is running, or "" when it says nothing.
+
+    Identity, not liveness. Pids are reused, so a live pid is not a live session:
+    the process wearing it has to still be the command that recorded it."""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip()
+
+
+def read_record(path, what):
+    """A process record, or None when there is none.
+
+    A record that will not parse refuses rather than reading as absent. "No session"
+    and "a session whose record nobody can read" call for opposite things from the
+    captain, and guessing the first reports an unattended fleet as attended."""
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        die(f"the {what} record at {path} cannot be read: {e}",
+            "nothing here can say what was granted; read that file, then remove it",
+            "and start again")
+    # Two branches and not one. `(rec or {}).get(...)` reads as a safe way to
+    # describe whatever was found, and it is not: `json.load` returns a string, a
+    # number, a bool or a list just as happily as a dict, and every one of those is
+    # truthy enough to reach `.get` and raise. A traceback here is not a refusal, and
+    # `just doctor` would print it in place of the `stale` line it asks for.
+    if not isinstance(rec, dict):
+        die(f"the {what} record at {path} is not a record this wrote",
+            f"it holds {type(rec).__name__} where a record belongs",
+            "read it, then remove it and start again")
+    if rec.get("state") != "running":
+        die(f"the {what} record at {path} is not a record this wrote",
+            f"it says its state is {rec.get('state')!r} if it says anything",
+            "read it, then remove it and start again")
+    return rec
+
+
+def still_running(rec, name):
+    """Whether that record's process is still the process that wrote it, and why not
+    when it is not.
+
+    Three questions, and the third is what makes a grant a process rather than a
+    file. The pid answers whether something is there, the recorded command answers
+    whether it is the same thing that recorded this, and that command having to name
+    `name` is what a hand-written record cannot supply: anyone can write a file
+    naming a live pid and copying that process's own `ps` line."""
+    pid = rec.get("pid")
+    if not isinstance(pid, int):
+        return False, f"the record names no pid, only {pid!r}"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, f"pid {pid} is gone"
+    except PermissionError:
+        pass          # Alive and someone else's, which the command settles below.
+    except OSError as e:
+        return False, f"pid {pid} cannot be asked about: {e}"
+    was = rec.get("command") or ""
+    if name not in was:
+        return False, (f"the record says pid {pid} is {was or 'unnamed'}, which is "
+                       f"not {name}, so this file was not written by one")
+    seen = process_command(pid)
+    if seen != was:
+        return False, (f"pid {pid} is now {seen or 'a process ps will not name'}, "
+                       "not the process that recorded it")
+    return True, ""
+
+
+def digest(path):
+    """The sha256 of a file's bytes, or None when it cannot be read."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def when(text):
+    """A deadline, from a time or from a plain duration like `8h`.
+
+    The duration is here because this is typed at the helm, and hand arithmetic on a
+    UTC stamp at midnight is a real way to mean one thing and say another. It is
+    resolved to an absolute moment here and recorded absolute, so nothing downstream
+    ever re-reads a relative number against a different clock."""
+    text = str(text).strip()
+    m = re.fullmatch(r"(\d+)([hm])", text)
+    if m:
+        n = int(m.group(1)) * (3600 if m.group(2) == "h" else 60)
+        return now() + timedelta(seconds=n)
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        die(f"--until {text!r} is neither a time nor a duration like 8h",
+            "a time is anything `2026-08-30T06:00:00Z` shaped; a duration is a",
+            "number of hours or minutes, and both end up recorded as a moment")
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def _staged(path, record):
+    """Written beside its destination, so it lands whole or not at all. A record
+    caught half-written would read as a session in a fleet that has none."""
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        fh.write(json.dumps(record, indent=2) + "\n")
+    return tmp
+
+
+def claim(home, record):
+    """Record this process as the session, and refuse when another holds it.
+
+    `os.link` refuses an existing destination, so two sessions started together
+    cannot both come away believing they are the only one. Two would bind two
+    different principle hashes and two different deadlines while this file could
+    only ever describe one of them, and the captain would read the wrong one."""
+    path = os.path.join(home, GRANT)
+    held = read_record(path, "advisory session")
+    if held:
+        live, why = still_running(held, "siana-afk")
+        if live:
+            die(f"an advisory session is already running (pid {held['pid']})",
+                f"it is bound to a deadline of {held.get('until')} and to the",
+                f"principles as they were then; stop it first, or read {path}")
+        die(f"an advisory session record is at {path}, and its process is gone: "
+            f"{why}",
+            "it is left exactly as it is, because removing it is deciding you have",
+            "read it, and every gate call refuses while it is there",
+            "read it, then `siana-afk --stop` clears it")
+    tmp = _staged(path, record)
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        die("another advisory session claimed the record while this one was starting",
+            "nothing was started here; ask `just doctor` which one is running")
+    finally:
+        os.unlink(tmp)
+    return path
+
+
+def release(home):
+    """Withdraw the session by removing its record, because the session was the
+    process and the process is stopping. A record left behind reads as a session that
+    died, and sends the captain looking for something that never happened."""
+    try:
+        os.unlink(os.path.join(home, GRANT))
+    except FileNotFoundError:
+        pass
+
+
+def decisions_under(home, started):
+    """How many decisions this session has recorded, folded from the ledger.
+
+    Folded and never counted into a file of its own. A second number can disagree
+    with the record, and the record is the audit trail, so there must not be a second
+    number for it to disagree with."""
+    return sum(1 for rec in fold(os.path.join(home, LEDGER), "id").values()
+               if rec.get("grant") == started)
+
+
+def status(home):
+    """Report whether an advisory session is running. Reports, and never repairs.
+
+    Nothing here reads healthy off the file, for the reason `siana-watch --status`
+    does not either: the record names a process, and what makes it a session is that
+    process still being alive and still being this command. A stopped record is left
+    exactly as it is, because removing it is deciding the captain has read it."""
+    stop = os.path.join(home, STOP)
+    path = os.path.join(home, GRANT)
+    try:
+        rec = read_record(path, "advisory session")
+    except Refusal as r:
+        return fault(r.lines)
+    if os.path.exists(stop) and rec is not None:
+        return fault([f"an advisory session is halted by {stop}",
+                      "every decision refuses while that file is there, and the",
+                      "session record is left in place so it cannot go unnoticed",
+                      f"remove {stop}, then `siana-afk --stop` and start again"])
+    if rec is None:
+        # The ordinary state, and the state the fleet is in whenever the captain is
+        # at the helm. Said out loud rather than left silent, the way no watcher is.
+        print("  ok      no advisory session (every decision is the captain's)")
+        return 0
+    live, why = still_running(rec, "siana-afk")
+    if not live:
+        return fault([f"the advisory session stopped without saying why: {why}",
+                      f"it started at {rec.get('started')} and was bound until "
+                      f"{rec.get('until')}",
+                      "nothing was decided in the interval, because permission was",
+                      "never in that file; every gate call has been refusing",
+                      f"read {path}, then `siana-afk --stop` clears it"])
+    n = decisions_under(home, rec.get("started"))
+    print(f"  ok      advisory session running (pid {rec['pid']}, until "
+          f"{rec.get('until')}, {n} decision(s) recorded)")
+    print("  ok      read them with `siana-gate log --full <id>`")
+    return 0
+
+
+def stop_session(home):
+    """Stop the session this machine is running, and clear a record it left behind.
+
+    A record whose process is gone is removed here and nowhere else. `--status`
+    reports it and leaves it, because removing it there would be deciding the captain
+    has read it; typing this is the captain deciding exactly that. Leaving it would
+    refuse every decision and every attended publish for a session that is not
+    there."""
+    path = os.path.join(home, GRANT)
+    rec = read_record(path, "advisory session")
+    if rec is None:
+        print("no advisory session is running")
+        return 0
+    live, why = still_running(rec, "siana-afk")
+    if not live:
+        os.unlink(path)
+        print(f"cleared  a session record whose process was gone: {why}")
+        return 0
+    pid = rec["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        die(f"cannot stop the advisory session at pid {pid}: {e}",
+            f"read {path} and stop that process by hand")
+    deadline = time.time() + STOP_WAIT_S
+    while time.time() < deadline:
+        if not os.path.exists(path):
+            print(f"stopped  the advisory session (pid {pid})")
+            return 0
+        time.sleep(0.05)
+    die(f"the advisory session at pid {pid} was asked to stop and has not",
+        f"its record is still at {path}, so every decision still refuses",
+        "look at that process before removing anything")
+
+
+def warn_no_watcher(home):
+    """Say when nothing will wake SIANA, and never refuse on it.
+
+    A session without a watcher is a grant that is never exercised, so the captain
+    should hear about it. It is not a precondition: making one grant depend on the
+    other would couple two things that are deliberately separate, and there is a real
+    way to want this - a captain who will take a turn or two before bed and wants
+    those decisions written down."""
+    try:
+        rec = read_record(os.path.join(home, WATCH), "watcher")
+    except Refusal:
+        rec = None
+    if rec is None or not still_running(rec, "siana-watch")[0]:
+        print("warning: no watcher is running, so nothing will wake SIANA and this "
+              "session\n"
+              "         may never reach a single decision; start `siana-watch` "
+              "beside SIANA", file=sys.stderr)
+
+
+def unfilled(text):
+    """Whether the principles file is still the template `just init` wrote.
+
+    Matched on the template's own placeholder rather than on any `{...}`, which is
+    how `siana-publish` reads a brief. A brief is written to be filled in and then
+    published; this file is the captain's own prose forever, and a principle that
+    happened to quote a brace would otherwise refuse every session with no way out
+    but rewording it. `tests/test_afk.py` drives the shipped template through this,
+    so the two cannot drift apart in silence.
+
+    What it exists to prevent is a night of proposals justified by a template, which
+    looks exactly like a calibration run and is not one."""
+    return PLACEHOLDER in text
+
+
+def activate(home, args):
+    # First, and before any file is written. `siana-dispatch` sets SIANA_TASK_ID for
+    # every minion, so this blocks the whole accidental path - an injected report
+    # talking a well-meaning minion into "helping" by starting a session - at the
+    # cost of one `if`.
+    #
+    # It is a guard rail and not a boundary. Minions run with
+    # `--dangerously-skip-permissions`, so a minion that unsets this variable first
+    # starts a real session that passes every check `siana-gate` makes, and nothing
+    # here stops it. The boundary is narrowing minion permissions, which is a larger
+    # change and is not this one. What contains the residual meanwhile is that every
+    # decision records the session it was made under, so a session nobody remembers
+    # starting is visible on the captain's return, and that `--until` bounds how long
+    # an unnoticed one lasts.
+    task = os.environ.get("SIANA_TASK_ID")
+    if task:
+        die(f"SIANA_TASK_ID is set to {task!r}, so this is a minion's environment",
+            "an advisory session is the captain's to start, at the keyboard, and a",
+            "minion that started one would be granting on the captain's behalf",
+            "this is a guard rail and not a boundary: it stops a minion that",
+            "inherits the variable, and does not stop one that unsets it first",
+            "if you are the captain, run this from your own shell")
+
+    stop = os.path.join(home, STOP)
+    if os.path.exists(stop):
+        die(f"{stop} is present, and every decision refuses while it is",
+            "it is the emergency stop, and clearing it is deliberate on purpose",
+            "remove it, then start this again")
+
+    if not args.until:
+        die("--until is required",
+            "there is no unbounded session and no default duration, because a",
+            "duration nobody typed is a duration nobody chose",
+            "usage: siana-afk --until 8h --project <handle>")
+    until = when(args.until)
+    if until <= now():
+        die(f"--until {args.until} is {until.isoformat()}, which has passed",
+            "a session that is over before it starts would record nothing and",
+            "refuse everything, which is what happens with no session at all")
+    hours = (until - now()).total_seconds() / 3600
+    if hours > CEILING_H:
+        die(f"--until {args.until} is {hours:.1f} hours out, and the ceiling is "
+            f"{CEILING_H}",
+            "the ceiling is compiled in rather than configured, because a session",
+            "long enough to forget about is one nobody is deciding to leave running",
+            "start another one in the morning if you are still away")
+
+    if not args.project:
+        die("--project is required, at least once",
+            "a session that covers no project refuses every decision, so it would",
+            "produce an empty ledger and read as a quiet night",
+            "usage: siana-afk --until 8h --project <handle>")
+    registry = os.path.join(home, "projects.jsonl")
+    if not os.path.isfile(os.path.join(home, "schema-projects.yaml")):
+        die(f"no project registry at {registry}", "run `just init` in the distro")
+    known = fold(registry, "handle")
+    for handle in args.project:
+        if handle not in known:
+            names = ", ".join(sorted(known)) or "(the registry is empty)"
+            die(f"unknown project: {handle}",
+                f"known handles: {names}",
+                "scope is resolved against the captain's registry, so a handle that",
+                "is not in it names nothing this session could ever cover")
+
+    policy = os.path.join(home, POLICY)
+    if not os.path.isfile(policy):
+        die(f"no principles at {policy}",
+            "it is the only file a principle may be read from, and a session with",
+            "none produces proposals justified by nothing",
+            "run `just init` in the distro to get a template, then write yours")
+    with open(policy, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    if not text.strip():
+        die(f"{policy} is empty",
+            "proposals justified by nothing are the one output that would waste a",
+            "night; write what you want SIANA to be held to")
+    if unfilled(text):
+        die(f"{policy} still carries the template's placeholder",
+            "it ships unfilled on purpose, so that writing the principles is a step",
+            "that cannot be skipped by accident",
+            f"replace the placeholder in {policy} with your own principles")
+
+    # What the record will say this process is, asked of the operating system rather
+    # than assumed. Every reader checks a live pid's `ps` line against this and
+    # refuses when it does not name siana-afk, so a record that could not carry one
+    # would be a session nobody can verify, which is worse than no session at all.
+    # Refused here, in front of the captain, rather than left for a reader to trip
+    # over in the middle of the night.
+    command = process_command(os.getpid())
+    if "siana-afk" not in command:
+        die(f"`ps` does not name this process (pid {os.getpid()}) as siana-afk",
+            f"it says {command or 'nothing'}, and the record has to carry a name a",
+            "later reader can check the operating system against")
+
+    record = {"state": "running", "pid": os.getpid(), "command": command,
+              "started": stamp(), "until": until.isoformat(),
+              "policy": policy, "sha256": digest(policy),
+              # Empty, and there is no flag that fills it. Advisory is the only mode
+              # there is, and `siana-gate` holds its own empty allowlist besides, so
+              # this field is the record of that rather than a way to change it.
+              "allow": [], "projects": list(args.project)}
+
+    if args.dry_run:
+        summary(record)
+        print("dry run  nothing was recorded and no session was started")
+        return 0
+
+    # Before the record is claimed, not after. A session left running in the
+    # background is stopped with `kill`, and that is the captain withdrawing it
+    # rather than a crash; left on its default disposition, a SIGTERM arriving in the
+    # moment between the claim and the loop would end this with the record already
+    # written and nothing to withdraw it.
+    signal.signal(signal.SIGTERM, _interrupted)
+
+    # The record is claimed before any of it is printed. A summary followed by a
+    # refusal reads as a session that started and then failed, and the one thing the
+    # captain must be able to tell at a glance is whether one is running.
+    warn_no_watcher(home)
+    path = claim(home, record)
+    try:
+        summary(record)
+        print(f"grant    {path}")
+        print("stop     siana-afk --stop, Ctrl-C, or `touch "
+              f"{os.path.join(home, STOP)}`", flush=True)
+        return run(home, until, path)
+    except BaseException:
+        # Anything at all between the claim and the loop leaves a record behind that
+        # reads as a session that died, which sends the captain looking for something
+        # that never happened. `release` is idempotent, so the ways out that already
+        # withdrew it pass through here unharmed.
+        release(home)
+        raise
+
+
+def summary(record):
+    """The session, printed back for the captain to read. What it permits is said
+    first, because that is the answer to the question anyone starting this has."""
+    print("session  advisory, and it permits nothing")
+    print(f"until    {record['until']}")
+    print(f"policy   {record['policy']}")
+    print(f"  sha256 {record['sha256']}")
+    print(f"projects {', '.join(record['projects'])}", flush=True)
+
+
+def run(home, until, path):
+    """Sleep until the deadline, the stop file, or a signal.
+
+    This loop is tidying up and never enforcement. `siana-gate` reads the deadline
+    out of the record, so a session that is stopped, wedged or paused has already
+    expired at every gate call before this notices. What the loop is for is removing
+    the record afterwards, so the captain does not come back to a file that reads as
+    a session that died."""
+    stop = os.path.join(home, STOP)
+    try:
+        while now() < until:
+            if os.path.exists(stop):
+                # The record is left in place and dead, which is the right shape for
+                # an emergency stop: it is a thing the captain then has to read and
+                # clear deliberately, rather than something that halted silently.
+                print(f"stopped  {stop} appeared; the record is left at {path} for "
+                      "you to read", flush=True)
+                return 1
+            time.sleep(TICK_S)
+    except KeyboardInterrupt:
+        release(home)
+        print("\nstopped; SIANA records no more decisions")
+        return 130
+    release(home)
+    print(f"expired  the advisory session ended at {until.isoformat()}", flush=True)
+    return 0
+
+
+def _interrupted(signum, frame):
+    raise KeyboardInterrupt
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="siana-afk", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--until", metavar="WHEN",
+                    help=f"a time, or a duration like 8h (ceiling: {CEILING_H}h)")
+    ap.add_argument("--project", action="append", metavar="HANDLE",
+                    help="a project this session covers; repeatable, and required")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the session and record nothing")
+    ap.add_argument("--status", action="store_true",
+                    help="report whether one is running, and start nothing")
+    ap.add_argument("--stop", action="store_true",
+                    help="stop the running session and withdraw its record")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+    if args.status and args.stop:
+        die("--status and --stop ask opposite things",
+            "--status reports and changes nothing; --stop withdraws the session")
+    if args.status:
+        raise SystemExit(status(home))
+    if args.stop:
+        raise SystemExit(stop_session(home))
+    raise SystemExit(activate(home, args))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Refusal as r:
+        print(f"error: {r.lines[0]}", file=sys.stderr)
+        for line in r.lines[1:]:
+            print(f"  {line}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
