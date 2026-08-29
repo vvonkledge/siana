@@ -341,6 +341,13 @@ _contract-drift:
 
 # Run the distro's tests. Pass unittest arguments through: `just test -v`, or
 # `just test -k slug` for one rule.
+#
+# Through `tests/run.py` rather than `-m unittest` directly, because unittest's own
+# progress is dots with no newline until the summary and a line-oriented reader -
+# the GitHub Actions runner is one - shows none of it. Three CI runs on this project
+# were killed by the hang guard having printed nothing at all. That file is the whole
+# of the difference: a line per test before it runs, and a watchdog that dumps every
+# thread's stack rather than letting a stall eat the job's wall clock in silence.
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -367,7 +374,10 @@ test *args:
     # installed to run these: they drive the commands where the mechanics are pure,
     # and drive them as processes against a real `tasks` and `datafile` where they
     # are not, because a stubbed store would only ever agree with this suite.
-    python3 -B -m unittest discover -s tests {{args}}
+    # `-u` as well as the flushes in `tests/run.py`, so that nothing this recipe
+    # runs can hold a line back: the point of the whole arrangement is that what
+    # has been printed has really left the process.
+    python3 -B -u tests/run.py {{args}}
 
 # Report SIANA's state without changing anything
 doctor: _contract-drift

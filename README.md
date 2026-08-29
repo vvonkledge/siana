@@ -349,11 +349,16 @@ other instruction file in the home.
 
     just test
 
-About 35 seconds. Standard-library `unittest`, no dependencies to install. It drives
-the pure mechanics in-process and drives the commands as real processes against a
-real `tasks` and `datafile`, into throwaway homes, because a stubbed store would only
-ever agree with the suite. Unittest arguments pass through, so `just test -v` is
-verbose and `just test -k <slug>` runs one rule.
+Three or four minutes. Standard-library `unittest`, no dependencies to install. It
+drives the pure mechanics in-process and drives the commands as real processes
+against a real `tasks` and `datafile`, into throwaway homes, because a stubbed store
+would only ever agree with the suite. Unittest arguments pass through, so `just test
+-v` is verbose and `just test -k <slug>` runs one rule.
+
+It reports a line per test as it goes, rather than unittest's dots, and puts a
+watchdog around each one: a test that stalls dumps every thread's stack and takes the
+run down instead of sitting there. That is `tests/run.py`, and it is there because a
+run killed by a hang guard printed dots that no line-oriented reader ever showed.
 
 `ORDERS.md` is the rest of the contract for changing anything here, and the parts of
 it that can be checked exactly are checked by the suite.
