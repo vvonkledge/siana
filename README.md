@@ -91,10 +91,15 @@ Into the home:
   `brief-qa.md`, copied from `template/`. **Copied only when absent.** SIANA evolves
   its own instructions, so a home copy that differs from the template is your work,
   and `init` says `kept` and leaves it alone.
-- `schema-projects.yaml`, `schema-obligations.yaml`, `schema-tasks.yaml`: the store
-  contracts. Also never overwritten, for a harder reason. A contract only ever grows,
-  because a field dropped from a live contract makes every record still carrying it
-  unreadable.
+- `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
+  `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
+  reason. A contract only ever grows, because a field dropped from a live contract
+  makes every record still carrying it unreadable.
+- `principles.md`, a template for the principles an advisory session holds SIANA to.
+  Written only when absent, and never touched by `just upgrade` either: a distro that
+  could rewrite it could rewrite what SIANA is held to while you are asleep. It ships
+  with its placeholder unfilled, and `siana-afk` refuses to start while that
+  placeholder is there. See [Leave it advisory](#leave-it-advisory).
 - The queue integration for each harness you have, so SIANA's session sees the
   fleet queue and no other agent session on this machine does. For `pi`, that is
   `pi-agent-tasks/`, generated from the installed `tasks`, and `.pi/settings.json`
@@ -105,14 +110,15 @@ Into the home:
   wake into SIANA's session, and the watcher refuses to start without it. See
   [Leave it running](#leave-it-running).
 
-The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl` - are
-not written here. `datafile` creates each on its first append, so a contract with no
-`.jsonl` beside it is an empty store and not a broken install.
+The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
+`decisions.jsonl` - are not written here. `datafile` creates each on its first append,
+so a contract with no `.jsonl` beside it is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-publish`,
-`siana-reap`, `siana-pipeline`. They are links, so a `git pull` here updates the
-commands with no reinstall. It does not update the home; `just upgrade` does that.
+`siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`. They are links, so a
+`git pull` here updates the commands with no reinstall. It does not update the home;
+`just upgrade` does that.
 
 ### The queue integration
 
@@ -305,6 +311,87 @@ Only the last of those is a reason to restart anything, which is why the warning
 names all three and diagnoses none: restarting SIANA over one of the first two
 discards the draft, or the turn, that the wake was waiting on.
 
+### Leave it advisory
+
+    siana-afk --until 8h --project <handle>
+
+The watcher above lets the fleet advance while you are away. It does not move a single
+decision: a gate you would have answered is still held, and you come back to a queue of
+them. An advisory session is the other half, and it moves none of them either. What it
+does is make SIANA write each one down.
+
+While one runs, a decision SIANA would have brought you becomes a record in
+`~/.siana/decisions.jsonl`: the exact command it would have run, what it read to
+conclude that, what it rejected and why, the principle it is citing, how sure it is,
+and what class of harm it believes the action is. Then it refuses, and SIANA holds
+exactly as it does today. In the morning:
+
+    siana-gate log                  every decision, newest first
+    siana-gate log --full <id>      one of them, whole
+
+**It permits nothing, by construction.** There is no allowlist and no `--allow` flag.
+Nothing SIANA reads - a report, a brief, a minion's reason, a page on the web - can
+turn a session into permission, because authority is never read from anything an agent
+writes. The point of running one is to find out whether your principles, applied by
+SIANA to real situations, produce the decisions you would have made. Principles that
+read well and decide badly are the failure this catches, and nothing else does.
+
+Before the first one, write your principles into `~/.siana/principles.md`. `just init`
+leaves a template there explaining what a principle can and cannot do, with an unfilled
+placeholder at the bottom; `siana-afk` refuses to start until you have replaced it,
+because a night of proposals justified by a template looks like a calibration run and
+is not one.
+
+The session is bound to three things at activation:
+
+- **Your principles, by sha256.** Every decision re-hashes that file, so editing it
+  fails closed at the next decision rather than quietly changing what SIANA is held
+  to.
+- **An absolute deadline.** `--until` takes a time or a plain duration like `8h`, it is
+  required, and it may not be set more than 12 hours out. It is read out of the record
+  at every decision rather than counted down by the process, so a session that is
+  wedged, paused, or stopped has already expired.
+- **The projects you name.** `--project <handle>`, repeatable, resolved against your
+  registry. A decision about anything else is refused.
+
+Stop it three ways, all equivalent: `siana-afk --stop`, Ctrl-C, or
+`touch ~/.siana/afk.stop`. The third exists because the first two need you to find the
+right terminal. It is checked before everything else, so it beats a live session, a
+valid hash, and an unexpired deadline, and it deliberately leaves the session record in
+place: an emergency stop should be something you then read and clear on purpose, not
+something that halted silently.
+
+Two of those bindings are stronger than the third sounds. `siana-afk` records its own
+pid and what `ps` calls it, and every decision re-asks the operating system about both,
+so a session cannot be forged by writing a file. The deadline, the projects, and the
+principles hash are read back out of that record, so they hold against you from a
+second terminal, against a stray script, and against an accident - and not against
+somebody who edits the record itself. Rewriting `principles.md` and then the `sha256`
+beside it passes the hash check. That is the same guard-rail-not-a-boundary shape as
+the `SIANA_TASK_ID` refusal below, for the same underlying reason: minions run with
+permissions that let one write any file here, so nothing kept here is a boundary
+against one. What contains it meanwhile is that nothing is permitted whatever the
+record says, and that every decision names the session it was made under.
+
+**While a session runs it applies to you too.** Telling SIANA to publish something
+gets you a recorded proposal and a refusal, not a merge request, because the session is
+what says decisions are being written down rather than made. If you are back at the
+helm and want it published now, stop the session first. Nothing changes with no session
+running: publishing is what it has always been.
+
+`siana-afk --status` says whether one is running and how many decisions it has
+recorded, and `just doctor` asks it the same way it asks the watcher. Like the
+watcher's, it reports and never repairs: removing a stopped session's record would be
+deciding you have read it.
+
+Two things it will not do. A minion cannot start one: `siana-afk` refuses outright when
+`SIANA_TASK_ID` is in its environment, which is how every minion runs, so an injected
+report cannot talk a well-meaning minion into starting a session on your behalf. That
+is a guard rail and not a boundary, because minions run with permissions that let one
+unset the variable first; closing it properly means narrowing those permissions, which
+is a separate change. And it never merges. Merging is permanently yours, and so is
+skipping a QA pair and answering a pipeline finding marked `decide`.
+
 ### A rigor the minion drives
 
 Most projects are verified by one command that runs when the minion says it is
@@ -391,14 +478,16 @@ first time SIANA writes a task.
 
 It changes nothing. It reports every file the home should hold, whether each required
 command is on the `PATH` and where it resolves to, whether a SIANA is running,
-whether every in-flight task's minion is still alive in the pane it was dispatched
-to, what SIANA owes you, and the queue itself.
+whether an advisory session is, whether every in-flight task's minion is still alive
+in the pane it was dispatched to, what SIANA owes you, and the queue itself.
 
 Things it says that are not faults:
 
-- `tasks.jsonl (empty; written on the first task)` and its two siblings. An empty
+- `tasks.jsonl (empty; written on the first task)` and its three siblings. An empty
   store has a contract and no log yet.
 - `no SIANA running`. That is the ordinary state between sessions.
+- `no advisory session (every decision is the captain's)`. That is the state the
+  fleet is in whenever you are at the helm.
 - `note    a herdr that restarted recently reads as GONE everywhere until it has
   re-detected its agents`. Rerun before acting on it.
 
@@ -408,6 +497,10 @@ Things it says that are:
   installed `tasks`. Add the fields it names.
 - `stale session claims pid <n>, which is gone`. A SIANA was killed before it could
   release its claim. Remove `$SIANA_HOME/session` and start again.
+- `stale advisory session stopped without saying why`. The `siana-afk` process is
+  gone and its record is not. Every decision has been refusing since, so nothing
+  happened that you were not told about. Read the record, then `siana-afk --stop`
+  clears it.
 - `GONE <task>: herdr has no agent in <pane>`. A minion died. `tasks reset` reclaims
   the task, and it stays manual, because that minion's worktree may hold work nobody
   has landed.

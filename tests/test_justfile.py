@@ -151,10 +151,13 @@ class Doctor(Recipe):
     def test_an_empty_store_is_a_zero_and_never_a_fault(self):
         # datafile writes the .jsonl on the first append, so absent-with-a-contract
         # is an empty store. Doctor must not cry wolf about it.
-        self.contract("projects", "obligations")
+        self.contract("projects", "obligations", "decisions")
         out = self.just("doctor").stdout
         self.assertIn("projects.jsonl (empty; written on the first project)", out)
         self.assertIn("obligations.jsonl (empty; written on the first promise)", out)
+        # A home that has never run an advisory session has no ledger at all, which
+        # is the same zero and not a home missing part of its install.
+        self.assertIn("decisions.jsonl (empty; written on the first decision)", out)
 
     def test_no_siana_running_is_the_ordinary_state(self):
         self.assertIn("no SIANA running", self.just("doctor").stdout)
@@ -206,6 +209,37 @@ class Doctor(Recipe):
                             reason="herdr went away")
         self.just("doctor")
         self.assertTrue(os.path.exists(path))
+
+    def test_no_advisory_session_is_reported_as_ok(self):
+        # The state the fleet is in whenever the captain is at the helm, and the
+        # state it is in most of the time. Reported the way `no watcher` is: an
+        # absence that is ordinary, said out loud rather than left to be assumed.
+        out = self.just("doctor")
+        self.assertIn("no advisory session (every decision is the captain's)",
+                      out.stdout)
+        self.assertNotIn("advisory", out.stderr)
+
+    def test_a_session_whose_process_is_gone_is_never_reported_healthy(self):
+        # Every gate call has been refusing since that process died, so a captain
+        # reading a healthy line here would be reading the opposite of the truth.
+        with open(self.at("afk"), "w") as fh:
+            json.dump({"state": "running", "pid": gone_pid(),
+                       "command": "python3 /somewhere/bin/siana-afk",
+                       "started": "2026-08-29T20:00:00Z",
+                       "until": "2099-01-01T00:00:00Z", "allow": [],
+                       "projects": ["demo"]}, fh)
+        out = self.just("doctor")
+        self.assertIn("advisory session stopped without saying why", out.stderr)
+        self.assertNotIn("advisory session running", out.stdout)
+
+    def test_a_stopped_advisory_sessions_record_is_reported_and_never_repaired(self):
+        with open(self.at("afk"), "w") as fh:
+            json.dump({"state": "running", "pid": gone_pid(), "command": "siana-afk",
+                       "started": "2026-08-29T20:00:00Z",
+                       "until": "2099-01-01T00:00:00Z", "allow": [],
+                       "projects": ["demo"]}, fh)
+        self.just("doctor")
+        self.assertTrue(os.path.exists(self.at("afk")))
 
     @unittest.skipUnless(has("pi"), "the wake extension is reported for pi only")
     def test_a_pi_home_without_the_wake_extension_is_named_as_missing(self):
@@ -262,7 +296,11 @@ class Init(Recipe):
         for f in ("siana.env", "AGENTS.md", "orders.md", "review.md",
                   "brief-ship.md", "brief-scout.md", "brief-qa.md",
                   "schema-projects.yaml", "schema-obligations.yaml",
-                  "schema-tasks.yaml",
+                  "schema-decisions.yaml", "schema-tasks.yaml",
+                  # The principles an advisory session holds SIANA to. It ships
+                  # unfilled and `siana-afk` refuses to start until it is written,
+                  # so a home without it is one where a session cannot start at all.
+                  "principles.md",
                   # The wake consumer. Without it `siana-watch` refuses to start,
                   # so a home it was left out of is a home that cannot advance the
                   # fleet unattended.
@@ -270,7 +308,7 @@ class Init(Recipe):
             self.assertTrue(os.path.exists(self.at(f)), f"init left out {f}")
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
                   "siana-owe", "siana-retire", "siana-publish", "siana-reap",
-                  "siana-pipeline"):
+                  "siana-pipeline", "siana-afk", "siana-gate"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this
@@ -433,6 +471,28 @@ class Init(Recipe):
         self.assertIn("kept     ", again.stdout)
         with open(self.at("AGENTS.md")) as fh:
             self.assertIn("reports at noon", fh.read())
+
+    def test_neither_init_nor_upgrade_ever_rewrites_the_principles(self):
+        # Harder than the instructions, which `upgrade` replaces with a diff beside
+        # them. This is the only file an advisory session lets SIANA read a principle
+        # from, so a distro that could rewrite it could rewrite what SIANA is held to
+        # while the captain is asleep.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at("principles.md"), "w") as fh:
+            fh.write("# Principles\n\nNever publish on a Friday.\n")
+        for recipe in ("init", "upgrade"):
+            out = self.just(recipe)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("kept     ", out.stdout)
+            with open(self.at("principles.md")) as fh:
+                self.assertIn("Never publish on a Friday", fh.read())
+        # And no backup of it was left anywhere under upgrade/, because nothing was
+        # replaced to need one. Walked rather than guessed at, since the backup
+        # directory is stamped with the time the upgrade ran.
+        backups = []
+        for root, _, files in os.walk(self.at("upgrade")):
+            backups += files
+        self.assertNotIn("principles.md", backups)
 
     def test_uninstall_removes_the_links_and_leaves_the_home_alone(self):
         self.assertEqual(self.just("init").returncode, 0)

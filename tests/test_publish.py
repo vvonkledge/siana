@@ -3,12 +3,21 @@
 Publishing is the one thing in this fleet that leaves it. Every test here is either
 a way the branch could go out without a second minion having accepted it, or a way
 something internal could travel with it.
+
+The last class is the other half of that: while an advisory session runs, the branch
+does not leave at all, and what the captain gets instead is a record of what SIANA
+would have done. With no session, nothing above it changes, and that is asserted
+rather than assumed - a safety feature that quietly made a direct instruction
+impossible would be a worse fleet, not a safer one.
 """
 
+import hashlib
+import json
 import os
 import subprocess
 import unittest
 
+from advisory import PROPOSAL
 from helpers import HomeTest, script
 
 publish = script("siana-publish")
@@ -180,8 +189,13 @@ class Refusals(HomeTest):
         self.assertRefused(out, "is not a git repository")
 
 
-class DryRun(HomeTest):
-    """A well-formed publish, stopped before it leaves the machine."""
+class Publishable(HomeTest):
+    """A home holding a well-formed publish: a real repository, a QA verdict, and the
+    ship brief behind it.
+
+    Split from the tests that use it because two classes need it, and a class that
+    inherited the fixture by inheriting the tests would run every one of them a second
+    time under conditions they were not written for."""
 
     def setUp(self):
         super().setUp()
@@ -213,6 +227,10 @@ class DryRun(HomeTest):
         os.makedirs(self.at("briefs"))
         with open(self.at("briefs", "add-json.md"), "w") as fh:
             fh.write(BRIEF)
+
+
+class DryRun(Publishable):
+    """A well-formed publish, stopped before it leaves the machine."""
 
     def test_reports_what_it_would_open(self):
         text = self.assertAccepted(self.run_bin("siana-publish", "qa-add-json",
@@ -270,6 +288,158 @@ class DryRun(HomeTest):
                        capture_output=True, text=True)
         out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
         self.assertRefused(out, "has no branch siana/add-json")
+
+
+class UnderAnAdvisorySession(Publishable):
+    """The same well-formed publish, with a session in force.
+
+    Driven with a session record rather than a live `siana-afk`, deliberately: what is
+    under test here is that this command asks at all and stops on the answer, and a
+    dead session is an answer. That the session itself cannot be forged into a
+    permission is `test_afk.py`, where it is driven against a real process."""
+
+    def setUp(self):
+        super().setUp()
+        self.contract("decisions")
+        with open(self.at("principles.md"), "wb") as fh:
+            fh.write(b"# Principles\n\nPublish what two minions accepted.\n")
+        with open(self.at("principles.md"), "rb") as fh:
+            self.policy = hashlib.sha256(fh.read()).hexdigest()
+        with open(self.at("afk"), "w") as fh:
+            json.dump({"state": "running", "pid": 1,
+                       "command": "python3 /nowhere/bin/siana-afk",
+                       "started": "2026-08-29T20:00:00Z",
+                       "until": "2099-01-01T00:00:00Z",
+                       "policy": self.at("principles.md"), "sha256": self.policy,
+                       "allow": [], "projects": ["demo"]}, fh)
+
+    def record(self, **over):
+        record = dict(PROPOSAL)
+        record.update(over)
+        with open(self.at("record.json"), "w") as fh:
+            json.dump(record, fh)
+        return self.at("record.json")
+
+    def test_it_refuses_without_a_record_before_anything_else(self):
+        # The record is what the captain reads in the morning instead of a merge
+        # request that appeared while they were asleep. Refused up front, so the
+        # message is about the missing record and not about the first world check
+        # that happened to fail.
+        out = self.run_bin("siana-publish", "qa-add-json")
+        self.assertRefused(out, "needs --record", "siana-afk --stop")
+
+    def test_the_push_does_not_happen_and_the_proposal_is_recorded(self):
+        # The whole of what an advisory night produces. No PATH is restricted here:
+        # the gate is asked before the check for a forge CLI, so this is the same
+        # answer on a machine that has one and on CI, which has neither.
+        out = self.run_bin("siana-publish", "qa-add-json",
+                           "--record", self.record())
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("nothing was pushed", out.stderr)
+        with open(self.at("decisions.jsonl")) as fh:
+            rec = json.loads(fh.read().strip().splitlines()[-1])
+        # Every field the captain reads in the morning instead of a merge request,
+        # asserted here rather than trusted to the gate's own tests: this is the one
+        # path that turns a publish into a record, and a field lost on the way would
+        # be lost silently.
+        self.assertEqual(rec["verdict"], "refused")
+        self.assertEqual(rec["action"], PROPOSAL["action"])
+        self.assertEqual(rec["task"], "qa-add-json")
+        self.assertEqual(rec["project"], "demo")
+        self.assertEqual(rec["evidence"], PROPOSAL["evidence"])
+        self.assertEqual(rec["alternatives"], PROPOSAL["alternatives"])
+        self.assertEqual(rec["principles"], PROPOSAL["principles"])
+        self.assertEqual(rec["confidence"], "high")
+        self.assertEqual(rec["reversibility"], "R2")
+        self.assertEqual(rec["grant"], "2026-08-29T20:00:00Z")
+        self.assertEqual(rec["policy"], self.policy)
+        # Nothing was pushed, so the branch has no upstream.
+        upstream = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "--abbrev-ref",
+             "siana/add-json@{upstream}"], capture_output=True, text=True)
+        self.assertNotEqual(upstream.returncode, 0, upstream.stdout)
+
+    def test_a_dry_run_records_nothing_and_still_describes_the_plan(self):
+        # A dry run changes nothing, and the ledger is something. Recording a
+        # proposal for a command that was never going to run would put a decision in
+        # front of the captain that SIANA did not make.
+        text = self.assertAccepted(
+            self.run_bin("siana-publish", "qa-add-json", "--dry-run"))
+        self.assertIn("branch:  siana/add-json", text)
+        self.assertFalse(os.path.exists(self.at("decisions.jsonl")))
+
+    def test_a_proposal_the_gate_refuses_on_shape_still_stops_the_publish(self):
+        out = self.run_bin("siana-publish", "qa-add-json",
+                           "--record", self.record(principles=[]))
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("quotes no principle", out.stdout)
+
+    def test_a_verdict_that_authorises_nothing_is_still_refused_first(self):
+        # The gate is asked last of the queue's refusals, not instead of them. A
+        # session must not turn a publish nobody accepted into a recorded proposal.
+        self.store("tasks.jsonl",
+                   {"id": "qa-add-json", "title": "QA add-json", "status": "doing",
+                    "verify": "just e2e", "verify_kind": "cmd", "deps": ["add-json"],
+                    "context": [], "project": "demo", "base": "siana/add-json",
+                    "updated": "2026-08-29T11:00:00Z"})
+        out = self.run_bin("siana-publish", "qa-add-json", "--record", self.record())
+        self.assertRefused(out, "is doing, not done")
+        self.assertFalse(os.path.exists(self.at("decisions.jsonl")))
+
+
+class WithNoSession(Publishable):
+    """Ordinary attended publication, with the decision ledger installed and no
+    session in force.
+
+    The regression this guards is the one a safety feature is most likely to cause:
+    the captain says publish this, and the fleet cannot, because a mechanism built for
+    the night they were away has quietly become the rule for the day they are here."""
+
+    def setUp(self):
+        super().setUp()
+        self.contract("decisions")
+
+    def test_no_record_is_required(self):
+        # And it gets no further than the check that was already there.
+        out = self.run_bin("siana-publish", "qa-add-json",
+                           env={"PATH": "/usr/bin:/bin"})
+        self.assertRefused(out, "glab is not installed")
+        self.assertNotIn("--record", out.stderr)
+
+    def test_nothing_is_recorded_in_the_ledger(self):
+        # The captain typed this, or told SIANA to, and that is the authority it has
+        # always run on. There is no decision to write down.
+        self.run_bin("siana-publish", "qa-add-json", env={"PATH": "/usr/bin:/bin"})
+        self.assertFalse(os.path.exists(self.at("decisions.jsonl")))
+
+    def test_a_record_passed_with_no_session_is_still_gated(self):
+        # The case this exists for: a session whose deadline passes at 06:00 releases
+        # its record, and a SIANA woken at 06:01 has already written its proposal.
+        # Ignoring the flag would push the branch and open the merge request with
+        # nothing recorded anywhere, which is the one outcome an advisory night is
+        # supposed to make impossible.
+        with open(self.at("record.json"), "w") as fh:
+            json.dump(PROPOSAL, fh)
+        out = self.run_bin("siana-publish", "qa-add-json",
+                           "--record", self.at("record.json"))
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("nothing was pushed", out.stderr)
+        with open(self.at("decisions.jsonl")) as fh:
+            rec = json.loads(fh.read().strip().splitlines()[-1])
+        # `proposed` and not `refused`: no session was in force, and the ledger says
+        # so rather than naming one that had already ended.
+        self.assertEqual(rec["verdict"], "proposed")
+        self.assertIsNone(rec["grant"])
+        upstream = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "--abbrev-ref",
+             "siana/add-json@{upstream}"], capture_output=True, text=True)
+        self.assertNotEqual(upstream.returncode, 0, upstream.stdout)
+
+    def test_the_dry_run_is_unchanged(self):
+        text = self.assertAccepted(
+            self.run_bin("siana-publish", "qa-add-json", "--dry-run"))
+        self.assertIn("branch:  siana/add-json", text)
+        self.assertIn("target:  preproduction", text)
 
 
 if __name__ == "__main__":

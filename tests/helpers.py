@@ -148,13 +148,33 @@ class HomeTest(unittest.TestCase):
             out.append(mirror)
         return os.pathsep.join([*first, BIN, *out])
 
-    def run_cmd(self, argv, cwd=None, env=None, timeout=120):
+    def command_env(self, extra=None):
+        """The environment a command under test runs in.
+
+        One place, because a command started with `Popen` has to be given the same
+        hygiene as one run with `run`, and two copies of these rules would drift
+        exactly where a drifted one is invisible: a suite that read the captain's
+        live fleet would still be green.
+
+        Not `env`: `test_siana.Siana` already has one of those, with a different
+        signature and a different job, and a base class quietly shadowed by a
+        subclass is how one rename turned 33 tests into a TypeError.
+        """
         e = dict(os.environ)
         e["SIANA_HOME"] = self.home
         e.pop("SIANA_TASKS_FILE", None)
-        e.update(env or {})
-        return subprocess.run(argv, cwd=cwd or self.home, env=e, text=True,
-                              capture_output=True, timeout=timeout)
+        # A suite run by a minion inherits its task id, and `siana-afk` refuses to
+        # activate in a minion's environment. Left in, every activation test here
+        # would pass on CI and refuse on the machine that wrote it - which is the
+        # one place a suite must not disagree with itself. The test of that refusal
+        # sets the variable back, deliberately.
+        e.pop("SIANA_TASK_ID", None)
+        e.update(extra or {})
+        return e
+
+    def run_cmd(self, argv, cwd=None, env=None, timeout=120):
+        return subprocess.run(argv, cwd=cwd or self.home, env=self.command_env(env),
+                              text=True, capture_output=True, timeout=timeout)
 
     def run_bin(self, name, *args, **kw):
         return self.run_cmd([os.path.join(BIN, name), *args], **kw)

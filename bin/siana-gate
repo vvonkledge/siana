@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""Record what SIANA decided to do, and answer whether it may.
+
+SIANA never decides that it may act. It decides *what it wants to do*, writes that
+down with its evidence and the principles it read as governing, and then asks this
+script - and this script is what performs the check that matters. That split is the
+whole safety property: authority is read only from a file whose writer is a process,
+and whose contents are re-verified against the operating system on every read, so no
+report, brief, finding, commit message or web page can widen what is allowed. The
+worst any of them can do is stop work, which is the direction this fleet already
+fails in.
+
+**Advisory is the only mode there is.** The allowlist below is empty and is a constant
+in this file, not a field read out of the grant, so there is no value anything could
+write anywhere that makes this return 0 while a session is in force. What an advisory
+night produces is the ledger, and the ledger is the point: the captain reads in the
+morning what SIANA would have decided, against principles they wrote, before any of it
+is real.
+
+    siana-gate <class> --task <id> --record <file>
+    siana-gate log [--since <when>] [--full <id>]
+
+Exit codes, in the shape the rest of this fleet reads:
+
+    0   nothing here refuses this, so the caller may act. Reached only by `log`
+        while advisory is the only mode, because a decision path that could return
+        it would be a decision path that permits
+    1   refused, and the ledger holds the record. Escalate; do not retry and do not
+        restate the request differently
+    2   fault. Nothing is known, so nothing is permitted
+
+The split between 1 and 2 is the same one `siana-pipeline` draws between "yours to
+fix" and "not yours". A refusal is a policy answer a caller can act on. A class this
+script does not know is the caller and this script disagreeing about what the world
+contains, and the only safe reading of a disagreement is that nothing is known.
+
+The `--record` file is written by SIANA and validated here for shape only:
+
+    {"action": "siana-publish qa-implement-collision-free",
+     "evidence": ["task:qa-implement-collision-free done",
+                  "reports/qa-implement-collision-free.md"],
+     "alternatives": ["hold until the captain returns: rejected, the branch is",
+                      "accepted and holding costs a night"],
+     "principles": ["Publish work two independent minions have accepted."],
+     "confidence": "high",
+     "reversibility": "R2"}
+
+Shape, and never meaning. This script does not judge whether the cited principle
+supports the action - that is understanding, and a script must never adjudicate
+meaning. It judges that one was cited at all, which is exact, repeatable, and removes
+the likeliest quiet failure: SIANA acting on a general sense that this is fine.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import UTC, datetime
+
+# Reached by `log` alone. Named anyway, because the decision path returning it is
+# precisely the bug this file is written to make unrepresentable, and a bare `0` in
+# the code would not say so.
+PERMITTED = 0
+REFUSED = 1
+FAULT = 2
+
+# The closed enum of classes, and the reversibility each one is. Not free text, not
+# read from the grant, not extensible by configuration: adding a class is a code
+# change with its own tests, which is the friction it should have. Today the fleet
+# has exactly one outward write, and this is it.
+#
+# R2 is externally visible and compensable but not undoable. A push can be
+# force-removed and a merge request closed, but both were seen, both may be mirrored
+# or indexed, and CI may have run against them.
+CLASSES = {"publish": "R2"}
+
+# The empty allowlist is what makes this advisory, and it is a constant here rather
+# than a field on the grant so that nothing anyone can write - into the grant record,
+# into a report, into a brief, into this fleet's own instructions - can add to it.
+# `siana-afk` has no `--allow` flag for the same reason.
+#
+# Widening it is a code change, and each class arrives with its own reversibility
+# declaration, its own ceiling, its own idempotent re-run story, and its own
+# adversarial test. Merge is never on it: the merge is the one step no command can
+# take back, and the whole validation chain in front of it exists to make that human
+# decision cheap rather than to make it unnecessary.
+ALLOWED = ()
+
+CONFIDENCE = ("low", "medium", "high")
+
+# The grant, the emergency stop, the ledger and its contract, and the one file a
+# principle may be read from. Named here because `siana-afk` writes the first and
+# this reads it, and two spellings of one path is one way for them to disagree.
+GRANT = "afk"
+STOP = "afk.stop"
+LEDGER = "decisions.jsonl"
+CONTRACT = "schema-decisions.yaml"
+POLICY = "principles.md"
+
+
+class Fault(SystemExit):
+    """Nothing can be said, so nothing is permitted."""
+
+    def __init__(self, lines):
+        self.lines = lines
+        super().__init__(FAULT)
+
+
+def fault(message, *hints):
+    raise Fault([message, *hints])
+
+
+def now():
+    return datetime.now(UTC)
+
+
+def stamp():
+    return now().isoformat()
+
+
+def moment(text, what):
+    """An ISO stamp from a record, as an aware datetime.
+
+    A stamp that will not parse is a fault and never a date this guesses at: every
+    caller of this is about to compare it against the clock, and a grant whose
+    deadline nobody can read must not be treated as one that has not expired."""
+    try:
+        dt = datetime.fromisoformat(str(text))
+    except (TypeError, ValueError):
+        fault(f"the grant's {what} is not a time anyone can read: {text!r}",
+              "nothing here can say whether it has passed, so nothing is permitted",
+              "stop the advisory session and start it again")
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def fold(store, key):
+    """The last record for each key in an append-only store.
+
+    Reads only. Every write still goes through `tasks` or `datafile`, so what is on
+    disk has already passed its contract. A tombstone is a last line like any other:
+    a dropped record must read as absent, not as a record with every field missing.
+
+    A store with no writes yet has no file at all, which is empty rather than a
+    fault."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                fault(f"{store} has a line that is not JSON",
+                      f"run `datafile -f {os.path.basename(store)} repair` to "
+                      "quarantine it")
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def process_command(pid):
+    """What `ps` says that pid is running, or "" when it says nothing.
+
+    Identity, not liveness. Pids are reused, so a live pid is not a live grant: the
+    process wearing it has to still be the command that recorded it. `siana-watch`
+    asks the same question of its own grant, and asks it the same way."""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip()
+
+
+def peek_grant(path):
+    """The grant, for annotating a record with the session it happened under, and
+    never for deciding anything.
+
+    Swallows what `read_grant` refuses on, because the two callers below have already
+    decided - the stop file beats everything, and a proposal that cites no principle
+    is refused whatever the session says - and a record that will not parse must not
+    turn either of those settled answers into a fault. What it costs when the record
+    is unreadable is one annotation, and the very next gate call says so loudly."""
+    try:
+        return read_grant(path)
+    except Fault:
+        return None
+
+
+def read_grant(path):
+    """The recorded grant, or None when there is none.
+
+    A record that will not parse is a fault rather than an absent grant. "No session"
+    and "a session whose record nobody can read" are different facts and only the
+    first is safe to act on: reading the second as absence would leave a proposal in
+    the ledger saying the captain was here, when what actually happened is that
+    nothing could be established at all."""
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        fault(f"the advisory session record at {path} cannot be read: {e}",
+              "nothing here can say what was granted, so nothing is permitted",
+              "read that file, then remove it and start `siana-afk` again")
+    # Two branches and not one. `(rec or {}).get(...)` reads as a safe way to
+    # describe whatever was found, and it is not: `json.load` returns a string, a
+    # number, a bool or a list just as happily as a dict, and every one of those is
+    # truthy enough to reach `.get` and raise. The branch that crashed would have
+    # been the one written to handle exactly this file, and a traceback here exits 1,
+    # which is this script's word for "refused, and the ledger holds the record".
+    if not isinstance(rec, dict):
+        fault(f"the advisory session record at {path} is not a record siana-afk "
+              "wrote",
+              f"it holds {type(rec).__name__} where a record belongs",
+              "read it, then remove it and start `siana-afk` again")
+    if rec.get("state") != "running":
+        fault(f"the advisory session record at {path} is not a record siana-afk "
+              "wrote",
+              f"it says its state is {rec.get('state')!r} if it says anything at all",
+              "read it, then remove it and start `siana-afk` again")
+    return rec
+
+
+def still_running(rec):
+    """Whether that record's process is still the process that wrote it, and why not
+    when it is not.
+
+    Three questions, and the third is what makes the grant a process rather than a
+    file. The pid answers whether something is there. The recorded command answers
+    whether it is the same thing that recorded this. And the recorded command having
+    to name `siana-afk` is what a hand-written record cannot supply: anyone may write
+    a file naming a live pid and copying that process's `ps` line, and without this
+    last question such a file would pass as a grant the captain never started."""
+    pid = rec.get("pid")
+    if not isinstance(pid, int):
+        return False, f"the record names no pid, only {pid!r}"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, f"pid {pid} is gone"
+    except PermissionError:
+        pass          # Alive and someone else's, which the command settles below.
+    except OSError as e:
+        return False, f"pid {pid} cannot be asked about: {e}"
+    was = rec.get("command") or ""
+    if "siana-afk" not in was:
+        return False, (f"the record says pid {pid} is {was or 'unnamed'}, which is "
+                       "not siana-afk, so this file was not written by a grant")
+    seen = process_command(pid)
+    if seen != was:
+        return False, (f"pid {pid} is now {seen or 'a process ps will not name'}, "
+                       "not the process that recorded it")
+    return True, ""
+
+
+def digest(path):
+    """The sha256 of the principles file, or None when it is not there.
+
+    Bytes, not text: what the grant recorded is what the file was, and a file that
+    has been rewritten with different line endings is a file the captain edited."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def slug(base, taken):
+    """An id derived from the class and the task, never invented by the caller, so a
+    decision is self-describing in the one line the log has room for."""
+    s = "-".join(w for w in re.split(r"[^a-z0-9]+", base.lower()) if w)
+    if not s or not s[0].isalpha():
+        s = f"decision-{s}" if s else "decision"
+    s = s[:48]
+    while len(s) < 3:
+        s += "-x"
+    if s not in taken:
+        return s
+    for n in range(2, 1000):
+        cand = f"{s[:48 - len(str(n)) - 1]}-{n}"
+        if cand not in taken:
+            return cand
+    fault(f"cannot derive a free id from {base!r}")
+
+
+def append(home, record):
+    """Every write goes through `datafile`, so what lands has already passed the
+    contract that enforces the queue and the registry.
+
+    A write that fails is a fault and never a shrug. An action that cannot be
+    recorded does not happen, including when the disk is full: no unrecorded
+    autonomy, ever."""
+    store = os.path.join(home, LEDGER)
+    contract = os.path.join(home, CONTRACT)
+    try:
+        proc = subprocess.run(
+            ["datafile", "-f", store, "-c", contract, "put", json.dumps(record)],
+            capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        fault("datafile is not on PATH",
+              "it is what enforces this ledger's contract, and a decision that "
+              "cannot be recorded does not happen",
+              "run `just init` in the distro")
+    if proc.returncode != 0:
+        fault(f"the ledger at {store} refused this record",
+              *(proc.stdout + proc.stderr).strip().splitlines()[:6],
+              "a decision that cannot be recorded does not happen, so nothing here "
+              "is permitted")
+    return record["id"]
+
+
+def decide(home, klass, task_id, record, verdict, reason, grant):
+    """Write one decision into the ledger and answer with it.
+
+    Everything the captain reads in the morning comes from here, so the fields SIANA
+    typed travel verbatim and the two that must not be typed by an agent - the id and
+    the clock - are stamped here."""
+    tasks_file = (os.environ.get("SIANA_TASKS_FILE")
+                  or os.path.join(home, "tasks.jsonl"))
+    task = fold(tasks_file, "id").get(task_id) or {}
+    ledger = fold(os.path.join(home, LEDGER), "id")
+    rec = {"id": slug(f"{klass}-{task_id}", ledger),
+           "at": stamp(),
+           "class": klass,
+           "action": record["action"],
+           "verdict": verdict,
+           "task": task_id,
+           "evidence": [str(x) for x in listed(record, "evidence")],
+           "alternatives": [str(x) for x in listed(record, "alternatives")],
+           "principles": [str(x) for x in listed(record, "principles")]}
+    if reason:
+        rec["reason"] = reason
+    if task.get("project"):
+        rec["project"] = task["project"]
+    if record.get("confidence") in CONFIDENCE:
+        rec["confidence"] = record["confidence"]
+    if record.get("reversibility") in ("R0", "R1", "R2", "R3"):
+        rec["reversibility"] = record["reversibility"]
+    if grant:
+        rec["grant"] = str(grant.get("started"))
+        rec["policy"] = str(grant.get("sha256"))
+    rid = append(home, rec)
+    print(f"{verdict:<8} {rid}")
+    for line in (reason or "").splitlines():
+        print(f"  {line}")
+    print(f"  recorded in {os.path.join(home, LEDGER)}")
+    return REFUSED
+
+
+def listed(record, field):
+    """One of the record's list fields, as a list.
+
+    A caller that wrote a bare string where a list belongs has said something, and it
+    is more useful in the ledger than dropped: the shape check below is what refuses
+    it, and this is only what survives long enough to be refused in writing."""
+    value = record.get(field)
+    if isinstance(value, list):
+        return value
+    return [value] if isinstance(value, str) and value.strip() else []
+
+
+def read_record(path):
+    """The decision SIANA wrote, or a refusal when there is not one.
+
+    Refused rather than faulted, and refused before anything is recorded. A record
+    file that does not parse or names no action carries no decision, so there is
+    nothing here to write into the captain's audit trail and nothing for them to
+    read in the morning."""
+    try:
+        with open(path) as fh:
+            record = json.load(fh)
+    except FileNotFoundError:
+        return None, f"no decision record at {path}"
+    except (OSError, ValueError) as e:
+        return None, f"the decision record at {path} cannot be read: {e}"
+    if not isinstance(record, dict):
+        return None, f"the decision record at {path} is not an object"
+    action = record.get("action")
+    if not isinstance(action, str) or not action.strip():
+        return None, (f"the decision record at {path} names no action, so it says "
+                      "nothing that could be recorded or carried out")
+    return record, None
+
+
+def shape(record, klass):
+    """What the record must carry to be a decision at all, or None when it does.
+
+    Never whether the cited principle actually supports the action, which is meaning.
+    Only that SIANA said what it read, what it rejected, how sure it is, and what
+    class of harm it believes this is - and that the last of those agrees with what
+    the class actually is."""
+    if not listed(record, "evidence"):
+        return ("this proposal cites no evidence, so nothing in it can be checked "
+                "by going and looking")
+    if not listed(record, "principles"):
+        return ("this proposal quotes no principle, so it rests on a general sense "
+                "that it is fine rather than on anything the captain wrote")
+    if not listed(record, "alternatives"):
+        return ("this proposal names no alternative, and what was rejected is the "
+                "half of a decision that nothing else records")
+    if record.get("confidence") not in CONFIDENCE:
+        return (f"confidence is {record.get('confidence')!r}, and it has to be one "
+                f"of {', '.join(CONFIDENCE)}")
+    declared = CLASSES[klass]
+    if record.get("reversibility") != declared:
+        return (f"this proposal calls {klass} {record.get('reversibility')!r}, and "
+                f"{klass} is {declared}; an agent that has the reversibility wrong "
+                "has misunderstood the action it is about to take")
+    return None
+
+
+def gate(home, klass, task_id, record_path):
+    """The ordered checks, and the only thing in this fleet that answers whether an
+    action may happen.
+
+    The order is deliberate and each step names the failure it prevents. Two checks
+    the design puts later are hoisted to the front, both for the same reason: an
+    unknown class and a missing contract are the two states in which nothing can be
+    written into the ledger at all, so a refusal recorded after them would be a
+    refusal nobody will ever read."""
+    if klass not in CLASSES:
+        # Never a refusal. A refusal is an answer the caller can act on; a class this
+        # script has never heard of means the caller and this script disagree about
+        # what the world contains, and the only safe reading of that is that nothing
+        # is known.
+        fault(f"unknown action class: {klass}",
+              f"this script knows {', '.join(sorted(CLASSES))} and nothing else",
+              "a class it does not know is a bug and never a policy answer, so this "
+              "says nothing about whether the action is allowed")
+    if not os.path.isfile(os.path.join(home, CONTRACT)):
+        fault(f"no decision ledger contract at {os.path.join(home, CONTRACT)}",
+              "it is what says the ledger exists, and a decision that cannot be "
+              "recorded does not happen",
+              "run `just init` in the distro")
+
+    record, refusal = read_record(record_path)
+    if record is None:
+        print(f"refused  {refusal}", file=sys.stderr)
+        print("  nothing was recorded, because a record with no action in it is not "
+              "a decision", file=sys.stderr)
+        return REFUSED
+
+    # Checked before everything else, so a stop beats a live session, a valid hash
+    # and an unexpired deadline. It is the one file untrusted writers may touch, and
+    # that is safe by construction: its presence only ever removes authority, so a
+    # minion, a hook, a stray script or the captain from a second terminal can all
+    # halt an advisory session with one `touch`, and none of them can grant anything
+    # by writing it.
+    stop = os.path.join(home, STOP)
+    if os.path.exists(stop):
+        return decide(home, klass, task_id, record, "refused",
+                      f"{stop} is present, and it beats everything else here",
+                      peek_grant(os.path.join(home, GRANT)))
+
+    # Before the session is looked at, and deliberately. Under advisory every call
+    # ends in the same refusal at the allowlist, so a proposal that cites no
+    # principle would otherwise be recorded as though it were well made and the one
+    # thing an advisory night is for measuring would be lost.
+    wrong = shape(record, klass)
+    if wrong:
+        return decide(home, klass, task_id, record, "refused", wrong,
+                      peek_grant(os.path.join(home, GRANT)))
+
+    # No session is a refusal and never a zero. It is the fail-closed default and
+    # the reason a caller may ask this without first working out whether a session
+    # exists: a gate that answered "nothing is in force, go ahead" would be a gate
+    # that permits, and a caller that forgot to check would publish on it.
+    #
+    # `siana-publish` therefore asks only while a record is there, because with no
+    # session it is the captain's own instruction being carried out and there is
+    # nothing here to gate.
+    grant = read_grant(os.path.join(home, GRANT))
+    if grant is None:
+        return decide(home, klass, task_id, record, "proposed",
+                      "no advisory session is in force, so this is a proposal and "
+                      "nothing more", None)
+
+    live, why = still_running(grant)
+    if not live:
+        return decide(home, klass, task_id, record, "refused",
+                      f"the advisory session is not running: {why}", grant)
+
+    # A fact in a file rather than a timer in a process, so a wedged, stopped or
+    # paused session cannot extend its own authority by failing to notice the clock.
+    # The file may still be there while this says no, and that gap is safe in the
+    # only direction that matters.
+    until = moment(grant.get("until"), "deadline")
+    if now() >= until:
+        return decide(home, klass, task_id, record, "refused",
+                      f"the advisory session expired at {until.isoformat()}", grant)
+
+    policy = str(grant.get("policy") or os.path.join(home, POLICY))
+    seen = digest(policy)
+    if seen != grant.get("sha256"):
+        return decide(home, klass, task_id, record, "refused",
+                      f"{policy} is no longer the file this session was bound to "
+                      f"({seen or 'it cannot be read'} is not "
+                      f"{grant.get('sha256')})", grant)
+
+    tasks_file = (os.environ.get("SIANA_TASKS_FILE")
+                  or os.path.join(home, "tasks.jsonl"))
+    task = fold(tasks_file, "id").get(task_id)
+    if task is None:
+        return decide(home, klass, task_id, record, "refused",
+                      f"{task_id} is not in {tasks_file}, so nothing says which "
+                      "project this is about", grant)
+    handle = task.get("project")
+    projects = grant.get("projects") or []
+    if handle not in projects:
+        return decide(home, klass, task_id, record, "refused",
+                      f"{task_id} is in {handle!r}, and this session covers "
+                      f"{', '.join(projects) or 'no project at all'}", grant)
+
+    # The last check, and under advisory the one every call reaches. There is no
+    # branch after it: ALLOWED is empty, so nothing below could return 0 even if it
+    # were written.
+    if klass not in ALLOWED:
+        return decide(home, klass, task_id, record, "refused",
+                      f"{klass} is in no allowlist, because advisory is the only "
+                      "mode there is: this session records what you would have done "
+                      "and permits nothing", grant)
+    fault(f"{klass} is allowed by a list that is meant to be empty",
+          "advisory is the only mode that exists, so reaching this is a bug in "
+          "siana-gate and never a decision about the action")
+
+
+def when(text, sign):
+    """A moment, from an ISO stamp or from a plain duration like `12h`.
+
+    The duration exists because the captain types this at the helm, and hand
+    arithmetic on a UTC stamp at midnight is a real way to mean one thing and say
+    another."""
+    text = str(text).strip()
+    m = re.fullmatch(r"(\d+)([hm])", text)
+    if m:
+        n = int(m.group(1)) * (3600 if m.group(2) == "h" else 60)
+        return now().timestamp() + sign * n
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return (dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt).timestamp()
+
+
+def log(home, since, full):
+    """The captain's return report.
+
+    Newest first, because a captain reading what happened overnight is asking about
+    the recent past. One line each, with the whole record on request: the evidence
+    and the alternatives are what make a decision reviewable, and they do not fit on
+    a line."""
+    records = sorted(fold(os.path.join(home, LEDGER), "id").values(),
+                     key=lambda r: str(r.get("at", "")), reverse=True)
+    if full:
+        rec = next((r for r in records if r.get("id") == full), None)
+        if rec is None:
+            known = ", ".join(r["id"] for r in records[:8]) or "(nothing recorded)"
+            print(f"error: no decision {full} in {os.path.join(home, LEDGER)}",
+                  file=sys.stderr)
+            print(f"  recent: {known}", file=sys.stderr)
+            return REFUSED
+        print(json.dumps(rec, indent=2))
+        return PERMITTED
+    if since is not None:
+        cutoff = when(since, -1)
+        if cutoff is None:
+            print(f"error: --since {since!r} is neither a time nor a duration "
+                  "like 12h", file=sys.stderr)
+            return REFUSED
+        kept = []
+        for rec in records:
+            try:
+                at = datetime.fromisoformat(str(rec.get("at")))
+            except (TypeError, ValueError):
+                kept.append(rec)          # unreadable stamp: shown, never dropped
+                continue
+            at = at.replace(tzinfo=UTC) if at.tzinfo is None else at
+            if at.timestamp() >= cutoff:
+                kept.append(rec)
+        records = kept
+    if not records:
+        # Nothing decided is the ordinary state and never a fault, the way an empty
+        # queue and an unwatched fleet are.
+        print("decided  nothing")
+        return PERMITTED
+    print(f"decided  {len(records)}")
+    wid = max(len(r["id"]) for r in records)
+    for rec in records:
+        under = "" if rec.get("grant") else "  (no session)"
+        print(f"  {rec.get('verdict', '?'):<8} {rec['id']:<{wid}}  "
+              f"{rec.get('at', '?')}  {rec.get('action', '?')}{under}")
+        if rec.get("reason"):
+            print(f"  {'':<8} {'':<{wid}}  {rec['reason'].splitlines()[0]}")
+    print("  full   siana-gate log --full <id>")
+    return PERMITTED
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="siana-gate", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    # The class is a positional rather than a subcommand, so that a class this
+    # script does not know reaches the ordered checks and is answered there. Made a
+    # subcommand, argparse would refuse it first, with a message about choosing from
+    # a list and an exit code that happens to be 2 for an unrelated reason. The two
+    # codes agreeing by accident is not the same as this script saying that nothing
+    # is known, and only one of those is a contract a caller can read.
+    ap.add_argument("action", metavar="<class>|log",
+                    help=f"one of {', '.join(sorted(CLASSES))}, or `log`")
+    ap.add_argument("--task", help="the queue task this decision is about")
+    ap.add_argument("--record", help="the decision SIANA wrote, as JSON")
+    ap.add_argument("--since", help="log only: a time, or a duration back like 12h")
+    ap.add_argument("--full", metavar="ID", help="log only: one decision, whole")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+    if args.action == "log":
+        raise SystemExit(log(home, args.since, args.full))
+    if not args.task or not args.record:
+        # A fault and not a refusal, for the reason an unknown class is one: a caller
+        # that did not say what it wants has told this script nothing about the
+        # action, and silence is not a policy answer.
+        fault("a decision needs both --task and --record",
+              "usage: siana-gate <class> --task <id> --record <file>",
+              "the record is what SIANA read, what it rejected, and which principle "
+              "it is citing; without it there is no decision to record")
+    raise SystemExit(gate(home, args.action, args.task, args.record))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Fault as f:
+        print(f"error: {f.lines[0]}", file=sys.stderr)
+        for line in f.lines[1:]:
+            print(f"  {line}", file=sys.stderr)
+        raise SystemExit(FAULT) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None

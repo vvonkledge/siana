@@ -20,6 +20,27 @@ Re-running is safe and is the intended recovery. Publishing happens outside the
 store, so a SIANA that restarts between a QA verdict and this call cannot know
 whether the merge request exists; asking the forge is cheaper than inventing
 somewhere to record it, so an existing merge request is reported and exits zero.
+
+**While an advisory session is in force, this asks `siana-gate` before it pushes.**
+An advisory session permits nothing, so what actually happens is that the proposal is
+written into the captain's decision ledger - the exact command, the evidence, the
+principles SIANA cited, what it rejected - and then this refuses, before any network
+write. `--record` is where SIANA writes that proposal, and under a session it is
+required: a publish nobody can say the reasoning for is not one the captain can judge
+in the morning. The gate's own exit code is passed through, so a caller can still tell
+a refusal from a fault.
+
+**Passing `--record` is itself a request to be gated**, whether or not a session turns
+out to be running. A caller only writes a decision record because it believes it is
+under one, and the moment that belief can be wrong is the moment it matters: a session
+whose deadline passes at 06:00 releases its record, and a SIANA woken at 06:01 that
+had already written its proposal would otherwise push the branch and open the merge
+request with nothing recorded anywhere. So a record is always carried to the gate, and
+the gate answers a missing session by writing the proposal and refusing.
+
+**With no advisory session, nothing here changes.** The captain typed this command, or
+told SIANA to, and that is the authority it has always run on. A safety feature that
+made a direct instruction impossible would be a worse fleet, not a safer one.
 """
 
 import argparse
@@ -222,17 +243,72 @@ def create(forge: str, path: str, branch: str, target: str, title: str, body: st
     return out.stdout.strip()
 
 
+def propose(task_id: str, record: str) -> int:
+    """Ask `siana-gate` whether this may happen, and let it say so in its own words.
+
+    Resolved beside this script rather than found on PATH: a `siana-gate` that is not
+    there must be a refusal and never a publish that went ahead because a lookup came
+    back empty. Its output is not captured, so the decision id and the reason reach
+    whoever is reading, and its exit code is passed through, so a refusal and a fault
+    stay distinguishable all the way up."""
+    gate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "siana-gate")
+    if not os.path.isfile(gate):
+        die(f"an advisory session is in force and there is no {gate}",
+            "it is the only thing that answers whether this may happen, so without",
+            "it nothing is known and nothing is published",
+            "run `just init` in the distro")
+    out = subprocess.run([gate, "publish", "--task", task_id, "--record", record])
+    if out.returncode != 0:
+        print("nothing was pushed and no merge request was opened", file=sys.stderr)
+    return out.returncode
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Push and open the merge request for the branch a QA task accepted.")
     ap.add_argument("task_id", help="the QA task whose verdict authorises this")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the branch, target, title and body, and change nothing")
+    ap.add_argument("--record", metavar="FILE",
+                    help="the decision SIANA wrote, as JSON; required while an "
+                         "advisory session is in force, and a request to be gated "
+                         "whenever it is given")
     args = ap.parse_args()
 
     home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
     tasks_file = os.environ.get("SIANA_TASKS_FILE", os.path.join(home, "tasks.jsonl"))
     registry = os.path.join(home, "projects.jsonl")
+
+    # Whether this publish is gated at all. Two things say so, and either is enough.
+    #
+    # A session record being there is the ordinary one. Only its presence is asked
+    # here: whether the process behind it is alive, whether the deadline has passed,
+    # and whether the principles still hash to what it recorded are `siana-gate`'s to
+    # settle, and a second copy of that check here would be a second thing to keep
+    # right. A record whose process is gone therefore reaches the gate and is refused
+    # there, which is correct: it is a session the captain has to read and clear, and
+    # until they do, nothing publishes on the strength of a file nobody has looked at.
+    #
+    # `--record` being given is the other, and it is not a redundant one. A caller
+    # writes a decision record only because it believes it is under a session, and
+    # the case where that belief is wrong is the case that matters: the deadline
+    # passes at 06:00 and `siana-afk` releases the record, SIANA wakes at 06:01 with
+    # a proposal already written, and a publish that ignored the flag would push the
+    # branch and open the merge request with nothing in the ledger. Reading the flag
+    # as the request it is costs nothing, because with no session the gate records
+    # the proposal and refuses, which is exactly what the caller was asking for.
+    gated = args.record is not None or os.path.exists(os.path.join(home, "afk"))
+    # A dry run is exempt, because it changes nothing and records nothing either. A
+    # proposal written for a command that was never going to run would put a decision
+    # in front of the captain that SIANA did not make.
+    if gated and not args.record and not args.dry_run:
+        die("an advisory session is in force, so this publish needs --record",
+            "the record is what SIANA read, what it rejected, and which principle it",
+            "is citing, and it is what the captain reads in the morning instead of",
+            "a merge request that appeared while they were asleep",
+            "  siana-publish <qa-task-id> --record <file>",
+            "stop the session with `siana-afk --stop` if you are here and want this",
+            "published now")
 
     task = fold(tasks_file, "id").get(args.task_id)
     if task is None:
@@ -405,6 +481,15 @@ def main() -> None:
             print(f"warning: {cli} is not installed here, so a real run would refuse",
                   file=sys.stderr)
         return
+
+    # Every refusal above says this verdict does not authorise a publish or that the
+    # branch it names is not there, and both are true whoever is asking. This asks
+    # who is asking, and it comes before the checks below because those are about
+    # whether this machine could carry the publish out - which is a different
+    # question, and not one an advisory night needs answered. A proposal has to be
+    # recorded on a machine that has no forge CLI installed at all.
+    if gated:
+        raise SystemExit(propose(args.task_id, args.record))
 
     # Checked before the push, not after it. A missing CLI discovered later leaves
     # the branch published with no merge request and nothing saying why.
