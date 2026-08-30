@@ -766,14 +766,31 @@ class Watching(WakeTest):
         # so it fires once and is dead for every rename after. The interval is
         # taken away here on purpose, so a wake that arrives arrived through the
         # watch and through nothing else.
+        #
+        # Which makes the order of the two waits below load-bearing rather than
+        # tidy. A send is not a delivery: the extension keeps its attempt
+        # outstanding until pi confirms it, so a wake raised inside that window is
+        # correctly folded into `held` and not sent again - and with the interval
+        # gone there is no later drain left to send it. So each rename waits for
+        # the confirmation on disk, not merely for the send: `settle` says pi was
+        # handed the message, and only the mark says the extension is ready to be
+        # handed another wake.
+        #
+        # Pi's confirmation is delayed to hold that window wide open on purpose. At
+        # its natural width - one task - whether the next rename lands inside it is
+        # the scheduler's to decide, which is how a test that waited on `settle`
+        # alone passed here for as long as it did and failed on CI. Delayed, it
+        # fails every time instead.
         pi = self.session()
         pi("break-interval")
+        pi("delay-starts", ms=250)
         pi("start")
         for n in (1, 2, 3):
             self.raise_wake()
             state = pi("settle", sent=n)
             self.assertEqual(len(state["sent"]), n,
                              f"rename {n} was not observed: {state['sent']}")
+            self.took(n)
 
     def test_a_wake_still_arrives_where_there_is_no_watch_to_be_had(self):
         # A filesystem or a platform that will not give a watch is not a stop, and

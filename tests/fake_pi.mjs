@@ -138,6 +138,15 @@ const starts = [];
 // about telling turns apart unanswerable.
 let holdStarts = false;
 const heldStarts = [];
+// How long pi takes to come back with that start. A task by default, which is the
+// shortest the real gap can be. A test widens it to hold the window between an
+// accepted send and its confirmation open for as long as it needs, which is the
+// only way to drive that window on purpose: at a task wide, whether anything else
+// lands inside it is the scheduler's to decide, and a test that depended on it
+// would pass on one machine and fail on the next. Unlike `holdStarts` the
+// confirmation still arrives on its own, so a test can wait for the mark rather
+// than having to release it.
+let startDelay = 0;
 // Pi's follow-up buffer: a message handed to a turn in flight waits here rather
 // than being appended. It is a real queue here and not a counter because
 // `interrupt` empties it back into the editor, which is what pi does.
@@ -243,7 +252,7 @@ function prompt(text, source, deliverAs, holdable) {
   setTimeout(() => {
     if (holdable && holdStarts) heldStarts.push(text);
     else start(text);
-  }, 0);
+  }, startDelay);
 }
 
 function start(text) {
@@ -323,6 +332,12 @@ async function run(command) {
       return {};
     case "advance":
       clockOffset += command.ms;
+      return {};
+    case "delay-starts":
+      // Widen the gap between an accepted send and pi confirming it. Not a sleep
+      // standing in for correctness: what a test waits on is still the mark the
+      // extension writes, and this only decides when that mark can be written.
+      startDelay = command.ms;
       return {};
     case "hold-starts":
       // Stand inside the window between an accepted send and its confirmation.
