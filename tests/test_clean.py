@@ -814,6 +814,16 @@ class Run(HomeTest):
         out = self.clean("status", run_id)
         self.assertRefused(out, "cannot read the run record", "not resumable")
 
+    def test_the_runbook_on_a_missing_home_refuses_rather_than_traces(self):
+        # Reachable from SIANA's own context through the `siana_runbook` tool, which
+        # hands back whatever the command printed. A traceback there is what SIANA
+        # gets in place of a recovery.
+        out = self.run_cmd([os.path.join(BIN, "siana-clean"), "runbook"],
+                           env={"PATH": self.distro_path(),
+                                "SIANA_HOME": self.at("never-created")})
+        self.assertRefused(out, "no SIANA home at", "just init")
+        self.assertNotIn("Traceback", out.stdout + out.stderr)
+
     def test_an_unknown_run_id_lists_the_ones_there_are(self):
         self.assertAccepted(self.clean("start"))
         out = self.clean("status", "clean-19700101-000000")
@@ -1049,6 +1059,14 @@ class Run(HomeTest):
         for verb in ("list", "get", "keys", "stores", "validate", "schema"):
             self.assertNotIn("not this cleanup run's to call",
                              self.probe("datafile", "-f", "x.jsonl", verb), verb)
+
+    def test_removing_anything_by_hand_is_refused(self):
+        # The cleaner's rule names git, herdr and `rm` in one sentence, and this was
+        # the third of it that nothing enforced. The reach it leaves open is the
+        # dangerous one: `siana-retire` refuses a dirty or unanchored tree, and
+        # `rm -rf <worktree>` passes through none of the checks that refusal was made
+        # of.
+        self.assertIn("removes nothing itself", self.probe("rm", "-rf", "/nowhere"))
 
     def test_a_nested_agent_is_refused(self):
         self.assertIn("does not start another agent", self.probe("pi", "-p", "hi"))

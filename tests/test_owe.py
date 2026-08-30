@@ -456,6 +456,29 @@ class AttendedDecisions(HomeTest):
         self.assertRefused(self.decision(), "no attended-decision contract",
                            "just upgrade")
 
+    def test_no_attended_contract_is_a_stop_for_history_too(self):
+        # A home that has not been upgraded reported `decided nothing`, which is what
+        # a home with an empty corpus reports, while `siana-owe` and `siana-owe
+        # closed` went on listing real decisions. An uninstalled store rendered as an
+        # empty one is the failure the rest of this reporting is written against.
+        self.assertAccepted(self.decision())
+        os.remove(self.at("schema-attended.yaml"))
+        self.assertRefused(self.owe("history"), "no attended-decision contract")
+        self.assertRefused(self.owe("history", "--json"),
+                           "no attended-decision contract")
+        # The obligation itself is still readable, which is what makes the silent
+        # version of this so easy to miss.
+        self.assertIn("Whether to reap", self.assertAccepted(self.owe()))
+
+    def test_a_corrupt_line_names_the_store_that_is_corrupt(self):
+        # `fold` had one caller and one store when its recovery was written. It has
+        # two now, and a recovery naming the wrong file quarantines nothing.
+        self.assertAccepted(self.decision())
+        self.store("attended.jsonl", "{half a record")
+        out = self.assertRefused(self.owe("history"), "is not JSON")
+        self.assertIn("-f attended.jsonl repair", out)
+        self.assertNotIn("obligations.jsonl repair", out)
+
     def test_the_advisory_ledger_is_a_different_store_entirely(self):
         # `decisions.jsonl` holds what SIANA would have done while the captain was
         # away, and nobody was asked. Folding the two would put rows in the corpus

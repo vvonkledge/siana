@@ -130,8 +130,12 @@ def fold(store: str, key: str):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                # The store being folded, not the one this used to be the only reader
+                # of. `joined` folds `attended.jsonl` too, and a recovery naming the
+                # wrong file quarantines nothing and leaves the reader where it was.
                 die(f"{store} has a line that is not JSON",
-                    "run `datafile -f obligations.jsonl repair` to quarantine it")
+                    f"run `datafile -f {os.path.basename(store)} repair` to"
+                    " quarantine it")
             rid = rec.get(key)
             if rid is None:
                 continue
@@ -414,6 +418,11 @@ def main() -> None:
         return
 
     if args.cmd == "history":
+        # The contract first, for the reason `fold` gives: it is what says the store
+        # exists. Without it a home that has not been upgraded reported `decided
+        # nothing`, which is what a home with an empty corpus reports, while
+        # `siana-owe` and `siana-owe closed` went on listing real decisions.
+        need_attended(attended_schema)
         history_view(joined(store, attended), args.as_json)
         return
 
