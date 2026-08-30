@@ -28,7 +28,7 @@ jobs:
     # Named for the command it runs, so a red check tells you what to run locally.
     name: just test
     runs-on: ubuntu-latest
-    # The suite takes three or four minutes. This is a hang guard, not a budget.
+    # The suite takes six or seven minutes. This is a hang guard, not a budget.
     timeout-minutes: 15
 
     env:

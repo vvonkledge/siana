@@ -645,12 +645,16 @@ package is installed in the home's harness settings, whether a SIANA is running,
 whether an advisory session is, whether every in-flight task's minion is still alive
 in the pane it was dispatched to, what SIANA owes you, and the queue itself.
 
-It exits nonzero for exactly one of those: a home whose `.pi/settings.json` does not
-name the `pi-siana` package. Everything else is a line for you to read and act on,
-and that one is not, because you cannot see it from inside a session. A home missing
-that package has no `siana_cleanup` and no `siana_runbook` tool, no `captain-report`
-skill and no `/captain-report` command, and none of them fails: none of them is there
-to be called. If you script around `doctor`, that is the condition to expect.
+Almost all of that is a line for you to read and act on, and `doctor` exits zero
+having said so. Two things make it exit nonzero. The first it always had: the home's
+queue does not read at all, which includes there being no home there yet - the
+ordinary state before `just init`. The second is new: on a machine with `pi`, the
+distro's own `pi-siana` package is not installed into the home, whether because the
+settings file does not name it, names it twice, names it somewhere it is not, or is
+not there at all. That one fails rather than reports because you cannot see it from
+inside a session. A home missing that package has no `siana_cleanup` and no
+`siana_runbook` tool, no `captain-report` skill and no `/captain-report` command, and
+none of them fails: none of them is there to be called.
 
 Things it says that are not faults:
 
@@ -675,10 +679,11 @@ Things it says that are:
 - `GONE <task>: herdr has no agent in <pane>`. A minion died. `tasks reset` reclaims
   the task, and it stays manual, because that minion's worktree may hold work nobody
   has landed.
-- `missing pi-siana package: <why>`. The home's `.pi/settings.json` does not name the
-  distro's package, or names it twice, or names it somewhere it is not. `just init`
-  installs it and collapses a duplicate back to one. This is the one thing here that
-  also makes `doctor` exit nonzero.
+- `missing pi-siana package: <why>`, and `missing .pi/settings.json` on a machine
+  with `pi`. The distro's own package is not installed in this home: the settings
+  file does not name it, names it twice, names it somewhere it is not, or is not
+  there at all. `just init` installs it and collapses a duplicate back to one. This
+  and an unreadable queue are what make `doctor` exit nonzero.
 
 ## Uninstall
 

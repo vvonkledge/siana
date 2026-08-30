@@ -446,7 +446,7 @@ test *args:
     # directly never writes its own, and the `bin/` commands import stdlib only. What
     # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
     # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner, against a suite that already takes three or four minutes.
+    # on a cold runner, against a suite that already takes six or seven minutes.
     # Invisible locally, where the captain's uv cache is already warm.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
@@ -526,6 +526,12 @@ doctor: _contract-drift
             starts="$starts $cmd"
         else
             echo "  missing $f (\`just init\` writes it)"
+            # For pi this is the package check below reached by another route. A
+            # home with no pi settings at all names no pi-siana package either, and
+            # everything that package carries is missing with it - but the check
+            # needs a file to read, so it is never reached to say so. Without this
+            # the one case the check exists for exits 0.
+            if [ "$cmd" = pi ]; then unhealthy=1; fi
         fi
         # The wake consumer, reported only for the harness that has one. It is what
         # delivers `siana-watch`'s wake inside the session without writing into the

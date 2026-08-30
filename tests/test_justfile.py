@@ -220,6 +220,16 @@ class Doctor(Recipe):
         self.just("doctor")
         self.assertTrue(os.path.exists(self.at("afk")))
 
+    @unittest.skipUnless(has("pi"), "the package is reported for pi only")
+    def test_a_pi_home_with_no_settings_at_all_is_never_reported_healthy(self):
+        # The case the package check exists for, arriving one layer up. With no
+        # settings file there is nothing for the check to read, so it is never
+        # reached - and a home that names no pi-siana package at all exited 0 while
+        # a home that named it badly exited 1.
+        out = self.just("doctor")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("missing .pi/settings.json", out.stdout)
+
     @unittest.skipUnless(has("pi"), "the wake extension is reported for pi only")
     def test_a_pi_home_without_the_wake_extension_is_named_as_missing(self):
         # The watcher refuses to start without it, so a home missing it is one where
