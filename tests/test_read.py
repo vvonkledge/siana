@@ -269,6 +269,55 @@ class NeverAnEmptyStore(Read):
         self.assertEqual(doc["records"], [])
         self.assertIsNone(doc["revision"]["inode"])
 
+    def test_the_queue_is_read_where_the_rest_of_the_fleet_reads_it(self):
+        """`SIANA_TASKS_FILE` points at the queue, and this follows it.
+
+        That variable is how a minion is pointed at the fleet queue from outside its
+        home, and `siana-dispatch` exports it into every minion's environment. A
+        command that ignored it would answer about a different file than `tasks` and
+        every other command in `bin/` do.
+        """
+        elsewhere = self.at("elsewhere")
+        os.makedirs(elsewhere)
+        out = self.run_cmd(["tasks", "init"], cwd=elsewhere)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        queue = os.path.join(elsewhere, "tasks.jsonl")
+        self.run_cmd(["datafile", "-f", queue,
+                      "-c", os.path.join(elsewhere, "schema-tasks.yaml"), "put",
+                      "--set", "id=away", "--set", "title=away",
+                      "--set", "verify=just test",
+                      "--set", "updated=2026-08-01T00:00:00Z"])
+        code, doc = self.read("tasks", env={"SIANA_TASKS_FILE": queue})
+        self.assertEqual(code, OK, doc)
+        self.assertEqual([r["id"] for r in doc["records"]], ["away"])
+
+    def test_a_queue_outside_the_home_is_never_read_as_the_empty_home_one(self):
+        """The quiet shape of the same bug, and the reason it is worth a test.
+
+        An initialised home always has `schema-tasks.yaml`, so a command keyed on the
+        home would pass its contract check, find no `tasks.jsonl` beside it, and
+        answer `records: []` with exit 0 - a full queue rendered as an empty fleet,
+        which is the one answer this command exists not to give.
+        """
+        elsewhere = self.at("elsewhere")
+        os.makedirs(elsewhere)
+        out = self.run_cmd(["tasks", "init"], cwd=elsewhere)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        queue = os.path.join(elsewhere, "tasks.jsonl")
+        self.run_cmd(["datafile", "-f", queue,
+                      "-c", os.path.join(elsewhere, "schema-tasks.yaml"), "put",
+                      "--set", "id=away", "--set", "title=away",
+                      "--set", "verify=just test",
+                      "--set", "updated=2026-08-01T00:00:00Z"])
+        # The home has its contract and no queue of its own, which is exactly the
+        # state that made the wrong answer look like a right one - and it is the
+        # state `tasks init` leaves, because the log is written on the first task.
+        self.assertTrue(os.path.isfile(self.at("schema-tasks.yaml")))
+        self.assertFalse(os.path.isfile(self.at("tasks.jsonl")))
+        code, doc = self.read("tasks", env={"SIANA_TASKS_FILE": queue})
+        self.assertEqual(code, OK, doc)
+        self.assertEqual(doc["total"], 1, doc)
+
     def test_datafile_missing_from_the_path_refuses(self):
         # Nothing here can fold a store on its own, so a `datafile` it cannot run is
         # a stop. The failure this prevents is the tempting fallback: a hand-rolled
@@ -804,6 +853,30 @@ class TheContract(Read):
                     self.assertIn(key, doc)
                 for key in ("inode", "size", "mtime_ns"):
                     self.assertIn(key, doc["revision"])
+
+    def test_a_request_this_command_cannot_parse_is_a_document_too(self):
+        """The failure a console is most likely to cause itself.
+
+        A subcommand or a flag this version does not have is argparse's to refuse,
+        and argparse writes prose to stderr and leaves stdout empty. That is the
+        single-document contract broken exactly where a consumer most needs
+        something to parse, so these paths answer like every other refusal here.
+        """
+        for args in ((), ("nope",), ("tasks", "--bogus"),
+                     ("tasks", "--limit", "abc"), ("tasks", "--fields")):
+            with self.subTest(args):
+                code, doc = self.read(*args)
+                self.assertEqual(code, USAGE, doc)
+                self.assertEqual(doc["code"], "USAGE_ERROR", doc)
+                self.assertIn("error", doc)
+
+    def test_help_is_the_one_exit_that_is_neither(self):
+        # A person asking to read the usage, and the only run here that is neither an
+        # answer nor a refusal. Named so that its absence from the contract above is
+        # a decision on the record rather than a gap nobody noticed.
+        out = self.run_bin("siana-read", "--help")
+        self.assertEqual(out.returncode, OK, out.stdout + out.stderr)
+        self.assertIn("siana-read", out.stdout)
 
     def test_a_refusal_is_a_document_too(self):
         empty = self.at("not-a-home")

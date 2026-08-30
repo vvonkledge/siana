@@ -551,7 +551,10 @@ or refused, and the exit code is the verdict:
 
     0   the document answers the question
     1   the source could not be read, or could not be trusted
-    2   the request was wrong: an unknown field, an unparseable timestamp
+    2   the request was wrong: an unknown subcommand, flag, field or timestamp
+
+`--help` is the one exception, and it is the one that is neither an answer nor a
+refusal: it prints the usage for a person to read.
 
 The four stores answer in one shape:
 
@@ -593,6 +596,11 @@ Two refusals are worth knowing about, because they look like answers:
   exist until the first decision is written, and that is an honest empty answer with
   a null `inode`. A directory holding no contracts is refused on all four stores,
   which is what a mistyped `SIANA_HOME` gets instead of a fleet with nothing in it.
+
+Three of the stores live in the home. The queue is read through `SIANA_TASKS_FILE`
+when that is set, the same way every other command here resolves it, so a minion
+pointed at a queue outside its home reads the one the rest of the fleet is using.
+Each store's contract is looked for beside it, named `schema-<store>.yaml`.
 
 It is not literally read-only on disk, and it is worth saying so plainly before
 anything is built on top of it: a `datafile` read may rewrite the `.idx` cache

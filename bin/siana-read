@@ -59,18 +59,9 @@ import sys
 import time
 from datetime import UTC, datetime
 
-# The stores, and the contract that says each one exists. The contract is the
-# existence test and the log is not: a store with no writes yet has no log file at
-# all, which is empty rather than broken, and `bin/siana-owe:98-104` already reads
-# it that way. Keying on the contract is also what catches the failure that would
-# otherwise be silent - a wrong or unwritten `$SIANA_HOME` has no contracts in it,
-# so every command here refuses rather than reporting an empty fleet.
-STORES = {
-    "tasks": ("tasks.jsonl", "schema-tasks.yaml"),
-    "projects": ("projects.jsonl", "schema-projects.yaml"),
-    "obligations": ("obligations.jsonl", "schema-obligations.yaml"),
-    "decisions": ("decisions.jsonl", "schema-decisions.yaml"),
-}
+# The four stores this reads. Only their names are here; where each one lives is
+# resolved below, because one of them moves.
+STORES = ("tasks", "projects", "obligations", "decisions")
 
 OK, REFUSED, USAGE = 0, 1, 2
 
@@ -194,6 +185,34 @@ def datafile_json(source, argv, store):
     return doc
 
 
+def store_paths(source, home):
+    """Where a store lives, and the contract beside it.
+
+    `tasks` is the one that moves. `SIANA_TASKS_FILE` is how a minion is pointed at
+    the fleet queue from outside the home, and `siana-dispatch:529` exports it into
+    every minion's environment - so every other command in `bin/` resolves the queue
+    through it, and one that did not would answer about a different file than the
+    rest of the fleet. The quiet shape is the dangerous one: an initialised home
+    always has `schema-tasks.yaml`, so the contract check below would pass, and a
+    home whose own `tasks.jsonl` happens not to exist would answer a full queue with
+    an empty one.
+
+    The contract is looked for beside the store and named after it, which is
+    `datafile`'s own first rule (`find_contract`, `datafile.py:807-819`) and what
+    both `just init` and `tasks init` write. A store somewhere else therefore
+    carries its own contract, rather than being read against the home's.
+    """
+    if source == "tasks":
+        path = (os.environ.get("SIANA_TASKS_FILE")
+                or os.path.join(home, "tasks.jsonl"))
+    else:
+        path = os.path.join(home, f"{source}.jsonl")
+    path = os.path.abspath(os.path.expanduser(path))
+    stem = os.path.basename(path)
+    stem = stem[:-len(".jsonl")] if stem.endswith(".jsonl") else stem
+    return path, os.path.join(os.path.dirname(path), f"schema-{stem}.yaml")
+
+
 def read_store(source, home, fields=None):
     """A store's live records, from `datafile` and from nowhere else.
 
@@ -201,17 +220,15 @@ def read_store(source, home, fields=None):
     own: it validates the names against the contract, which is the check that turns
     a typo into a refusal instead of into a column of nulls.
     """
-    name, contract = STORES[source]
-    store = os.path.join(home, name)
-    schema = os.path.join(home, contract)
+    store, schema = store_paths(source, home)
     # The contract, and not the log. A missing log is a store nothing has written
     # to yet; a missing contract is a directory that is not a SIANA home, and
     # answering that with an empty list is how a mistyped `$SIANA_HOME` would read
     # as a fleet with no work, no projects and nothing owed.
     if not os.path.isfile(schema):
-        raise Refusal(source, f"no contract for {name} at {schema}", "NO_CONTRACT",
-                      [f"{home} is not an initialised SIANA home, or this store "
-                       f"predates its contract",
+        raise Refusal(source, f"no contract for {source} at {schema}", "NO_CONTRACT",
+                      [f"{os.path.dirname(schema)} is not an initialised SIANA "
+                       f"home, or this store predates its contract",
                        "run `just init` in the distro against that home"],
                       store=store)
     argv = ["datafile", "-f", store, "-c", schema, "list", "--json", "--limit", ALL]
@@ -704,10 +721,34 @@ def cmd_health(args, home):
 
 # -------------------------------------------------------------------- the CLI
 
+class Parser(argparse.ArgumentParser):
+    """argparse, refusing in the one shape everything else here refuses in.
+
+    Its own `error` writes usage prose to stderr and leaves stdout empty, which
+    breaks the single-document contract on the failure a console is most likely to
+    cause itself: a subcommand or a flag this version does not have. A consumer
+    would have nothing to parse exactly where it most needs to be told what it got
+    wrong.
+
+    `--help` is left alone. It is a person asking to read the usage, not a program
+    asking a question, and it is the one exit here that is neither an answer nor a
+    refusal.
+    """
+
+    def error(self, message):
+        # The subcommand when there is one: argparse names a subparser
+        # "siana-read tasks", so the last word is the source the caller was asking
+        # about, and the bare prog when it never got that far.
+        raise Refusal(self.prog.split()[-1], message, "USAGE_ERROR",
+                      [f"run `{self.prog} --help` for the full reference"],
+                      status=USAGE)
+
+
 def build_parser():
-    ap = argparse.ArgumentParser(
-        prog="siana-read",
-        description="fleet state as JSON: one document on stdout, always")
+    ap = Parser(prog="siana-read",
+                description="fleet state as JSON: one document on stdout, always")
+    # Subparsers inherit this class from `ap`, so a bad flag on a subcommand refuses
+    # the same way a bad subcommand does.
     sub = ap.add_subparsers(dest="what", required=True)
 
     p = sub.add_parser("tasks", help="the fleet queue")
