@@ -135,9 +135,13 @@ if [ -f "$home/schema-obligations.yaml" ]; then
 }# What SIANA owes ($home/obligations.jsonl)
 $owed
 
-Record a new one with \`siana-owe promise|decision <text>\`, and retire it with
-\`siana-owe close <id> --answer <text>\` when a durable event answers it. Never
-close one from recollection, and never carry one in this conversation instead."
+Record a promise with \`siana-owe promise <text>\`. A decision carries more, because
+it is also the fleet's record of what the captain decides and why: \`siana-owe
+decision <text> --situation ... --option ... --consequence ... --recommend ...
+--because ...\`, at least two options and one consequence each, and it refuses
+anything less. Retire either with \`siana-owe close <id> --answer <text>\` when a
+durable event answers it. Never close one from recollection, and never carry one in
+this conversation instead."
 fi
 
 prompt=()

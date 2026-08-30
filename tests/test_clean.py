@@ -708,8 +708,35 @@ class Run(HomeTest):
         out = self.clean("abort", run_id, "--reason", "the captain said stop")
         self.assertRefused(out, "aborted", "nothing was undone")
         self.assertEqual(self.record(run_id)["status"], "failed")
-        self.assertTrue(os.path.exists(
+        # The question is kept, as history rather than as a live one.
+        self.assertFalse(os.path.exists(
             self.at("cleanup", "runs", run_id, "question.json")))
+        kept = [f for f in os.listdir(self.at("cleanup", "runs", run_id))
+                if f.startswith("abandoned-")]
+        self.assertEqual(len(kept), 1, kept)
+
+    def test_an_aborted_run_stops_reporting_a_question_to_answer(self):
+        # `pending()` is "the file is there", so a kept question meant `status` went
+        # on exiting 3 forever and the captain's report went on listing an aborted
+        # run under what the captain has to decide.
+        self.write_script(self.ask_script())
+        self.clean("start")
+        run_id = self.only_run()
+        self.clean("abort", run_id, "--reason", "the captain said stop")
+        status = self.clean("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertNotIn("answer siana-clean answer", status.stdout)
+        records = json.loads(self.assertAccepted(self.clean("status", "--json")))
+        self.assertIsNone(records[0]["question"])
+
+    def test_a_new_run_starts_after_an_abort(self):
+        # The other half of the same defect: answering an aborted run's question
+        # moved it to `answered`, and `start` refuses every new run while one is.
+        self.write_script(self.ask_script())
+        self.clean("start")
+        self.clean("abort", self.runs()[-1], "--reason", "stop")
+        self.write_script(QUIET)
+        self.assertAccepted(self.clean("start"))
 
     # -- bounds -------------------------------------------------------------
 
@@ -826,8 +853,16 @@ class Run(HomeTest):
         self.assertNotIn("while a question is waiting", out)
 
     def test_the_destructive_git_verbs_are_refused_and_the_readers_are_not(self):
+        # The working-tree half matters as much as the history half, and for a
+        # sharper reason: `siana-retire` refuses a tree holding uncommitted,
+        # untracked or ignored work, so `git restore .`, `git checkout -- .` and
+        # `git stash` are the obvious next commands for a cleaner trying to get past
+        # that refusal - which is exactly the reach this guard exists to catch.
         for argv in (["git", "push"], ["git", "worktree", "remove", "x"],
-                     ["git", "branch", "-D", "x"], ["git", "reset", "--hard"]):
+                     ["git", "branch", "-D", "x"], ["git", "reset", "--hard"],
+                     ["git", "restore", "."], ["git", "checkout", "--", "."],
+                     ["git", "stash"], ["git", "clean", "-fdx"],
+                     ["git", "switch", "main"], ["git", "rm", "-rf", "."]):
             self.assertIn("not this cleanup run's to call", self.probe(*argv), argv)
         for argv in (["git", "worktree", "list"], ["git", "status"]):
             self.assertNotIn("not this cleanup run's to call", self.probe(*argv),

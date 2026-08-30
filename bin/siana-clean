@@ -152,8 +152,10 @@ GUARDS = {
     "datafile": (("words:put,rm,delete,repair",
                   "the stores are SIANA's; a cleanup run reads them and never"
                   " writes"),),
-    "git": (("words:push,commit,merge,rebase,reset,clean,am,cherry-pick",
-             "nothing in a cleanup run changes a repository's history"),),
+    "git": (("words:push,commit,merge,rebase,reset,clean,am,cherry-pick,revert,"
+             "apply,restore,checkout,switch,stash,rm,mv",
+             "a cleanup run changes neither a repository's history nor its"
+             " working tree"),),
     "herdr": (("words:close,remove,kill,prompt",
                "worktree and workspace removal is `siana-retire`'s, and only its"),),
 }
@@ -1295,12 +1297,28 @@ def cmd_abort(paths: Home, args) -> int:
             os.killpg(os.getpgid(rec["pid"]), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError, TypeError):
             pass
+    # A question on an aborted run is history, and it has to stop being a pending
+    # one. `pending()` is "the file is there", so a kept question.json meant `status`
+    # went on exiting 3 forever, the captain's report went on listing it under what
+    # the captain has to decide, and the hint `status` prints made it worse: an
+    # answer would have moved the run to `answered`, and `start` refuses every new
+    # run while one is. Moved rather than deleted, because what the run asked is the
+    # useful half of an aborted run.
+    question = pending(paths, args.run)
+    if question:
+        os.replace(paths.question(args.run),
+                   os.path.join(paths.run_dir(args.run),
+                                f"abandoned-{question['qid']}.json"))
     write_json(paths.record(args.run),
                dict(rec, status="failed", updated=now(),
                     detail=f"aborted: {args.reason}"))
     print(f"aborted  {args.run}")
     print(f"  why    {args.reason}")
-    print("  state  the run's questions and rounds are kept; nothing was undone")
+    print("  state  the run's rounds are kept and nothing was undone")
+    if question:
+        print(f"  unasked {question['body']}")
+        print("          it was never answered; a new run will ask again if it")
+        print("          still matters")
     return 1
 
 
