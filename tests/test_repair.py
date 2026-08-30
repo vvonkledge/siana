@@ -28,6 +28,7 @@ import os
 import shutil
 import stat
 import unittest
+from unittest import mock
 
 from advisory import PROPOSAL
 from helpers import HomeTest, script
@@ -414,13 +415,15 @@ class Advancing(Fleet):
         self.assertIn("## Hotspots", text)
 
     def test_a_dry_run_without_the_client_still_shows_the_copy(self):
-        text = self.assertAccepted(self.publish("--dry-run", PATH="/usr/bin:/bin"))
+        text = self.assertAccepted(
+            self.publish("--dry-run", PATH=self.path_with_no_forge_client()))
         self.assertIn("body:", text)
         self.assertIn("## Hotspots", text)
 
     def test_a_dry_run_without_the_client_still_says_what_it_would_do(self):
         # CI has neither client, and a dry run has to stay readable there.
-        text = self.assertAccepted(self.publish("--dry-run", PATH="/usr/bin:/bin"))
+        text = self.assertAccepted(
+            self.publish("--dry-run", PATH=self.path_with_no_forge_client()))
         self.assertIn(self.ship_branch, text)
         self.assertIn("is not installed here", text)
         self.assertRemoteUnmoved()
@@ -674,6 +677,107 @@ class Github(Fleet):
         self.assertEqual(edited[0][:4], ["gh", "pr", "edit", self.ship_branch])
 
 
+# What an installed client says when it cannot speak to its forge. The github one
+# is verbatim what Actions run 33301560920 read back, which is the whole reason
+# these exist: it is a refusal, it names the client, and it is not absence.
+HOST_CLIENT = {
+    "gh": "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN "
+          "environment variable.",
+    "glab": "glab: authentication required, run glab auth login",
+}
+
+
+class AForgeClientTheHostProvides(Fleet):
+    """A machine that has a client installed, for the tests that say it has none.
+
+    This is the regression that took the suite green here and red on GitHub
+    Actions. Three tests hid the client by passing `PATH=/usr/bin:/bin`, which is a
+    claim about this machine's package layout rather than the world those tests
+    name. An Actions runner keeps `gh` in `/usr/bin` and hands it no `GH_TOKEN`, so
+    all three drove the real client and read its login error back: the two dry runs
+    never reached the output they exist to defend, and the refusal test matched a
+    message about a client that is installed and cannot answer, which is a
+    different refusal with a different reason (run 33301560920).
+
+    So this puts exactly such a client on the machine's own PATH, in front of
+    everything, and drives both halves - what the old fixture would have seen, and
+    what the one in use now sees in the same world. `/usr/bin` is not writable from
+    a test, so the client stands at the front of that PATH instead of inside it;
+    what the old fixture trusted was the directory, and either way it is the host
+    providing the client and not the test handing it over.
+    """
+
+    CLI = "gh"
+
+    def setUp(self):
+        super().setUp()
+        self.hostbin = self.at("hostbin")
+        os.makedirs(self.hostbin)
+        for name, says in HOST_CLIENT.items():
+            path = os.path.join(self.hostbin, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         f"echo '{says}' >&2\n"
+                         "exit 4\n")
+            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        # On the environment's own PATH, because that is where every fixture here
+        # starts from. Handed to one command as an argument it would prove nothing:
+        # what failed on CI was the machine underneath the fixture.
+        patched = mock.patch.dict(
+            os.environ,
+            {"PATH": os.pathsep.join([self.hostbin, os.environ["PATH"]])})
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def test_the_host_client_answers_when_nothing_hides_it(self):
+        # The control, and the failure itself. Without it the tests below would
+        # pass just as well against a client that was never there to be hidden.
+        out = self.publish(PATH=os.environ["PATH"])
+        text = self.assertRefused(out, "could not say what is open",
+                                  HOST_CLIENT[self.CLI])
+        self.assertNotIn("is not installed", text)
+
+    def test_the_absent_client_path_resolves_neither_client_and_still_has_git(self):
+        # The boundary itself, named rather than inferred from a refusal: absence
+        # is the fixture's to create, and the ordinary utilities a command needs
+        # are not the fixture's to take away.
+        path = self.path_with_no_forge_client()
+        for name in ("gh", "glab"):
+            self.assertIsNone(shutil.which(name, path=path), name)
+        for name in ("git", "env", "python3"):
+            self.assertIsNotNone(shutil.which(name, path=path), name)
+
+    def test_a_real_run_reports_absence_and_never_the_hosts_client(self):
+        out = self.publish(PATH=self.path_with_no_forge_client())
+        text = self.assertRefused(out, f"{self.CLI} is not installed")
+        self.assertNotIn(HOST_CLIENT[self.CLI], text)
+        self.assertRemoteUnmoved()
+        self.assertNothingTouched()
+
+    def test_a_dry_run_still_says_what_it_would_do_and_shows_the_copy(self):
+        text = self.assertAccepted(
+            self.publish("--dry-run", PATH=self.path_with_no_forge_client()))
+        self.assertIn(f"{self.CLI} is not installed here", text)
+        self.assertIn(self.ship_branch, text)
+        self.assertIn("body:", text)
+        self.assertIn("## Hotspots", text)
+        self.assertNotIn(HOST_CLIENT[self.CLI], text)
+        self.assertRemoteUnmoved()
+
+
+class AForgeClientTheHostProvidesOnGitlab(AForgeClientTheHostProvides):
+    """The same machine, publishing to the other forge.
+
+    Nothing in the fixture is forge-specific, and that is the claim: a runner with
+    `glab` installed would take the gitlab half of these tests down exactly the
+    wrong path, and only a run says it does not.
+    """
+
+    FORGE = "gitlab"
+    CLI = "glab"
+    URL = "https://gitlab.com/demo/demo/-/merge_requests/15"
+
+
 class Refusals(Fleet):
     """Every way this could push at something nobody accepted, or nobody reads.
 
@@ -734,7 +838,7 @@ class Refusals(Fleet):
         self.assertRemoteUnmoved()
 
     def test_the_client_is_not_installed(self):
-        out = self.publish(PATH="/usr/bin:/bin")
+        out = self.publish(PATH=self.path_with_no_forge_client())
         self.assertRefused(out, "is not installed")
         self.assertRemoteUnmoved()
 

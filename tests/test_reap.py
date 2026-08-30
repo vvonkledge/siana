@@ -180,8 +180,9 @@ class Reap(HomeTest):
         to read as "could not tell", never as a traceback."""
         self.branch("siana/landed", landed=True)
         self.project("demo", path=self.repo, target="main")
-        text = self.assertAccepted(self.run_bin("siana-reap", "demo", "--yes",
-                                                env={"PATH": "/usr/bin:/bin"}))
+        text = self.assertAccepted(self.run_bin(
+            "siana-reap", "demo", "--yes",
+            env={"PATH": self.path_with_no_forge_client()}))
         self.assertIn("reaped (contained)", text)
         self.assertEqual(self.git("branch", "--list", "siana/landed").strip(), "")
 

@@ -490,16 +490,17 @@ class DryRun(Publishable):
     def test_a_missing_forge_cli_stops_a_real_run_before_it_pushes(self):
         # Discovered after the push, this leaves the branch published with no merge
         # request and nothing on the record saying why.
-        out = self.run_bin("siana-publish", "qa-add-json", env={"PATH": "/usr/bin:/bin"})
+        out = self.run_bin("siana-publish", "qa-add-json",
+                           env={"PATH": self.path_with_no_forge_client()})
         self.assertRefused(out, "glab is not installed",
                            "nowhere to open a merge request")
 
     def test_a_dry_run_still_describes_the_plan_without_the_cli(self):
         # A dry run changes nothing, so it has to stay readable on a machine that
         # could not carry it out - including CI, which has neither glab nor gh.
-        text = self.assertAccepted(self.run_bin("siana-publish", "qa-add-json",
-                                                "--dry-run",
-                                                env={"PATH": "/usr/bin:/bin"}))
+        text = self.assertAccepted(self.run_bin(
+            "siana-publish", "qa-add-json", "--dry-run",
+            env={"PATH": self.path_with_no_forge_client()}))
         self.assertIn("branch:  siana/add-json", text)
         self.assertIn("glab is not installed here", text)
 
@@ -848,14 +849,15 @@ class WithNoSession(Publishable):
     def test_no_record_is_required(self):
         # And it gets no further than the check that was already there.
         out = self.run_bin("siana-publish", "qa-add-json",
-                           env={"PATH": "/usr/bin:/bin"})
+                           env={"PATH": self.path_with_no_forge_client()})
         self.assertRefused(out, "glab is not installed")
         self.assertNotIn("--record", out.stderr)
 
     def test_nothing_is_recorded_in_the_ledger(self):
         # The captain typed this, or told SIANA to, and that is the authority it has
         # always run on. There is no decision to write down.
-        self.run_bin("siana-publish", "qa-add-json", env={"PATH": "/usr/bin:/bin"})
+        self.run_bin("siana-publish", "qa-add-json",
+                     env={"PATH": self.path_with_no_forge_client()})
         self.assertFalse(os.path.exists(self.at("decisions.jsonl")))
 
     def test_a_record_passed_with_no_session_is_still_gated(self):
