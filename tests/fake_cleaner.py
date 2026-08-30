@@ -24,7 +24,7 @@ The script is a JSON file named by `SIANA_FAKE_PI`:
                {"run": ["siana-retire", "some-task"]},
                {"raw": "not json at all"},
                {"sleep": 30},
-               {"waitfor": "/a/path/the/test/creates"}],
+               {"waitfor": "/a/path/the/test/creates", "waitfor_s": 120}],
      "exit": 0}
 
 Every invocation appends what it was given to `$SIANA_FAKE_PI.calls`, one JSON object
@@ -88,7 +88,18 @@ def main() -> int:
             # short is flaky and too long is the whole suite. This parks the round
             # until the test says otherwise, so the interleaving is decided rather
             # than raced for.
+            #
+            # Bounded, like every other step here. This process is started in a
+            # session of its own, so nothing the test does to the command that
+            # spawned it reaches this one: an unbounded wait plus a test that fails
+            # before it writes the barrier leaves a process polling forever, outliving
+            # the whole suite run. The bound is long enough that no passing test ever
+            # reaches it and short enough to be a stray that clears itself.
+            deadline = time.time() + step.get("waitfor_s", 120)
             while not os.path.exists(step["waitfor"]):
+                if time.time() > deadline:
+                    say(f"gave up waiting for {step['waitfor']}")
+                    return 1
                 time.sleep(0.02)
         elif "ask" in step:
             ask = step["ask"]

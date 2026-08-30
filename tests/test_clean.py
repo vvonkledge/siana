@@ -741,6 +741,11 @@ class Run(HomeTest):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             start_new_session=True)
         self.addCleanup(winner.kill)
+        # Registered after the kill so it runs before it: cleanups are unwound in
+        # reverse. A test that fails before it releases the barrier below would
+        # otherwise leave the cleaner parked while `kill` took away the only process
+        # that reaps it, and the cleaner is in a session of its own.
+        self.addCleanup(lambda: open(barrier, "w").close())
         self.assertTrue(until(lambda: self.calls()), "the winner never started")
 
         loser = self.clean("start")
