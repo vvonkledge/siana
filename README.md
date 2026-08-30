@@ -116,9 +116,27 @@ so a contract with no `.jsonl` beside it is an empty store and not a broken inst
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
-`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`. They are
-links, so a `git pull` here updates the commands with no reinstall. It does not
-update the home; `just upgrade` does that.
+`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
+`siana-clean`, `siana-report`. They are links, so a `git pull` here updates the
+commands with no reinstall. It does not update the home; `just upgrade` does that.
+
+### The distro's own pi package
+
+Beside the queue integration, `init` installs `template/pi-siana` into the home as a
+project-local pi package. It carries three things:
+
+    siana_cleanup, siana_runbook   tools, so SIANA can delegate fleet cleanup
+    captain-report                 a skill, reached as `/skill:captain-report`
+    /captain-report                the same procedure, as the command you type
+
+It is installed from this checkout rather than copied, so a `git pull` updates it the
+way it updates the commands. It is also installed exactly once: pi identifies a local
+package by its resolved absolute path, so the same package reached through two
+spellings is two packages to pi and every resource in it is discovered twice. `init`
+reconciles the settings entry rather than appending one.
+
+Loading it starts nothing. No process, no watcher, no timer, no model. A cleanup run
+begins when something calls the tool, and never before.
 
 ### The queue integration
 
@@ -460,6 +478,103 @@ what you wanted.
 `~/.siana/review.md` is what that reviewer is told. It is yours to edit, like every
 other instruction file in the home.
 
+### Delegate the cleanup
+
+Retiring worktrees and reaping branches is long, repetitive and almost entirely
+mechanical. Done inside SIANA's session it is thirty rounds of tool output crowding
+out the fleet. So it happens somewhere else, and SIANA sees only what it has to
+answer:
+
+    siana-clean start --grant retire       one run, in its own context
+    siana-clean status                     what it is doing, or stopped on
+    siana-clean answer <run> --text ...    your answer to its question
+    siana-clean resume <run>               carry it on from there
+
+At the helm you never type these: SIANA calls the `siana_cleanup` tool the pi package
+registers, and it is the same command underneath.
+
+A run carries a grant, and the grants are named after the commands they unlock.
+`inventory` reads and is always in force. `retire` adds `siana-retire`. `reap-report`
+adds `siana-reap` in its report-only form. There is no grant that reaches `siana-reap
+--yes`, because a wrong reap is the one mistake in this fleet that loses work, and
+there is none that closes a herdr workspace, because `siana-retire` owns worktree
+removal and a second route to the same destruction would be a second copy of a safety
+judgment that must have exactly one.
+
+The cleaner does no safety thinking of its own. It enumerates and delegates, and
+every refusal it meets is one of your existing commands refusing on its own terms.
+What it does instead of guessing is stop:
+
+    $ siana-clean start --grant retire
+    run      clean-20260830-0730
+      round  1
+      asks   design-three-part's tree holds 44 untracked files; are they yours?
+      kind   siana
+      answer siana-clean answer clean-20260830-0730 --text <your answer>
+
+The question is on disk before anybody reads it, and nothing after that point runs
+until an answer is recorded. Answering and resuming are two operations with a process
+boundary between them, so nothing is ever waiting on anything else and a restart
+loses at most a round.
+
+A question the cleaner marks `captain` is one SIANA cannot answer for you. It becomes
+an ordinary recorded decision, you answer it, and only then can the run be unblocked.
+
+Every answer lands in `$SIANA_HOME/runbook.md`, which the next cleaner reads first.
+Nothing else can write there: entries are built out of the question a cleaner wrote
+down and the answer SIANA recorded, so a guess, a secret or a stray piece of
+transcript has no way in.
+
+If anything goes wrong, nothing was half-done. The mutations belong to commands that
+fail closed on their own inputs, so a killed cleaner, an unavailable model or a
+corrupt run record all leave the fleet exactly as it was. `siana-clean status` says
+which, and the package's README lists the recoveries.
+
+### Ask for the report
+
+    /captain-report
+
+SIANA reads the live queue, registry, repositories, forge, watcher, herdr,
+obligations, cleanup runs and decision history, and writes you an overview: what
+happened, whether the fleet is moving, what is about to go wrong, what is waiting to
+be published or cleaned up, what is still owed, and every decision you have to take.
+
+A source it could not read is named as unreadable. It is never rendered as healthy
+and never as empty, because "no open workspaces" when herdr is down is a lie you
+would act on.
+
+Each pending decision arrives with its options, what each one costs, what SIANA
+recommends, and why. A recommendation is not authority and nothing in this distro
+turns one into an action.
+
+### What the fleet learns from what you decide
+
+Every decision SIANA puts in front of you is recorded twice, and the split is the
+point. The obligation holds the question, whether it is still open, and - once you
+answer - your answer, in your words. Beside it, keyed by the same id,
+`attended.jsonl` holds what the obligation has no room for: the situation, the
+options, what each one cost, which SIANA would have chosen, and why.
+
+    siana-owe history            every decision, joined
+    siana-owe history --json     the same, for a program
+
+Your answer lives in exactly one place and is read out of it every time, so there is
+nothing here to go stale. Later, once an answer has been carried out:
+
+    siana-owe outcome <id> --outcome "what actually happened"
+
+It refuses while the obligation is still open, because an outcome recorded before an
+answer is a guess.
+
+This is a learning corpus and a reporting foundation, and that is all it is. It
+exists so that "how often did SIANA and I agree, and about what" is a question with
+an answer, which is the only ground an argument for giving the fleet more autonomy
+could ever stand on. Nothing reads a recommendation as permission today, and nothing
+in this distro turns a row of this store into an action.
+
+It is not `decisions.jsonl`. That one is the advisory ledger: what SIANA would have
+done while you were away, where nobody was asked and no answer exists.
+
 ## Validate a change to the distro
 
     just test
@@ -547,7 +662,8 @@ deleted. Your home is left alone, queue and all. Delete it by hand when you mean
                 world surprises them, and never adjudicate meaning.
     template/   what an install copies into the home: SIANA's instructions, the
                 standing orders every minion is started with, the brief and
-                handoff templates, and the store contracts.
+                handoff templates, the store contracts, and `pi-siana/`, the
+                distro's own pi package.
     tests/      the suite.
     justfile    init, upgrade, test, doctor, uninstall.
     VISION.md   what the fleet is for.

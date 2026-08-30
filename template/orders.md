@@ -113,3 +113,10 @@ stall that nobody sees. Use AskUserQuestion, which shows up as `blocked`, or cal
 Do the task you were given. Do not expand it. Scout work reports and lands nothing;
 ship work lands through the project's own delivery rigor and never through a shortcut,
 including when that rigor is a process you have to sit through.
+
+Some of this fleet's commands are not yours at all. `siana-clean` runs the cleanup
+loop, and the run it drives has its own grant, its own questions and its own
+authority boundary. You never start one, never answer one's question, and never
+retire or reap anything: a worktree that is finished with is SIANA's to clean up, and
+yours is the one you are working in. Finding one that needs cleaning up is a `block`
+like any other discovery, reported and never acted on.

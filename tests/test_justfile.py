@@ -67,27 +67,6 @@ class Recipe(HomeTest):
             os.chmod(path, 0o755)
         return d
 
-    def path_without(self, *names):
-        """A PATH on which some commands cannot be found.
-
-        Every directory holding one is replaced by a mirror of itself with that
-        entry left out, rather than dropped. Dropping it would take `uv` with it on
-        a Homebrew machine, and init would then fail on a tool it needs instead of
-        on the harness this is hiding - a green test for the wrong reason.
-        """
-        out = []
-        for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
-            if not any(os.path.lexists(os.path.join(d, n)) for n in names):
-                out.append(d)
-                continue
-            mirror = self.at(f"path-{i}")
-            os.makedirs(mirror, exist_ok=True)
-            for entry in os.listdir(d):
-                if entry not in names:
-                    os.symlink(os.path.join(d, entry), os.path.join(mirror, entry))
-            out.append(mirror)
-        return os.pathsep.join(out)
-
     def on_path(self, first, rest=None):
         return os.pathsep.join([first, rest if rest is not None
                                 else os.environ["PATH"]])
@@ -302,6 +281,14 @@ class Init(Recipe):
                   "handoff.md",
                   "schema-projects.yaml", "schema-obligations.yaml",
                   "schema-decisions.yaml", "schema-tasks.yaml",
+                  # The reasoning behind the decisions the captain was asked. A
+                  # decision recorded without it is one nothing can learn from, and
+                  # `siana-owe decision` refuses rather than writing one.
+                  "schema-attended.yaml",
+                  # What a cleanup run reads before it starts. Written here so that
+                  # `doctor` can say whether it is there, rather than a cleaner
+                  # having to create the file it reads.
+                  "runbook.md",
                   # The principles an advisory session holds SIANA to. It ships
                   # unfilled and `siana-afk` refuses to start until it is written,
                   # so a home without it is one where a session cannot start at all.
@@ -313,7 +300,8 @@ class Init(Recipe):
             self.assertTrue(os.path.exists(self.at(f)), f"init left out {f}")
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
                   "siana-owe", "siana-retire", "siana-handoff", "siana-publish",
-                  "siana-reap", "siana-pipeline", "siana-afk", "siana-gate"):
+                  "siana-reap", "siana-pipeline", "siana-afk", "siana-gate",
+                  "siana-clean", "siana-report"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this
@@ -332,6 +320,88 @@ class Init(Recipe):
         missing = [line.strip() for line in doctor.stdout.splitlines()
                    if "missing " in line]
         self.assertEqual(missing, [])
+
+    def siana_package_entries(self):
+        """Every settings entry that resolves to this distro's pi package.
+
+        Resolved rather than compared as strings: pi writes the entry relative to the
+        settings file, and the whole failure this guards against is one package
+        reached through two spellings.
+        """
+        settings = self.at(".pi", "settings.json")
+        with open(settings) as fh:
+            packages = json.load(fh).get("packages", [])
+        want = os.path.realpath(os.path.join(DISTRO, "template", "pi-siana"))
+        out = []
+        for entry in packages:
+            source = entry if isinstance(entry, str) else entry.get("source", "")
+            resolved = os.path.realpath(
+                os.path.join(os.path.dirname(settings), source))
+            if resolved == want:
+                out.append(source)
+        return out
+
+    def test_the_distros_own_package_is_installed_exactly_once(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(len(self.siana_package_entries()), 1)
+
+    def test_a_second_init_does_not_install_it_twice(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(len(self.siana_package_entries()), 1)
+
+    def test_the_same_package_under_a_second_spelling_is_reconciled_away(self):
+        # The collision this exists to prevent. Pi identifies a local package by its
+        # resolved absolute path, so a relative entry and an absolute one naming the
+        # same directory are two packages: two `/captain-report` commands, two
+        # `siana_cleanup` tools, and a skill-name collision at every startup.
+        self.assertEqual(self.just("init").returncode, 0)
+        settings = self.at(".pi", "settings.json")
+        with open(settings) as fh:
+            config = json.load(fh)
+        config["packages"].append(
+            os.path.realpath(os.path.join(DISTRO, "template", "pi-siana")))
+        with open(settings, "w") as fh:
+            json.dump(config, fh)
+        self.assertEqual(len(self.siana_package_entries()), 2)
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(len(self.siana_package_entries()), 1)
+
+    def test_reconciling_leaves_the_queue_package_alone(self):
+        # It is another local entry in the same array, and losing it would take the
+        # ambient queue out of SIANA's session while looking like a clean install.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json")) as fh:
+            packages = json.load(fh)["packages"]
+        self.assertTrue(any("pi-agent-tasks" in str(p) for p in packages), packages)
+
+    def test_the_package_extension_is_not_also_auto_discovered(self):
+        # An extension present in `.pi/extensions/` *and* in an installed package is
+        # loaded twice, which is the same collision by another route.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(sorted(os.listdir(self.at(".pi", "extensions"))),
+                         ["wake.ts"])
+
+    def test_doctor_reports_the_runbook_and_the_cleanup_state(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        doctor = self.just("doctor")
+        self.assertIn("runbook.md", doctor.stdout)
+        self.assertIn("attended.jsonl", doctor.stdout)
+        # A home that has never run one is a zero and not a fault.
+        self.assertIn("cleanup  no runs", doctor.stdout)
+
+    def test_upgrade_keeps_the_runbook_and_the_attended_contract(self):
+        # Both hold the fleet's own accumulated answers. An upgrade that rewrote
+        # either would lose them to restore something nobody needed.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at("runbook.md"), "a") as fh:
+            fh.write("\n<!-- siana-clean:q1 -->\n## Is it?\n\nNo.\n")
+        out = self.just("upgrade")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        with open(self.at("runbook.md")) as fh:
+            self.assertIn("No.", fh.read())
+        self.assertIn("kept     ", out.stdout)
+        self.assertIn("schema-attended.yaml", out.stdout)
 
     def test_the_wake_extension_is_the_distros_and_is_refreshed_on_every_init(self):
         # Distro-owned and never the captain's work, so it is overwritten rather

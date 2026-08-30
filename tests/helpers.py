@@ -148,6 +148,31 @@ class HomeTest(unittest.TestCase):
             out.append(mirror)
         return os.pathsep.join([*first, BIN, *out])
 
+    def path_without(self, *names):
+        """A PATH on which some commands cannot be found.
+
+        Every directory holding one is replaced by a mirror of itself with that entry
+        left out, rather than dropped. Dropping it would take `uv` with it on a
+        Homebrew machine, and a command under test would then fail on a tool it needs
+        instead of on the one this is hiding - a green test for the wrong reason.
+
+        The mirrors are named apart from `distro_path`'s, because a test that wants
+        both would otherwise have two fixtures writing one directory.
+        """
+        out = []
+        for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
+            if not any(os.path.lexists(os.path.join(d, n)) for n in names):
+                out.append(d)
+                continue
+            mirror = self.at(f"without-{i}")
+            os.makedirs(mirror, exist_ok=True)
+            for entry in os.listdir(d):
+                link = os.path.join(mirror, entry)
+                if entry not in names and not os.path.lexists(link):
+                    os.symlink(os.path.join(d, entry), link)
+            out.append(mirror)
+        return os.pathsep.join(out)
+
     def command_env(self, extra=None):
         """The environment a command under test runs in.
 

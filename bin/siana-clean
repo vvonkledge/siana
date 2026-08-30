@@ -1,0 +1,1162 @@
+#!/usr/bin/env python3
+"""Run the fleet cleanup loop in its own context, and hand SIANA back only the
+questions it has to answer.
+
+Cleanup is long, repetitive and almost entirely mechanical, and it is exactly the
+shape of work that eats a SIANA session: thirty worktrees enumerated, twenty-eight
+of them retired without incident, and two that need a judgment. Done in SIANA's own
+context that is thirty rounds of tool output crowding out the fleet; done here it is
+two questions and a report.
+
+This is the mechanics of that arrangement and none of its judgment. It starts one
+cleanup agent, gives it a named grant, keeps its state on disk, and provides the
+protocol by which it stops and asks. It never decides what to clean up, and it never
+performs a cleanup itself: every destructive mechanic in this fleet already lives
+behind a command that fails closed, and the whole point of delegating is that those
+commands keep their judgments rather than having them copied in here.
+
+**The authority boundary is SIANA, and nothing here moves it.** The cleaner may do
+exactly what its grant names and nothing else. A question it cannot settle stops the
+run. A question that belongs to the captain stops the run too, and SIANA turns that
+one into an ordinary recorded decision with `siana-owe decision`: an answer given
+here can never manufacture captain authority, because nothing here can close an
+obligation, and `answer` refuses a captain question until an obligation id is named.
+
+**The protocol cannot deadlock, because the child is gone before the question is
+read.** A nested one-shot agent is one-way: it cannot call back into a parent that is
+synchronously waiting on it, and a design that tried would hang both. So an uncertain
+cleaner writes its question down and *ends*. The command returns to SIANA with exit
+3, SIANA reads the question, records an answer, and `resume` starts a fresh child
+carrying the durable state forward. Asking and resuming are two operations with the
+process boundary between them, and there is no point at which either side waits on
+the other.
+
+**The question is on disk before anybody sees it.** `ask` writes it and returns; the
+cleaner is only then permitted to stop. So a machine that dies between the two loses
+a round of work and never loses the question, and nothing after the uncertain point
+runs until an answer is durably recorded.
+
+Usage:
+    siana-clean start [--project <handle>] [--grant <name>]...  begin one run
+    siana-clean status [<run>] [--json]                         what a run is doing
+    siana-clean answer <run> --text <answer>                    answer its question
+    siana-clean resume <run>                                    carry on from there
+    siana-clean abort <run> --reason <text>                     stop one, keep state
+    siana-clean runbook                                         durable gotchas
+    siana-clean ask --run <run> --body <text> --kind <kind>     the cleaner's own
+
+Exit codes, in the shape `siana-pipeline` reads:
+
+    0   the round finished and there is nothing outstanding
+    1   refused, or a fault. Nothing was left half-done; the message says what to do
+    3   a question is pending. Read it, answer it, resume
+
+The grants, and there are three. They are named after the commands they unlock,
+because a grant that does not name a command is a grant nobody can check:
+
+    inventory     read the queue, the registry, git and herdr. Change nothing
+    retire        also `siana-retire <task-id>`, one task at a time
+    reap-report   also `siana-reap <project>` in its report-only form
+
+`inventory` is always in force and is the default. There is deliberately no grant for
+closing a herdr workspace: `siana-retire` owns worktree removal, whatever that
+command does about the workspace behind it is that command's decision, and a second
+route to the same destruction would be a second copy of a safety judgment that must
+have exactly one. There is no grant that reaches `siana-reap --yes` either. Reaping
+is the one mistake in this fleet that loses work, so it stays the captain's, and what
+a cleanup run produces about it is a report SIANA turns into a decision.
+
+**What the guard is, and what it is not.** Every run puts a directory of refusing
+shims on the front of the child's `PATH`, so a fleet command outside the grant fails
+with a message naming what to do instead rather than running. That is a real, tested
+boundary against the ordinary way an agent goes wrong, which is reaching for the next
+obvious command. It is not a sandbox: an agent invoking `/usr/bin/git` by absolute
+path would be outside it. What actually holds is that the destructive mechanics live
+in commands that fail closed on their own inputs; the guard is what keeps the cleaner
+from reaching for them by mistake, and what makes that fact testable.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+from datetime import UTC, datetime
+
+# One line of the child's JSON stream can be a whole file the cleaner read, so the
+# stream is capped rather than trusted. A cleanup round that has produced a megabyte
+# of events has already gone wrong, and the useful part of it is the beginning.
+STREAM_CAP = 1024 * 1024
+# What of a round survives into the next one. The report is the cleaner's own summary
+# and is what `resume` carries forward, so it is bounded to something a later prompt
+# can hold: past this the round is quoting rather than reporting.
+REPORT_CAP = 16 * 1024
+# How long one round may run before it is killed. Cleanup is enumerate-and-delegate,
+# so a round still going after half an hour is wedged rather than thorough.
+ROUND_S = int(os.environ.get("SIANA_CLEAN_ROUND_S", "1800"))
+# Between SIGTERM to the child's process group and SIGKILL. Long enough for pi to
+# flush its last event, short enough that an abort is not itself a wait.
+GRACE_S = 5
+
+GRANTS = ("inventory", "retire", "reap-report")
+
+# What each shim refuses, and the whole of it. A command absent from this table is a
+# command the child reaches unchanged, which is the right default: the cleaner has to
+# read the world, and a guard that had to enumerate every reader would go stale
+# against the first new one.
+#
+# The rules are matched over the child's whole argument list, because `git worktree
+# remove` and `git -C x worktree remove` are the same call and only the words tell
+# them apart.
+GUARDS = {
+    "siana-retire": ("grant:retire", "this run's grant does not include retiring"),
+    "siana-reap": ("flags:--yes,-y", "reaping is the captain's; report it and stop"),
+    "siana-publish": ("always", "publishing is SIANA's, after QA accepts"),
+    "siana-dispatch": ("always", "dispatching is SIANA's"),
+    "siana-brief": ("always", "briefing is SIANA's"),
+    "siana-gate": ("always", "the gate is SIANA's"),
+    "siana-afk": ("always", "advisory sessions are the captain's"),
+    "siana-watch": ("always", "the watcher is the captain's grant"),
+    "siana-pipeline": ("always", "the pipeline validates a minion's branch"),
+    "siana-handoff": ("always", "a handoff is written by whoever did the work"),
+    "pi": ("always", "a cleanup run does not start another agent"),
+    "tasks": ("words:add,done,block,reset,drop,delete,put,edit,set",
+              "the queue is SIANA's; a cleanup run reads it and never writes it"),
+    "datafile": ("words:put,rm,delete,repair",
+                 "the stores are SIANA's; a cleanup run reads them and never writes"),
+    "git": ("words:push,commit,merge,rebase,reset,clean,am,cherry-pick",
+            "nothing in a cleanup run changes a repository's history"),
+    "herdr": ("words:close,remove,kill,prompt",
+              "worktree and workspace removal is `siana-retire`'s, and only its"),
+}
+
+# `git worktree` and `git branch` read in their common form and destroy in their
+# flagged one, so they are matched on the pair rather than on the verb. Kept apart
+# from GUARDS because the rule is a different shape, and one table holding both would
+# have to be read twice to be understood once.
+GIT_PAIRS = (
+    ("worktree", ("add", "remove", "prune", "move", "repair")),
+    ("branch", ("-d", "-D", "-m", "-M", "--delete", "--move")),
+    ("tag", ("-d", "--delete")),
+)
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching the rest of the fleet."""
+
+    def __init__(self, message: str, hints=()):
+        self.message, self.hints = message, tuple(hints)
+        super().__init__(1)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def die(message: str, *hints: str):
+    raise Refusal(message, hints)
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def process_command(pid: int) -> str:
+    """What `ps` says this process is running, or "" when it says nothing.
+
+    Identity, not liveness, for the reason `siana-watch` and `template/wake.ts` give:
+    pids are reused, so a live pid is not a live child unless the process wearing it
+    is still the one that was recorded.
+    """
+    try:
+        return subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                              capture_output=True, text=True,
+                              timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
+def read_json(path: str, what: str):
+    """A record this command wrote, or None when it has not written one.
+
+    A file that will not parse is a stop and never a zero. Every write here lands by
+    atomic rename, so an unreadable one was hand-edited or lost rather than caught
+    half-written, and reading either as "no state" would let a run start on top of
+    one already going.
+    """
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot read the {what} at {path}: {exc}",
+            "it is written whole by an atomic rename, so an unreadable one was",
+            "edited or lost rather than caught half-written",
+            "move it aside; the run it belongs to is not resumable")
+
+
+def write_json(path: str, record) -> None:
+    """Beside the destination and then renamed, so a reader never catches a record
+    half-written. A run's state is what says whether a destructive command may
+    follow, and a torn read of that is the failure this whole design is built
+    against."""
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        json.dump(record, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+class Home:
+    """Where a cleanup run keeps everything, and the only place it does.
+
+    One object rather than paths threaded through every function, because the
+    invariant that matters is that no two of these ever disagree about where a run
+    lives, and a constructor is the cheapest way to hold it.
+    """
+
+    def __init__(self, home: str):
+        self.home = home
+        self.root = os.path.join(home, "cleanup")
+        self.runs = os.path.join(self.root, "runs")
+        self.lock = os.path.join(self.root, "lock")
+        self.runbook = os.path.join(home, "runbook.md")
+
+    def run_dir(self, run_id: str) -> str:
+        return os.path.join(self.runs, run_id)
+
+    def record(self, run_id: str) -> str:
+        return os.path.join(self.run_dir(run_id), "run.json")
+
+    def question(self, run_id: str) -> str:
+        return os.path.join(self.run_dir(run_id), "question.json")
+
+    def answers(self, run_id: str) -> str:
+        return os.path.join(self.run_dir(run_id), "answers.jsonl")
+
+    def log(self, run_id: str) -> str:
+        return os.path.join(self.run_dir(run_id), "rounds.jsonl")
+
+    def stream(self, run_id: str, round_no: int) -> str:
+        return os.path.join(self.run_dir(run_id), f"round-{round_no}.jsonl")
+
+    def ids(self):
+        """Every run there is, oldest first. The id sorts by its own clock, so this
+        needs no stat and cannot be reordered by a touch."""
+        try:
+            return sorted(d for d in os.listdir(self.runs)
+                          if os.path.isdir(os.path.join(self.runs, d)))
+        except OSError:
+            return []
+
+
+def run_id_for(paths: Home) -> str:
+    """The run id, and it is the clock rather than a counter.
+
+    A counter needs somewhere to live and something to serialise its increment; a UTC
+    second does not, sorts correctly in a directory listing, and says when the run
+    happened in the one place the captain always sees it. Two runs in the same second
+    are still two runs, so a taken id is suffixed rather than reused - the lock makes
+    that a formality, and a formality is cheaper than a run silently joining another.
+    """
+    base = datetime.now(UTC).strftime("clean-%Y%m%d-%H%M%S")
+    taken = set(paths.ids())
+    if base not in taken:
+        return base
+    for n in range(2, 100):
+        if f"{base}-{n}" not in taken:
+            return f"{base}-{n}"
+    die("cannot derive a free run id", "look at the cleanup runs directory by hand")
+
+
+# ---------------------------------------------------------------------------
+# The lock. One cleanup run at a time, and the refusal says which one.
+# ---------------------------------------------------------------------------
+
+def take_lock(paths: Home, what: str) -> None:
+    """Exclusive, and reclaimed only from a process that is provably gone.
+
+    `O_EXCL` is the whole of the exclusion: two `start`s racing reach the same `open`
+    and exactly one of them creates the file. What the file holds is for the loser to
+    read, and for the next caller to decide whether the holder is still alive. A lock
+    left by a killed process must not wedge the fleet forever, and a lock removed
+    because a pid was reused would let two runs mutate one fleet, so liveness is the
+    pid *and* what `ps` says it is running - the check `siana-watch` makes of its own
+    grant, for the same reason.
+    """
+    os.makedirs(paths.root, exist_ok=True)
+    record = {"pid": os.getpid(), "command": process_command(os.getpid()),
+              "what": what, "taken": now()}
+    for attempt in (1, 2):
+        try:
+            fd = os.open(paths.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            held = read_json(paths.lock, "cleanup lock") or {}
+            pid, command = held.get("pid"), held.get("command") or ""
+            alive = bool(pid) and bool(command) \
+                and process_command(pid) == command
+            if alive:
+                die(f"a cleanup run is already starting or resuming (pid {pid})",
+                    f"it took the lock at {held.get('taken', '?')}"
+                    f" to {held.get('what', '?')}",
+                    "one at a time, so that two cleaners never mutate one fleet",
+                    "`siana-clean status` says what it is doing")
+            if attempt == 2:
+                die("cannot take the cleanup lock",
+                    f"{paths.lock} keeps coming back; look at it by hand")
+            # The holder is gone, so this is a leftover from a process killed before
+            # its own release ran. Removed and retried once rather than forced: a
+            # second racer that took it in between must win the retry.
+            try:
+                os.unlink(paths.lock)
+            except FileNotFoundError:
+                pass
+            continue
+        with os.fdopen(fd, "w") as fh:
+            json.dump(record, fh)
+        return
+
+
+def drop_lock(paths: Home) -> None:
+    """Only ours. A lock reclaimed by a later run while this one was dying belongs to
+    that run, and removing it here would leave that run unprotected."""
+    try:
+        with open(paths.lock) as fh:
+            held = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return
+    if held.get("pid") == os.getpid():
+        try:
+            os.unlink(paths.lock)
+        except FileNotFoundError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# The guard. What a cleanup child may reach, as shims rather than as instructions.
+# ---------------------------------------------------------------------------
+
+def clean_path() -> str:
+    """The PATH without any guard directory on it.
+
+    A resumed run builds a new guard, and looking the real command up through an
+    older one would make each round's shim call the previous round's. Guards live
+    under the cleanup root, so that prefix is the whole test.
+    """
+    home = os.environ.get("SIANA_HOME", "")
+    path = os.environ.get("PATH", "")
+    if not home:
+        return path
+    root = os.path.join(home, "cleanup")
+    return os.pathsep.join(p for p in path.split(os.pathsep)
+                           if not p.startswith(root))
+
+
+def sq(text: str) -> str:
+    """One shell word, single-quoted, so that nothing in it is ever interpreted.
+
+    This is not tidiness. The refusal messages below are prose written for an agent
+    to read, and prose contains backticks and apostrophes: `worktree removal is
+    `siana-retire`'s` inside a double-quoted `echo` is a command substitution, and
+    the first version of this file really did run `siana-retire` every time a
+    cleaner asked herdr to close a workspace. A guard that executes its own refusal
+    text is worse than no guard, so every string reaching a shim goes through here.
+    """
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def refusal_lines(name: str, instead: str):
+    """What a shim says when it refuses.
+
+    In the fleet's own shape, because the reader is an agent deciding what to do
+    next, and a bare "permission denied" tells it to try something cleverer.
+    """
+    said = [f"refused: {name} is not this cleanup run's to call",
+            f"  {instead}",
+            "  stop and record what you found. siana-clean ask is how you put",
+            "  a question in front of SIANA"]
+    return [f"printf '%s\\n' {sq(line)} >&2" for line in said] + ["exit 1"]
+
+
+def match_words(words, var="BAD"):
+    """Shell that sets BAD when any argument is one of these words."""
+    cases = "\n".join(f'    {sq(w)}) {var}=1 ;;' for w in words)
+    return ['for a in "$@"; do', "  case \"$a\" in", cases, "  esac", "done"]
+
+
+def match_pairs(verb, bad):
+    """Shell that sets BAD when an argument follows `verb` and is one of `bad`.
+
+    Positional rather than anywhere-in-the-line: `git worktree list` names a path
+    that could itself be the word `remove`, and a rule that did not care where the
+    word sat would refuse a reader for the name of a directory.
+    """
+    cases = "|".join(sq(b) for b in bad)
+    return [
+        "SAW=0",
+        'for a in "$@"; do',
+        '  if [ "$SAW" = 1 ]; then',
+        '    case "$a" in',
+        f"      {cases}) BAD=1 ;;",
+        "    esac",
+        "    SAW=0",
+        "  fi",
+        '  case "$a" in',
+        f"    {sq(verb)}) SAW=1 ;;",
+        "  esac",
+        "done",
+    ]
+
+
+def shim(name: str, rule: str, instead: str, real, grants) -> str:
+    """One shim's text: `sh`, because it runs on every command the child issues, and
+    small enough that a reader can check it without trusting this comment."""
+    refuse = refusal_lines(name, instead)
+    always = rule == "always" or (rule.startswith("grant:")
+                                  and rule.split(":", 1)[1] not in grants)
+    if real is None:
+        # Nothing to fall through to. Written anyway rather than skipped: a command
+        # absent today and installed tomorrow must not become reachable to a run that
+        # was already refused it.
+        always = True
+    if always:
+        return "\n".join(["#!/bin/sh", *refuse]) + "\n"
+    passthrough = f'exec {sq(real)} "$@"'
+    if rule.startswith("grant:"):
+        return "\n".join(["#!/bin/sh", passthrough]) + "\n"
+    kind, values = rule.split(":", 1)
+    lines = ["#!/bin/sh", "BAD=0", *match_words(values.split(","))]
+    if kind == "words" and name == "git":
+        for verb, bad in GIT_PAIRS:
+            lines += match_pairs(verb, bad)
+    elif kind not in ("words", "flags"):
+        die(f"unknown guard rule: {rule}")
+    lines += ['if [ "$BAD" = 1 ]; then',
+              *[f"  {line}" for line in refuse],
+              "fi", passthrough]
+    return "\n".join(lines) + "\n"
+
+
+def guard_dir(run_dir: str, grants) -> str:
+    """A directory of refusing shims, first on the child's PATH.
+
+    Written per run rather than shipped, because what is refused depends on the grant
+    this run was given, and a shipped guard would have to read state to know it -
+    which is a second place the grant would live.
+    """
+    guard = os.path.join(run_dir, "guard")
+    os.makedirs(guard, exist_ok=True)
+    path = clean_path()
+    for name, (rule, instead) in GUARDS.items():
+        body = shim(name, rule, instead, shutil.which(name, path=path), grants)
+        target = os.path.join(guard, name)
+        with open(target, "w") as fh:
+            fh.write(body)
+        os.chmod(target, 0o755)
+    return guard
+
+
+# ---------------------------------------------------------------------------
+# The runbook. Durable gotchas, and nothing else may reach it.
+# ---------------------------------------------------------------------------
+
+RUNBOOK_HEAD = """# Cleanup runbook
+
+What a cleanup run learned that it could not have worked out from the fleet alone,
+and what SIANA answered when it asked. The cleaner reads this at the start of every
+run, so a gotcha resolved once is not asked about twice.
+
+Nothing writes here by hand and nothing writes here from a transcript. Entries are
+appended by `siana-clean answer`, out of exactly two strings: the question a cleaner
+wrote down before it stopped, and the answer SIANA recorded. So a guess cannot land
+here, and neither can a stream fragment, a secret a tool printed, or anything else
+that was only ever in a private context.
+
+Each entry carries the id of the question it came from. Appending the same one twice
+is a no-op, which is what makes a retried answer safe.
+"""
+
+
+def runbook_init(path: str) -> None:
+    """Create it if it is not there, and never touch it if it is. Later runs append
+    to it and the captain reads it, so a rewrite would lose the fleet's accumulated
+    answers in order to restore a header nobody needed."""
+    if os.path.isfile(path):
+        return
+    with open(path, "w") as fh:
+        fh.write(RUNBOOK_HEAD)
+
+
+def runbook_has(path: str, qid: str) -> bool:
+    try:
+        with open(path) as fh:
+            return f"<!-- siana-clean:{qid} -->" in fh.read()
+    except OSError:
+        return False
+
+
+def runbook_append(path: str, qid: str, question: str, answer: str) -> bool:
+    """Append one resolved gotcha, once.
+
+    Idempotent by the question's id and not by its text: two runs can legitimately
+    reach the same wording about different worktrees, and de-duplicating on prose
+    would silently drop the second. Returns whether anything was written, so the
+    caller can say so rather than guess.
+
+    The two strings are passed through as they were recorded and are never
+    reformatted or summarised. An entry that has been through a summariser is no
+    longer the answer SIANA gave, and this file's whole value is that it is.
+    """
+    if runbook_has(path, qid):
+        return False
+    runbook_init(path)
+    # One open-append-close, so a second process appending at the same moment cannot
+    # interleave inside an entry.
+    with open(path, "a") as fh:
+        fh.write(f"\n<!-- siana-clean:{qid} -->\n"
+                 f"## {question.strip()}\n\n{answer.strip()}\n")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Reading a run's state, with liveness folded in.
+# ---------------------------------------------------------------------------
+
+def state(paths: Home, run_id: str) -> dict:
+    """The run record, with `running` re-derived rather than believed.
+
+    A stored status is what a process last managed to write, and a process killed
+    between spawning a child and recording its exit never wrote anything. So the one
+    status that could be a lie is checked against the operating system every time it
+    is read, exactly as `siana-watch` and `siana-afk` check their grants.
+    """
+    rec = read_json(paths.record(run_id), "run record")
+    if rec is None:
+        known = ", ".join(paths.ids()) or "(there are none)"
+        die(f"no cleanup run under that id: {run_id}", f"runs: {known}")
+    if rec.get("status") == "running":
+        pid, command = rec.get("pid"), rec.get("command") or ""
+        if not (pid and command and process_command(pid) == command):
+            rec = dict(rec, status="failed",
+                       detail="the process running it is gone; it was interrupted")
+    return rec
+
+
+def pending(paths: Home, run_id: str):
+    """The question this run stopped on, or None.
+
+    Its own file, and it exists only while the question is unanswered: `answer` moves
+    it into the answers log and removes it. So the presence of that one file is the
+    whole of "a question is waiting", which is what makes the state legible after a
+    restart without anything having to be reconciled.
+    """
+    return read_json(paths.question(run_id), "pending question")
+
+
+def answers(paths: Home, run_id: str):
+    """Every question this run has asked and had answered, oldest first."""
+    out = []
+    try:
+        with open(paths.answers(run_id)) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        pass
+    return out
+
+
+def rounds(paths: Home, run_id: str):
+    """Every round this run has already done, oldest first. Append-only, so the file
+    is the history and nothing has to be recomputed from a transcript."""
+    out = []
+    try:
+        with open(paths.log(run_id)) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Running one round.
+# ---------------------------------------------------------------------------
+
+def cleaner_prompt() -> str:
+    """The cleaner's definition, from the package this command ships beside.
+
+    Found by this file's own resolved location rather than by configuration. The
+    command is symlinked onto the captain's PATH by `just init`, so the link is
+    followed first; `SIANA_DISTRO` would be a second answer to the same question, and
+    a home whose config had drifted would start a cleaner out of a distro that is no
+    longer there.
+    """
+    distro = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    path = os.path.join(distro, "template", "pi-siana", "agents", "cleaner.md")
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        die(f"no cleaner definition at {path}",
+            "it is what a cleanup run is; without it there is nothing to start",
+            "reinstall the distro, or run `just init` in it")
+
+
+def brief(paths: Home, rec: dict, resolved) -> str:
+    """What the child is told, and the whole of what it carries forward.
+
+    Never the previous round's transcript. A resumed cleaner gets the runbook, its
+    own reports, and the answer it was waiting on - what it concluded, rather than
+    everything it read to conclude it. That is the property keeping this out of
+    SIANA's context and out of the child's alike: the state is small because it is
+    the findings, and the findings are the only durable thing a round produces.
+    """
+    parts = [
+        f"Cleanup run {rec['id']}.",
+        "",
+        f"Grant: {', '.join(rec['grants'])}.",
+        f"Scope: {rec.get('project') or 'every project in the registry'}.",
+        f"Runbook: {paths.runbook}",
+        f"Ask with: siana-clean ask --run {rec['id']} --body <question>"
+        " --kind <siana|captain>",
+        "",
+    ]
+    try:
+        with open(paths.runbook) as fh:
+            parts += ["## The runbook, as it stands", "", fh.read().strip(), ""]
+    except OSError:
+        parts += ["## The runbook", "", "It is empty; this is the first run.", ""]
+    history = rounds(paths, rec["id"])
+    if history:
+        parts += ["## What you have already established", ""]
+        for r in history:
+            parts += [f"### Round {r['round']}", "",
+                      r.get("report") or "(the round produced no report)", ""]
+    if resolved:
+        parts += [
+            "## The question you stopped on, and SIANA's answer",
+            "",
+            f"You asked: {resolved['body']}",
+            "",
+            f"SIANA answered: {resolved['answer']}",
+            "",
+            "That answer is in the runbook now. Carry on from exactly there.",
+        ]
+    return "\n".join(parts)
+
+
+def assistant_text(line: str):
+    """The text of an assistant message in pi's JSON stream, or None.
+
+    Anything that is not a complete JSON object of the shape expected is skipped
+    rather than reported. The stream is a machine format, and a partial line at the
+    end of a killed process is the ordinary way it ends, so treating malformed output
+    as a fault would turn every abort into an error about the wrong thing. What
+    matters is that nothing here ever *acts* on the stream: the only thing read out
+    of it is the round's report, and a round whose report is empty is reported empty.
+    """
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(event, dict) or event.get("type") != "message_end":
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content or None
+    if not isinstance(content, list):
+        return None
+    text = "".join(b.get("text", "") for b in content
+                   if isinstance(b, dict) and b.get("type") == "text")
+    return text or None
+
+
+def tail(text: str, limit: int = 2000) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else "..." + text[-limit:]
+
+
+def reap(proc) -> None:
+    """Kill the child's whole process group, and make sure it is gone.
+
+    The group rather than the pid, because pi spawns tools and a SIGTERM to the
+    parent alone leaves a `git` or a `herdr` behind. SIGKILL after a grace period,
+    because a child that will not take SIGTERM is exactly the wedged one this exists
+    for.
+    """
+    for sig, wait in ((signal.SIGTERM, GRACE_S), (signal.SIGKILL, GRACE_S)):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def spawn(paths: Home, rec: dict, resolved) -> dict:
+    """Run one round, and return what it produced.
+
+    The child gets its own process group, so an abort or a timeout reaches whatever
+    it started rather than only the process this holds a handle to. pi is resolved
+    from the parent's PATH before the guard goes on the child's, because the guard
+    refuses `pi` and a run that looked itself up through it could never start.
+    """
+    run_id = rec["id"]
+    round_no = len(rounds(paths, run_id)) + 1
+    pi = shutil.which("pi", path=clean_path())
+    if pi is None:
+        die("pi is not on PATH",
+            "a cleanup run is a pi agent in its own context; without pi there is",
+            "nothing to run it in",
+            "install pi, or do this cleanup by hand with `siana-retire`")
+    guard = guard_dir(paths.run_dir(run_id), rec["grants"])
+    system = os.path.join(paths.run_dir(run_id), "cleaner.md")
+    with open(system, "w") as fh:
+        fh.write(cleaner_prompt())
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([guard, clean_path()])
+    env["SIANA_HOME"] = paths.home
+    env["SIANA_CLEAN_RUN"] = run_id
+    env["SIANA_CLEAN_GRANTS"] = ",".join(rec["grants"])
+    # `tasks` finds `datafile` by walking PATH and then *imports the file it finds*
+    # as a python module. With the guard in front, the file it finds is a `/bin/sh`
+    # shim, `spec_from_file_location` returns None for it, and every `tasks` call in
+    # the run dies on an AttributeError about a loader.
+    #
+    # Found by a live cleaner, which reported "the initial `tasks` invocation hit a
+    # Python loader error" and then worked around it - so the cost of this was a
+    # round that could not read the queue at all, reported as a footnote.
+    #
+    # Naming the real module is the fix, and it is the same one `just init` writes
+    # into `siana.env` for the same reason. Resolved through the symlink, because
+    # what has to be imported is the `.py`, and past the guard, because the whole
+    # problem is what PATH answers.
+    datafile = shutil.which("datafile", path=clean_path())
+    if datafile:
+        env["TASKS_DATAFILE"] = os.path.realpath(datafile)
+    # A cleaner must never be mistaken for a minion. `siana-afk` refuses to activate
+    # in a minion's environment by reading this, and a cleanup child inheriting one
+    # would be carrying a task id that is not its.
+    env.pop("SIANA_TASK_ID", None)
+    # The child runs in the home, because that is where the stores are, and the home
+    # is SIANA's own project directory. Two flags keep it from becoming SIANA:
+    #
+    #   --no-approve      the home holds `.pi/settings.json` and
+    #                     `.pi/extensions/wake.ts`. A cleaner that loaded the wake
+    #                     extension would consume the watcher's counter, and SIANA
+    #                     would simply stop being woken - silently, because a taken
+    #                     wake looks exactly like a delivered one.
+    #   -nc               the home holds `AGENTS.md`, which is SIANA's instructions.
+    #                     A cleaner that read it would believe it was SIANA, and the
+    #                     first thing that file tells SIANA is how to dispatch.
+    #
+    # Its own definition arrives by `--append-system-prompt` instead, which is
+    # deliberate rather than incidental: a project-local prompt is trusted because
+    # somebody approved the directory, and this one is trusted because this command
+    # read it out of the distro it ships in and handed it over by path.
+    argv = [pi, "--mode", "json", "-p", "--no-session", "--no-approve", "-nc",
+            "--append-system-prompt", system, brief(paths, rec, resolved)]
+
+    try:
+        proc = subprocess.Popen(argv, cwd=paths.home, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+    except OSError as exc:
+        return {"round": round_no, "ended": now(), "exit": -1, "report": "",
+                "failed": f"cannot start pi: {exc}", "stderr": "",
+                "truncated": False}
+    write_json(paths.record(run_id),
+               dict(rec, status="running", pid=proc.pid,
+                    command=process_command(proc.pid), round=round_no,
+                    updated=now(), detail="a cleaner is working"))
+
+    report, truncated, written = "", False, 0
+    # The deadline is a timer on the child's process group and not a check inside the
+    # read loop. A wedged round is exactly one that has stopped producing output, so
+    # a check that only runs when a line arrives never runs at all: the first version
+    # of this waited the full two minutes of a `sleep 120` with a one-second bound
+    # set. Killing the group is what ends the read, because it is what closes stdout.
+    killed = []
+
+    def on_deadline():
+        killed.append(f"the round passed {ROUND_S // 60} minutes")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    watchdog = threading.Timer(ROUND_S, on_deadline)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        with open(paths.stream(run_id, round_no), "w") as out:
+            for line in proc.stdout:
+                if written < STREAM_CAP:
+                    out.write(line)
+                    written += len(line)
+                elif not truncated:
+                    truncated = True
+                    out.write('{"type":"siana-clean","note":"stream cap reached"}\n')
+                text = assistant_text(line)
+                if text:
+                    report = text
+    except KeyboardInterrupt:
+        killed.append("interrupted")
+        raise
+    finally:
+        watchdog.cancel()
+        if killed:
+            reap(proc)
+        stderr = proc.stderr.read() if proc.stderr else ""
+        code = proc.wait()
+    why = killed[0] if killed else None
+    return {"round": round_no, "ended": now(), "exit": -1 if why else code,
+            "report": report[:REPORT_CAP], "stderr": tail(stderr),
+            "truncated": truncated,
+            "failed": why or (None if code == 0 else f"the cleaner exited {code}")}
+
+
+def finish(paths: Home, rec: dict, result: dict) -> int:
+    """Record what a round did, and say what happens next.
+
+    The round is logged before the run record is rewritten, so a crash between them
+    loses the run's summary and never the round's evidence. The status is then
+    derived from what is on disk rather than from what this believes: a question file
+    that landed is a pending question whatever the child's exit code said, because
+    the question was written first and deliberately.
+    """
+    run_id = rec["id"]
+    with open(paths.log(run_id), "a") as fh:
+        fh.write(json.dumps(result) + "\n")
+
+    question = pending(paths, run_id)
+    if question:
+        status, detail = "question", question["body"]
+    elif result["failed"]:
+        status, detail = "failed", result["failed"]
+    else:
+        status, detail = "finished", "the round completed with nothing outstanding"
+    rec = dict(rec, status=status, detail=detail, round=result["round"],
+               updated=now())
+    rec.pop("pid", None)
+    rec.pop("command", None)
+    write_json(paths.record(run_id), rec)
+
+    print(f"run      {run_id}")
+    print(f"  round  {result['round']}")
+    if result["truncated"]:
+        print("  note   the round's output hit its cap and was truncated")
+    if status == "question":
+        report_question(run_id, question)
+        return 3
+    if status == "failed":
+        print(f"  failed {result['failed']}")
+        for line in result["stderr"].splitlines()[-6:]:
+            print(f"    {line}")
+        print("  state  nothing was left half-done. Every mutation this run could")
+        print("         make goes through a command that fails closed on its own")
+        print(f"  again  siana-clean start{scope_flags(rec)}")
+        return 1
+    print("  done   nothing outstanding")
+    if result["report"]:
+        print()
+        print(result["report"])
+    return 0
+
+
+def report_question(run_id: str, question: dict) -> None:
+    print(f"  asks   {question['body']}")
+    print(f"  kind   {question['kind']}")
+    for option in question.get("options", []):
+        print(f"    option  {option}")
+    if question["kind"] == "captain":
+        print("  note   this one is the captain's. Record it as a decision:")
+        print("         siana-owe decision <the question> --situation ... --option ...")
+        print(f"  answer siana-clean answer {run_id} --text <what the captain said>"
+              " --captain-decided <obligation id>")
+    else:
+        print(f"  answer siana-clean answer {run_id} --text <your answer>")
+
+
+def scope_flags(rec: dict) -> str:
+    flags = f" --project {rec['project']}" if rec.get("project") else ""
+    for grant in rec["grants"]:
+        if grant != "inventory":
+            flags += f" --grant {grant}"
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# The subcommands.
+# ---------------------------------------------------------------------------
+
+def cmd_start(paths: Home, args) -> int:
+    grants = ["inventory"] + [g for g in args.grant if g != "inventory"]
+    for grant in grants:
+        if grant not in GRANTS:
+            die(f"no such grant: {grant}", f"the grants are: {', '.join(GRANTS)}")
+    if not os.path.isdir(paths.home):
+        die(f"no SIANA home at {paths.home}", "run `just init` in the distro")
+
+    take_lock(paths, "start")
+    try:
+        # One live run at a time, decided after the lock so that two `start`s racing
+        # cannot both find the fleet quiet. A run holding an unanswered question is
+        # live: starting a second would put two cleaners on one fleet with one of
+        # them believing a question is still open.
+        for existing in paths.ids():
+            rec = state(paths, existing)
+            if rec["status"] in ("running", "question", "answered"):
+                die(f"cleanup run {existing} is still {rec['status']}",
+                    f"  {rec.get('detail', '')}".rstrip(),
+                    "one run at a time; finish or abort that one first",
+                    f"`siana-clean status {existing}` says what it is doing")
+
+        run_id = run_id_for(paths)
+        os.makedirs(paths.run_dir(run_id), exist_ok=True)
+        runbook_init(paths.runbook)
+        rec = {"id": run_id, "started": now(), "updated": now(),
+               "status": "starting", "grants": grants, "project": args.project,
+               "round": 0, "detail": "not started yet"}
+        write_json(paths.record(run_id), rec)
+        print(f"started  {run_id}")
+        return finish(paths, rec, spawn(paths, rec, None))
+    finally:
+        drop_lock(paths)
+
+
+def cmd_resume(paths: Home, args) -> int:
+    take_lock(paths, "resume")
+    try:
+        rec = state(paths, args.run)
+        question = pending(paths, args.run)
+        if question:
+            die(f"{args.run} is still waiting for an answer",
+                f"  {question['body']}",
+                f"answer it first: siana-clean answer {args.run} --text <answer>")
+        if rec["status"] == "running":
+            die(f"{args.run} is already running (pid {rec.get('pid')})",
+                "wait for it, or `siana-clean abort` it")
+        history = answers(paths, args.run)
+        if not history:
+            die(f"{args.run} has no answered question to carry on from",
+                f"it is {rec['status']}: {rec.get('detail', '')}".rstrip(),
+                "a run resumes from an answer and from nothing else; start a new",
+                f"one instead: siana-clean start{scope_flags(rec)}")
+        resolved = history[-1]
+        # The mark that this answer has been carried forward. Without it a second
+        # `resume` would re-run the same round off the same answer, which is the
+        # duplicate-delivery failure: the answers log is append-only and says nothing
+        # about which of its entries a round has already been given.
+        if rec.get("carried") == resolved["qid"]:
+            die(f"{args.run} has already carried {resolved['qid']} forward",
+                f"it is {rec['status']}: {rec.get('detail', '')}".rstrip(),
+                "resuming again would re-run a round off an answer already used")
+        rec = dict(rec, carried=resolved["qid"])
+        write_json(paths.record(args.run), rec)
+        return finish(paths, rec, spawn(paths, rec, resolved))
+    finally:
+        drop_lock(paths)
+
+
+def cmd_ask(paths: Home, args) -> int:
+    """The cleaner's own call, and the only write it makes.
+
+    Refuses a second question while one is open, so a cleaner that misread its
+    instructions and kept going cannot overwrite the question SIANA is about to be
+    shown.
+    """
+    run_id = args.run
+    if not os.path.isdir(paths.run_dir(run_id)):
+        die(f"no cleanup run under that id: {run_id}")
+    open_question = pending(paths, run_id)
+    if open_question:
+        die(f"{run_id} already has a question waiting",
+            f"  {open_question['body']}",
+            "one at a time: stop now and let SIANA answer that one")
+    body = (args.body or "").strip()
+    if not body:
+        die("a question needs a body", "what is it you cannot settle?")
+    if args.kind not in ("siana", "captain"):
+        die(f"no such question kind: {args.kind}",
+            "`siana` is something this fleet's own rules can settle",
+            "`captain` is a product choice or an irreversible action, and SIANA",
+            "records those as decisions rather than answering them")
+    slug = re.sub(r"[^a-z0-9]+", "-", body.lower())[:32].strip("-") or "question"
+    qid = f"q{len(answers(paths, run_id)) + 1}-{slug}"
+    write_json(paths.question(run_id),
+               {"qid": qid, "run": run_id, "body": body, "kind": args.kind,
+                "options": [o for o in args.option if o.strip()], "asked": now()})
+    print(f"asked    {qid}")
+    print("  stop here. SIANA answers it and resumes this run.")
+    return 0
+
+
+def cmd_answer(paths: Home, args) -> int:
+    rec = state(paths, args.run)
+    question = pending(paths, args.run)
+    if question is None:
+        history = answers(paths, args.run)
+        if history:
+            die(f"{args.run} is not waiting on a question",
+                f"the last one, {history[-1]['qid']}, was answered:"
+                f" {history[-1]['answer']}",
+                f"resume it: siana-clean resume {args.run}")
+        die(f"{args.run} is not waiting on a question",
+            f"it is {rec['status']}: {rec.get('detail', '')}".rstrip())
+    text = (args.text or "").strip()
+    if not text:
+        die(f"what is the answer to {question['qid']}?",
+            f"  {question['body']}",
+            "usage: siana-clean answer <run> --text <answer>")
+    if question["kind"] == "captain" and not args.captain_decided:
+        die("this question is the captain's, not SIANA's",
+            f"  {question['body']}",
+            "record it as an ordinary decision and wait for the captain:",
+            "  siana-owe decision <the question> --situation ... --option ...",
+            "then answer here with --captain-decided <obligation id> once they",
+            "have said. An answer given here cannot make captain authority; it",
+            "only unblocks a cleaner already told what the captain decided")
+
+    resolved = dict(question, answer=text, answered=now())
+    if args.captain_decided:
+        resolved["decision"] = args.captain_decided
+    # The answer lands in three places and the order is the whole of its safety. The
+    # append-only log first, because that is what `resume` reads and what survives a
+    # restart. The runbook second, idempotently, so a retry after a crash between the
+    # two writes it rather than skipping it. The pending question is removed last:
+    # while it is there the run is still unanswered, so every earlier step can be
+    # repeated and none of them can be half-done.
+    with open(paths.answers(args.run), "a") as fh:
+        fh.write(json.dumps(resolved) + "\n")
+    added = runbook_append(paths.runbook, resolved["qid"], resolved["body"], text)
+    os.unlink(paths.question(args.run))
+    write_json(paths.record(args.run),
+               dict(rec, status="answered", updated=now(),
+                    detail=f"answered {resolved['qid']}; resume to carry on"))
+    print(f"answered {resolved['qid']}")
+    print(f"  runbook {'written' if added else 'already had this one'}")
+    print(f"  resume  siana-clean resume {args.run}")
+    return 0
+
+
+def cmd_abort(paths: Home, args) -> int:
+    rec = state(paths, args.run)
+    if rec["status"] == "running":
+        try:
+            os.killpg(os.getpgid(rec["pid"]), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError, TypeError):
+            pass
+    write_json(paths.record(args.run),
+               dict(rec, status="failed", updated=now(),
+                    detail=f"aborted: {args.reason}"))
+    print(f"aborted  {args.run}")
+    print(f"  why    {args.reason}")
+    print("  state  the run's questions and rounds are kept; nothing was undone")
+    return 1
+
+
+def cmd_status(paths: Home, args) -> int:
+    ids = [args.run] if args.run else paths.ids()
+    records = []
+    for run_id in ids:
+        rec = dict(state(paths, run_id))
+        rec["question"] = pending(paths, run_id)
+        rec["answers"] = answers(paths, run_id)
+        rec["rounds"] = len(rounds(paths, run_id))
+        records.append(rec)
+    if args.as_json:
+        print(json.dumps(records, indent=2))
+        return 3 if any(r["question"] for r in records) else 0
+    if not records:
+        print("cleanup  no runs")
+        return 0
+    for rec in records:
+        print(f"run      {rec['id']}  {rec['status']}")
+        print(f"  grant  {', '.join(rec['grants'])}")
+        print(f"  scope  {rec.get('project') or 'every project'}")
+        print(f"  rounds {rec['rounds']}")
+        if rec.get("detail"):
+            print(f"  is     {rec['detail']}")
+        if rec["question"]:
+            report_question(rec["id"], rec["question"])
+    return 3 if any(r["question"] for r in records) else 0
+
+
+def cmd_runbook(paths: Home, args) -> int:
+    runbook_init(paths.runbook)
+    with open(paths.runbook) as fh:
+        sys.stdout.write(fh.read())
+    return 0
+
+
+def main() -> int:
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    paths = Home(home)
+
+    ap = argparse.ArgumentParser(
+        prog="siana-clean", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    s = sub.add_parser("start")
+    s.add_argument("--project", help="one project handle; omitted means all of them")
+    s.add_argument("--grant", action="append", default=[],
+                   help=f"one of: {', '.join(GRANTS)}. Repeatable")
+    st = sub.add_parser("status")
+    st.add_argument("run", nargs="?")
+    st.add_argument("--json", action="store_true", dest="as_json")
+    a = sub.add_parser("answer")
+    a.add_argument("run")
+    a.add_argument("--text", help="the answer, in the words the runbook will keep")
+    a.add_argument("--captain-decided", metavar="OBLIGATION",
+                   help="the obligation id the captain's answer was recorded under")
+    r = sub.add_parser("resume")
+    r.add_argument("run")
+    ab = sub.add_parser("abort")
+    ab.add_argument("run")
+    ab.add_argument("--reason", required=True)
+    sub.add_parser("runbook")
+    k = sub.add_parser("ask")
+    k.add_argument("--run", required=True)
+    k.add_argument("--body", required=True)
+    k.add_argument("--kind", default="siana")
+    k.add_argument("--option", action="append", default=[])
+    args = ap.parse_args()
+
+    if args.cmd is None:
+        args = ap.parse_args(["status"])
+    return {"start": cmd_start, "status": cmd_status, "resume": cmd_resume,
+            "ask": cmd_ask, "answer": cmd_answer, "abort": cmd_abort,
+            "runbook": cmd_runbook}[args.cmd](paths, args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Refusal as r:
+        print(f"error: {r.message}", file=sys.stderr)
+        for h in r.hints:
+            print(f"  {h}", file=sys.stderr)
+        raise
+    except KeyboardInterrupt:
+        sys.exit(130)

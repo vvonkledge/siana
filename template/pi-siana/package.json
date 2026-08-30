@@ -1,0 +1,16 @@
+{
+  "name": "pi-siana",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SIANA's fleet cleanup delegation and captain report, as a pi package",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
