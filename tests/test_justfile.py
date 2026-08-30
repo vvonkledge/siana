@@ -432,6 +432,26 @@ class Init(Recipe):
                 self.assertIn("own-package", fh.read())
             self.assertFalse(os.path.exists(self.at("pi-agent-tasks")))
 
+    def test_changing_which_pi_package_is_configured_leaves_only_the_new_one(self):
+        # `pi install` only appends, so this used to leave both, and pi resolved
+        # the skill collision first-wins - which meant the package the captain had
+        # just stopped configuring was the one SIANA read its queue skill from. It
+        # showed as a startup warning and nowhere else: `doctor` does not read the
+        # packages list, so the home reported complete.
+        checkout = self.package("checkout", "pi-agent-tasks")
+        first = self.just("init", pi_package=checkout)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        again = self.just("init")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        with open(self.at(".pi", "settings.json")) as fh:
+            packages = json.load(fh)["packages"]
+        # Resolved rather than compared as written: pi records the source relative
+        # to `.pi/`, and what has to hold is which directory it lands on.
+        landed = [os.path.realpath(os.path.join(self.at(".pi"), p))
+                  for p in packages]
+        self.assertEqual(landed, [os.path.realpath(self.at("pi-agent-tasks"))],
+                         f"init left {packages} behind")
+
     def test_a_configured_pi_package_that_is_absent_is_refused(self):
         # Never a fallback: generating a different package behind the captain's
         # back gives SIANA a queue skill that is not the one they pointed at. And
