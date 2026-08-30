@@ -385,11 +385,38 @@ class Advancing(Fleet):
         self.assertRemoteUnmoved()
         self.assertNothingTouched()
 
+    def test_a_dry_run_shows_the_copy_that_would_replace_what_is_there(self):
+        """The body and not the title alone.
+
+        A repair overwrites the description of a request somebody is already
+        reading, so a dry run that previewed the push and hid the overwrite would
+        show half of what it changes - and the half a human would want to look at.
+        Asserted exactly, line for line, the way the ordinary path's copy is."""
+        text = self.assertAccepted(self.publish("--dry-run"))
+        self.assertIn("body:", text)
+        for line in ("## Intent", "## Solution", "## Validation", "## Hotspots",
+                     "## Risks and boundaries"):
+            self.assertIn(f"  {line}\n", text)
+        # The repair's own intent, and not the copy it replaces: the published
+        # request currently carries the original ship minion's.
+        self.assertIn("reached for a network it does not have", text)
+        self.assertNotIn("every consumer of it", text)
+        self.assertIn("  Independently reviewed and accepted by a second agent",
+                      text)
+
     def test_a_dry_run_after_the_advance_says_there_is_nothing_to_push(self):
         self.assertAccepted(self.publish())
         text = self.assertAccepted(self.publish("--dry-run"))
         self.assertIn("already at", text)
         self.assertIn("nothing would be pushed", text)
+        # It would still put the copy on, so it still has to show it.
+        self.assertIn("body:", text)
+        self.assertIn("## Hotspots", text)
+
+    def test_a_dry_run_without_the_client_still_shows_the_copy(self):
+        text = self.assertAccepted(self.publish("--dry-run", PATH="/usr/bin:/bin"))
+        self.assertIn("body:", text)
+        self.assertIn("## Hotspots", text)
 
     def test_a_dry_run_without_the_client_still_says_what_it_would_do(self):
         # CI has neither client, and a dry run has to stay readable there.

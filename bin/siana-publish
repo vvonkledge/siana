@@ -488,12 +488,25 @@ def repair_publish(args, home: str, tasks_file: str, handle: str, path: str,
     plan = [f"branch:  {branch}",
             f"repairs: {target_task}, published from {publication}",
             f"head:    {accepted[:12]}, accepted by {qa_id}",
-            f"forge:   {forge}",
-            f"title:   {title}"]
+            f"forge:   {forge}"]
+
+    def preview(*context):
+        """What a dry run shows: the plan, then the exact copy that would go on.
+
+        The body and not the title alone, the same as the ordinary path prints it.
+        It matters more here: this rewrites the description of a request somebody is
+        already reading, so a dry run showing only the title would preview the push
+        and hide the overwrite - which is the half of a repair a human would want to
+        look at before it happens."""
+        for line in (*plan, *context):
+            print(line)
+        print(f"title:   {title}")
+        print("body:")
+        for line in body.splitlines():
+            print(f"  {line}")
 
     if args.dry_run and missing:
-        for line in plan:
-            print(line)
+        preview()
         print(f"would fast-forward {publication} to that head, on the request "
               f"already open from it")
         print(f"warning: {cli} is not installed here, so a real run would refuse",
@@ -554,11 +567,9 @@ def repair_publish(args, home: str, tasks_file: str, handle: str, path: str,
     # far the interrupted run got.
     if remote_head == accepted:
         if args.dry_run:
-            for line in plan:
-                print(line)
-            print(f"request: {request['url']}")
-            print(f"remote:  {publication} is already at {accepted[:12]}")
-            print("  nothing would be pushed, and the copy would be put on again")
+            preview(f"request: {request['url']}",
+                    f"remote:  {publication} is already at {accepted[:12]}")
+            print("nothing would be pushed, and this copy would be put on again")
             return
         update(forge, path, publication, title, body)
         print(f"already advanced: {request['url']}")
@@ -599,10 +610,8 @@ def repair_publish(args, home: str, tasks_file: str, handle: str, path: str,
             (ancestry.stderr or ancestry.stdout).strip())
 
     if args.dry_run:
-        for line in plan:
-            print(line)
-        print(f"request: {request['url']}")
-        print(f"remote:  {publication} at {remote_head[:12]}")
+        preview(f"request: {request['url']}",
+                f"remote:  {publication} at {remote_head[:12]}")
         print(f"would push {accepted[:12]} to refs/heads/{publication} "
               f"(fast-forward, no force)")
         print("  no second request is opened, and its number and target do not move")
