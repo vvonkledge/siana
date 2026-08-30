@@ -182,6 +182,11 @@ class Herdr:
         return result
 
 
+# The agent states a finished minion leaves behind, and the whole of what may be
+# closed. An allowlist rather than a list of what to refuse, for the reason
+# `check_nobody_is_in_it` gives below.
+FINISHED = ("idle", "done", "unknown")
+
 # `<kind>@<pane-id>`, and a pane id is `<workspace-id>:<pane>`. Both halves are shape
 # rules rather than lookups, and they are strict on purpose: this is the one place a
 # workspace id is derived, so a spelling this cannot read has to refuse rather than
@@ -357,21 +362,38 @@ def check_nobody_is_in_it(w: dict, task_id: str, tasks_file: str,
                           workspace_id: str) -> None:
     """Live, focused, or somebody else's. Three ways a workspace is in use, and the
     third is the one no reading of herdr can see on its own."""
-    # A missing field and the value `unknown` are two different answers and are
-    # treated as such. `unknown` is herdr saying it has identified no agent in there,
-    # which is exactly what a finished minion leaves behind and is the ordinary case
-    # this grant exists for. A field that is not there at all is a shape this cannot
-    # read, and an unreadable state is one that might be working.
+    # An allowlist, and it has to be one. A denylist naming `working` alone read
+    # `blocked` as closable, and `blocked` is a live agent stopped at a modal dialog
+    # waiting for a person - the state `siana-dispatch` already refuses to prompt
+    # into, because an untrusted directory raises a dialog that
+    # `--dangerously-skip-permissions` does not skip. Closing that kills an agent
+    # mid-question, which is the exact harm this whole grant is drawn around.
+    #
+    # It also fails the right way on a status this does not know. Herdr's schema has
+    # five today (`herdr api schema`, protocol 19: idle, working, blocked, done,
+    # unknown) and a sixth would arrive with no warning here, so the list is the
+    # states a finished minion actually leaves rather than the states to avoid.
+    #
+    # `unknown` is on it because that is what herdr answers for a pane holding no
+    # agent it has identified, which is what every finished minion leaves behind:
+    # refusing it would leave this grant unable to close the ordinary case. A field
+    # that is not there at all is different again - a shape this cannot read rather
+    # than an answer - and is refused.
     status = w.get("agent_status")
     if not status:
         die(f"herdr says nothing about what is running in {workspace_id}",
             "a workspace whose state cannot be read is one that might be working;",
             "closing it kills whatever is in it")
-    if status == "working":
-        die(f"{workspace_id} is working",
-            f"herdr reports an agent still running there, and {task_id} is done, so",
-            "these disagree about whether anything is left to do",
-            "closing it kills that agent mid-turn; look at the workspace first")
+    if status not in FINISHED:
+        die(f"{workspace_id} is {status}, and a workspace this closes is "
+            + " or ".join(sorted(FINISHED)),
+            f"{task_id} is done, so the queue and herdr disagree about whether",
+            "anything is left to be doing in there",
+            "`working` is an agent mid-turn and `blocked` is one stopped at a dialog",
+            "waiting for a person; closing either kills it where it stands",
+            "a status not in that list at all is one this command does not know,",
+            "and an unknown state is never read as a finished one",
+            "look at the workspace first")
     # Asked for its presence and then for its value, the same distinction as
     # `agent_status` above: `False` is herdr saying nobody is looking at it, and an
     # absent field is herdr not saying, which is not the same answer and must not

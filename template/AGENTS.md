@@ -666,7 +666,11 @@ What it refuses, and every one is a finding rather than an obstacle:
   once
 - a workspace open on a different tree, or in a different repository, from the ones
   the queue and the registry give for that task
-- a workspace that is working, or focused, or whose state Herdr will not say
+- a workspace whose agent is not in a state a finished minion leaves. Idle, done
+  and unknown are; working is an agent mid-turn, blocked is one stopped at a modal
+  dialog waiting for a person, and a state Herdr has since grown is one the command
+  does not know. It is an allowlist, so all three refuse
+- a workspace that is focused, or whose state Herdr will not say at all
 - a workspace any other task in the queue names a pane in, whatever that task's
   status. Shared custody is never inferred away
 - a Herdr that cannot be reached or that answers something unreadable. A workspace

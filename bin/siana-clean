@@ -82,7 +82,9 @@ and deliberately, and the narrowness is in the command: `siana-close-workspace` 
 a task id, resolves the workspace from that task's recorded owner pane and from
 nothing else, and refuses unless herdr agrees the workspace is a linked worktree one,
 open on exactly the tree that task recorded, in exactly the repository the registry
-gives that task's project, with nothing running in it and no other task's pane in it.
+gives that task's project, unfocused, with no other task's pane in it, and with its
+agent in one of the states a finished minion leaves rather than one this fleet would
+be interrupting.
 
 Two orderings are load-bearing and both are refusals in that command rather than
 instructions here. Closing a workspace before its worktree is removed strands the

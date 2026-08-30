@@ -513,10 +513,13 @@ own recorded owner pane - never from a label, a workspace number, an agent name 
 what is focused, each of which finds *a* workspace rather than *that task's*. It
 closes only a `done` task's workspace, only when Herdr says the workspace is a
 linked-worktree one open on exactly the tree the queue recorded, in exactly the
-repository the registry gives that project, with nothing running in it, unfocused,
-and named by no other task in the queue. And it closes only after the retirement has
-actually happened: the tree gone from disk and gone from git's own list of worktrees,
-read from the world rather than taken from an exit code.
+repository the registry gives that project, unfocused, named by no other task in the
+queue, and with its agent in one of the states a finished minion actually leaves -
+idle, done or unknown. That last one is an allowlist, so an agent mid-turn, an agent
+stopped at a dialog waiting for you, and a state a later Herdr grows all refuse. And
+it closes only after the retirement has actually happened: the tree gone from disk and
+gone from git's own list of worktrees, read from the world rather than taken from an
+exit code.
 
 That ordering is load-bearing twice over. A workspace closed before its worktree is
 removed strands the worktree, and a project's *source* workspace closes every

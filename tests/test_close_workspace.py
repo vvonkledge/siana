@@ -476,8 +476,33 @@ class InUse(Close):
     def test_a_working_workspace_is_never_closed(self):
         worktree = self.retired()
         self.answers(listing(self.workspace(worktree, status="working")))
-        self.assertRefused(self.close(), "is working", "mid-turn")
+        self.assertRefused(self.close(), "w9 is working", "mid-turn")
         self.assertClosedNothing()
+
+    def test_a_blocked_agent_is_a_live_one_waiting_on_a_person(self):
+        # The state a denylist naming `working` alone read as closable. A blocked
+        # agent is stopped at a modal dialog - `siana-dispatch` refuses to prompt
+        # into that one for the same reason - so closing it kills an agent
+        # mid-question, which is the exact harm this grant is drawn around.
+        worktree = self.retired()
+        self.answers(listing(self.workspace(worktree, status="blocked")))
+        self.assertRefused(self.close(), "w9 is blocked", "waiting for a person")
+        self.assertClosedNothing()
+
+    def test_a_status_this_command_does_not_know_is_never_a_finished_one(self):
+        # The list is the states a finished minion leaves, not the states to avoid,
+        # so a sixth one a later herdr adds arrives as a refusal rather than as a
+        # close. Herdr's schema has five today (protocol 19).
+        worktree = self.retired()
+        self.answers(listing(self.workspace(worktree, status="reviewing")))
+        self.assertRefused(self.close(), "w9 is reviewing",
+                           "one this command does not know")
+        self.assertClosedNothing()
+
+    def test_the_states_it_closes_are_the_ones_a_finished_minion_leaves(self):
+        # Read off the command, so the allowlist and the tests cannot drift apart
+        # into agreeing with each other.
+        self.assertEqual(set(c.FINISHED), {"idle", "done", "unknown"})
 
     def test_a_focused_workspace_is_never_closed(self):
         worktree = self.retired()
