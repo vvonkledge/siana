@@ -382,6 +382,87 @@ class Init(Recipe):
         self.assertEqual(sorted(os.listdir(self.at(".pi", "extensions"))),
                          ["wake.ts"])
 
+    def settings(self, mutate):
+        """The home's pi settings, rewritten by `mutate`. Every check below is about
+        what doctor makes of the file rather than about how it got that way, so the
+        home is installed for real first and then damaged."""
+        path = self.at(".pi", "settings.json")
+        with open(path) as fh:
+            config = json.load(fh)
+        mutate(config)
+        with open(path, "w") as fh:
+            json.dump(config, fh)
+
+    def test_doctor_passes_the_package_the_install_actually_wrote(self):
+        # The half that makes every refusal below mean something. A check nothing
+        # can satisfy would fail an install that is correct.
+        self.assertEqual(self.just("init").returncode, 0)
+        doctor = self.just("doctor")
+        self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        self.assertIn("ok      .pi/settings.json (pi-siana)", doctor.stdout)
+
+    def test_a_home_that_lost_the_package_is_never_reported_healthy(self):
+        # The gap this closes. Doctor checked that `.pi/settings.json` existed, and
+        # a home whose packages array had lost the pi-siana entry has no
+        # `siana_cleanup` and no `siana_runbook` tool, no `captain-report` skill and
+        # no `/captain-report` command - none of which fails, because none of them
+        # is there to be called. It printed `ok .pi/settings.json` and exited 0.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.settings(lambda config: config.__setitem__(
+            "packages", [p for p in config["packages"]
+                         if "pi-siana" not in str(p)]))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("missing pi-siana package: no entry names it", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+
+    def test_a_second_spelling_of_the_package_is_reported_rather_than_blessed(self):
+        # Two spellings of one directory are two packages to pi, so every resource
+        # in it is discovered twice. `init` reconciles it; doctor is what says the
+        # captain needs to run one.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.settings(lambda config: config["packages"].append(
+            os.path.realpath(os.path.join(DISTRO, "template", "pi-siana"))))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("2 entries name it", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+
+    def test_an_entry_that_resolves_nowhere_is_not_a_present_package(self):
+        # The failure the README already names: the entry is a relative path into
+        # the checkout, so a checkout that moved leaves a settings file that still
+        # names a package and a home that has none.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.settings(lambda config: config.__setitem__(
+            "packages", [p for p in config["packages"]
+                         if "pi-siana" not in str(p)]
+            + [os.path.join(self.home, "moved-away", "pi-siana")]))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("which is not there", doctor.stderr)
+
+    def test_a_directory_that_is_no_package_is_not_a_present_package(self):
+        # The near miss `init` already refuses on the way in, asked of a home that
+        # has one anyway. Existing and a directory is not enough.
+        self.assertEqual(self.just("init").returncode, 0)
+        empty = self.at("empty", "pi-siana")
+        os.makedirs(empty, exist_ok=True)
+        self.settings(lambda config: config.__setitem__(
+            "packages", [p for p in config["packages"]
+                         if "pi-siana" not in str(p)] + [empty]))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("holds no package.json", doctor.stderr)
+
+    def test_settings_that_will_not_parse_is_never_a_healthy_package(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json"), "w") as fh:
+            fh.write("{ this is not json\n")
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("will not parse", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+
     def test_doctor_reports_the_runbook_and_the_cleanup_state(self):
         self.assertEqual(self.just("init").returncode, 0)
         doctor = self.just("doctor")

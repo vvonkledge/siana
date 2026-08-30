@@ -468,6 +468,12 @@ doctor: _contract-drift
     #!/usr/bin/env bash
     set -uo pipefail
     home='{{home}}'
+    # Doctor reports and never repairs, so almost everything it finds is a line the
+    # captain reads and acts on. This is the one exception, and it is set below: an
+    # absent pi-siana package cannot be seen from inside a session at all, because
+    # every tool and command it carries is simply not offered. A report nobody
+    # notices is what let a home with the whole package gone read as healthy.
+    unhealthy=""
     echo "home     $home"
     for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-tasks.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
@@ -534,6 +540,67 @@ doctor: _contract-drift
                 echo "  missing .pi/extensions/wake.ts (\`just init\` writes it;" \
                      "without it \`siana-watch\` refuses to start)"
             fi
+            # The distro's own package, asked of the settings file rather than
+            # assumed from it existing. `wake.ts` is checked by name because a home
+            # without it cannot advance unattended; this is the same silence one
+            # layer in. A home whose `packages` array has lost the pi-siana entry
+            # has no `siana_cleanup` and no `siana_runbook` tool, no
+            # `captain-report` skill and no `/captain-report` command - and none of
+            # them fails, because none of them is there to be called.
+            #
+            # An entry is recognised exactly as `init`'s reconciler recognises one,
+            # so what doctor calls a pi-siana entry and what init collapses to a
+            # single entry cannot drift apart.
+            siana_pkg="$(cd "$PWD/template/pi-siana" && pwd -P)"
+    python3 - "$home/.pi/settings.json" "$siana_pkg" <<'PACKAGE' || unhealthy=1
+    import json, os, sys
+    settings_path, pkg = sys.argv[1], sys.argv[2]
+    try:
+        with open(settings_path) as fh:
+            settings = json.load(fh)
+    except (OSError, ValueError) as exc:
+        settings = None
+        why = f"{os.path.basename(settings_path)} will not parse: {exc}"
+    if settings is not None and not isinstance(settings, dict):
+        why = f"{os.path.basename(settings_path)} is not a JSON object"
+    elif settings is not None:
+        packages = settings.get("packages", [])
+        if not isinstance(packages, list):
+            why = "its `packages` is not a list"
+        else:
+            found = []
+            for entry in packages:
+                source = entry if isinstance(entry, str) else \
+                    (entry.get("source", "") if isinstance(entry, dict) else "")
+                if not isinstance(source, str) or not source.startswith(("/", ".")):
+                    continue
+                resolved = os.path.realpath(
+                    os.path.join(os.path.dirname(settings_path), source))
+                if resolved == pkg or os.path.basename(resolved) == "pi-siana":
+                    found.append(resolved)
+            if not found:
+                why = "no entry names it"
+            elif len(found) > 1:
+                # Two spellings of one directory are two packages to pi, and every
+                # resource in it is then discovered twice.
+                why = f"{len(found)} entries name it: {', '.join(found)}"
+            elif not os.path.isdir(found[0]):
+                why = f"its entry resolves to {found[0]}, which is not there"
+            elif not os.path.isfile(os.path.join(found[0], "package.json")):
+                why = f"its entry resolves to {found[0]}, which holds no package.json"
+            else:
+                why = ""
+    if not why:
+        print("  ok      .pi/settings.json (pi-siana)")
+        raise SystemExit(0)
+    print(f"  missing pi-siana package: {why}", file=sys.stderr)
+    print("          without it a session has no siana_cleanup or siana_runbook",
+          file=sys.stderr)
+    print("          tool, no captain-report skill and no /captain-report command",
+          file=sys.stderr)
+    print("          `just init` installs it", file=sys.stderr)
+    raise SystemExit(1)
+    PACKAGE
         fi
     done
     if [ -n "$starts" ]; then
@@ -587,6 +654,12 @@ doctor: _contract-drift
     SIANA_HOME="$home" "$PWD/bin/siana-owe" || true
     echo
     [ -d "$home" ] && (cd "$home" && tasks)
+    # The queue's own exit code, unless the package check above already failed.
+    # Kept rather than replaced with a plain `exit 0`, because a home whose queue
+    # will not read is a home doctor was already right to fail on.
+    status=$?
+    [ -z "$unhealthy" ] || status=1
+    exit "$status"
 
 # Remove the installed commands. SIANA's home and its queue are left alone.
 uninstall:
