@@ -20,6 +20,7 @@ impossible would be a worse fleet, not a safer one.
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import unittest
 
@@ -601,6 +602,20 @@ class UnderAnAdvisorySession(Publishable):
             json.dump(record, fh)
         return self.at("record.json")
 
+    def assertProposalRecorded(self, out):
+        """The publish stopped, and the decision SIANA reached is in the ledger.
+
+        Both halves. A publish that merely refuses has done half the job: what an
+        advisory night produces is the record, and a decision missing from it reads
+        in the morning as a quiet night."""
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        with open(self.at("decisions.jsonl")) as fh:
+            rec = json.loads(fh.read().strip().splitlines()[-1])
+        self.assertEqual(rec["verdict"], "refused")
+        self.assertEqual(rec["action"], PROPOSAL["action"])
+        self.assertEqual(rec["grant"], "2026-08-29T20:00:00Z")
+        return rec
+
     def test_it_refuses_without_a_record_before_anything_else(self):
         # The record is what the captain reads in the morning instead of a merge
         # request that appeared while they were asleep. Refused up front, so the
@@ -654,6 +669,43 @@ class UnderAnAdvisorySession(Publishable):
                            "--record", self.record(principles=[]))
         self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("quotes no principle", out.stdout)
+
+    def test_a_forge_nobody_recognises_does_not_discard_the_proposal(self):
+        # Which forge the remote is on is a question about this machine, and an
+        # advisory night never needs it answered: the proposal is refused at the
+        # allowlist whatever the answer would have been. Asked first, it threw the
+        # decision away instead.
+        subprocess.run(["git", "-C", self.repo, "remote", "set-url", "origin",
+                        "https://bitbucket.org/example/demo.git"],
+                       capture_output=True, text=True)
+        out = self.run_bin("siana-publish", "qa-add-json", "--record", self.record())
+        self.assertProposalRecorded(out)
+        self.assertNotIn("cannot tell which forge", out.stdout + out.stderr)
+
+    def test_a_repository_with_no_origin_does_not_discard_the_proposal(self):
+        subprocess.run(["git", "-C", self.repo, "remote", "remove", "origin"],
+                       capture_output=True, text=True)
+        out = self.run_bin("siana-publish", "qa-add-json", "--record", self.record())
+        self.assertProposalRecorded(out)
+        self.assertNotIn("no `origin` remote", out.stdout + out.stderr)
+
+    def test_a_registry_path_that_has_moved_does_not_discard_the_proposal(self):
+        # The registry entry is stale and the work is somewhere else. Still a
+        # decision SIANA made, and still the captain's to read.
+        shutil.move(self.repo, self.repo + "-moved")
+        self.addCleanup(shutil.move, self.repo + "-moved", self.repo)
+        out = self.run_bin("siana-publish", "qa-add-json", "--record", self.record())
+        self.assertProposalRecorded(out)
+        self.assertNotIn("which is not a directory", out.stdout + out.stderr)
+
+    def test_a_branch_that_is_gone_does_not_discard_the_proposal(self):
+        subprocess.run(["git", "-C", self.repo, "checkout", "main"],
+                       capture_output=True, text=True)
+        subprocess.run(["git", "-C", self.repo, "branch", "-D", "siana/add-json"],
+                       capture_output=True, text=True)
+        out = self.run_bin("siana-publish", "qa-add-json", "--record", self.record())
+        self.assertProposalRecorded(out)
+        self.assertNotIn("has no branch", out.stdout + out.stderr)
 
     def test_a_verdict_that_authorises_nothing_is_still_refused_first(self):
         # The gate is asked last of the queue's refusals, not instead of them. A

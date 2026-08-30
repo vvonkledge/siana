@@ -52,13 +52,20 @@ fields:
   verdict:
     type: enum
     values: [proposed, refused]
-    description: it reads `proposed` when no grant was in force and `refused` when
-      one was and it said no. There is no third value while advisory is the only
-      mode
+    description: it reads `proposed` on exactly one path - a well-formed record, no
+      stop file, and no session record on disk - and `refused` on every other answer
+      the gate gives, including the ones it reaches with nothing in force. So a
+      `refused` record whose `grant` below is absent is a refusal that never got as
+      far as looking for a session, and not a session that said no. There is no third
+      value while advisory is the only mode
   reason:
     type: str
     required: false
-    description: what the gate refused on, in the gate's words; absent on a proposal
+    description: what the gate said, in the gate's own words - what it refused on,
+      or on a proposal that nothing was in force to decide it. Every record
+      `siana-gate` writes carries one. It stays optional rather than being made
+      required, because tightening a field is not something an append-only contract
+      can do to the records already written under it
   task:
     type: str
     required: false

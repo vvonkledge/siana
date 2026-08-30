@@ -90,6 +90,16 @@ class Activation(Advisory):
             self.run_bin("siana-afk", "--until", past, "--project", "demo"),
             "which has passed")
 
+    def test_a_deadline_too_large_to_work_out_is_refused_and_never_a_traceback(self):
+        # The arithmetic that resolves a duration runs before the ceiling that would
+        # have refused this, and it overflowed. Everything else in this file names a
+        # traceback as the failure it is avoiding, and `just doctor` would print one
+        # where it asks for a refusal.
+        out = self.run_bin("siana-afk", "--until", "999999999999h",
+                           "--project", "demo")
+        self.assertRefused(out, "further out than a date can be")
+        self.assertNotIn("Traceback", out.stderr)
+
     def test_a_deadline_that_is_neither_a_time_nor_a_duration_is_refused(self):
         self.assertRefused(
             self.run_bin("siana-afk", "--until", "tonight", "--project", "demo"),
@@ -338,6 +348,23 @@ class WhileOneRuns(Advisory):
         text = self.assertAccepted(self.run_bin("siana-afk", "--status"))
         self.assertIn("2 decision(s) recorded", text)
 
+    def test_a_ledger_the_gate_cannot_read_is_never_reported_healthy(self):
+        # The two halves of one state have to agree. `siana-gate` faults on a ledger
+        # line it cannot parse and records nothing, so a fleet with one is a fleet
+        # deciding nothing at all; `--status` - and `just doctor`, which runs it -
+        # printing `ok      advisory session running` over that is the same false
+        # green the record-whose-process-is-gone test above refuses, for the other
+        # half of the same state.
+        self.decide()
+        with open(self.at("decisions.jsonl"), "a") as fh:
+            fh.write("this is not json\n")
+        out = self.run_bin("siana-afk", "--status")
+        self.assertRefused(out, "has a line that is not JSON", "records nothing")
+        self.assertNotIn("ok      advisory session running", out.stdout)
+        # And the gate is still faulting on the same line, which is what makes the
+        # line above true rather than merely loud.
+        self.assertEqual(self.decide().returncode, 2)
+
     def test_stopping_it_withdraws_the_record(self):
         # A record left behind reads as a session that died, and sends the captain
         # looking for something that never happened.
@@ -380,6 +407,15 @@ class Stopping(Advisory):
         out = self.run_bin("siana-afk", "--status")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("no advisory session", out.stdout)
+
+    def test_a_ledger_the_gate_cannot_read_is_reported_with_no_session_too(self):
+        # The night before the captain starts one. Asked only while a session was in
+        # force, this would print `ok` over a home whose next session decides nothing
+        # and records nothing, which is the state it exists to make visible.
+        with open(self.at("decisions.jsonl"), "w") as fh:
+            fh.write("this is not json\n")
+        self.assertRefused(self.run_bin("siana-afk", "--status"),
+                           "has a line that is not JSON")
 
 
 if __name__ == "__main__":
