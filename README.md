@@ -291,14 +291,18 @@ The brief then records the branch that work was published from, and once QA acce
 the fix, `siana-publish` fast-forwards that branch to exactly the head QA accepted.
 Your merge request keeps its number and its review, and gains the commits that fix
 it. Its description is rewritten from the repair minion's own handoff, because after
-that push it is describing that minion's work. Nothing merges: that is still yours,
-in person.
+that push it is describing that minion's work. Nothing merges unless you granted that
+project a merge, under "Letting accepted work merge" below; without the grant it is
+still yours, in person.
 
 It refuses rather than guesses. No open request from that branch, more than one, a
 closed or merged one, a branch that has moved under the request, a head that is not a
 fast-forward of what the request holds, or a minion still working on that branch all
 stop before anything is pushed. So does a repair branch that moved after its verdict,
 because the head that goes out is the one a second minion actually read.
+
+The push and the description are two calls, so an interrupted run can leave the new
+commits under the old copy. Running it again pushes nothing and puts the copy on.
 
 ### Letting accepted work merge
 
@@ -361,8 +365,6 @@ must be green is a project setting the client does not report. So on GitLab an a
 could not be retracted, and "this branch requires nothing" and "I could not ask"
 arrive as the same empty answer. Neither is a thing to build a merge on.
 
-The push and the description are two calls, so an interrupted run can leave the new
-commits under the old copy. Running it again pushes nothing and puts the copy on.
 
 ### Leave it running
 
