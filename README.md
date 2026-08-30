@@ -599,7 +599,7 @@ done while you were away, where nobody was asked and no answer exists.
 
     just test
 
-Three or four minutes. Standard-library `unittest`, no dependencies to install. It
+Six or seven minutes. Standard-library `unittest`, no dependencies to install. It
 drives the pure mechanics in-process and drives the commands as real processes
 against a real `tasks` and `datafile`, into throwaway homes, because a stubbed store
 would only ever agree with the suite. Unittest arguments pass through, so `just test
