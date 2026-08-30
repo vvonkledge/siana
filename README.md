@@ -88,9 +88,9 @@ Into the home:
 - `siana.env`, a flat env file with the resolved paths SIANA needs to find itself.
   Regenerated every run, because it is derived and never yours to edit for keeps.
 - `AGENTS.md`, `orders.md`, `review.md`, `brief-ship.md`, `brief-scout.md`,
-  `brief-qa.md`, copied from `template/`. **Copied only when absent.** SIANA evolves
-  its own instructions, so a home copy that differs from the template is your work,
-  and `init` says `kept` and leaves it alone.
+  `brief-qa.md`, `handoff.md`, copied from `template/`. **Copied only when absent.**
+  SIANA evolves its own instructions, so a home copy that differs from the template
+  is your work, and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
   `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
   reason. A contract only ever grows, because a field dropped from a live contract
@@ -115,10 +115,10 @@ The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
 so a contract with no `.jsonl` beside it is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
-`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-publish`,
-`siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`. They are links, so a
-`git pull` here updates the commands with no reinstall. It does not update the home;
-`just upgrade` does that.
+`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
+`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`. They are
+links, so a `git pull` here updates the commands with no reinstall. It does not
+update the home; `just upgrade` does that.
 
 ### The queue integration
 
@@ -246,6 +246,34 @@ You never make one of these by hand, and nothing here pushes one. `siana-publish
 pushes the branch a QA minion accepted, and only that; `siana-retire` removes the
 worktree once nothing is left in it that only it holds; `siana-reap` removes the
 branch once the work has landed.
+
+### What the merge request says
+
+The title and the body come from the minion that did the work, not from the task it
+was given. It writes them at `~/.siana/handoffs/<task-id>.md` once its last commit is
+made: the problem and why the change exists, what the implementation does and the
+design choice behind it, what it was checked with, where review attention is worth
+most, and what it trades away or deliberately leaves alone.
+
+That is judgment, so it stays with an agent. What is exact is `siana-handoff`, which
+validates the document and assembles it: five sections, none of them empty, one title
+inside a subject line's width, and a recorded commit that has to be the head the QA
+minion accepted. A handoff that is missing, still carrying its scaffolding, malformed
+or left behind by a later commit refuses the publish rather than travelling with work
+it does not describe, and nothing in that path asks a model. So does one that points
+into `~/.siana`, in any of the ways that directory gets written: a reviewer cannot
+follow a path onto the captain's machine, and what is under it was written for SIANA
+and not for them.
+
+The brief never travels. It was written before the work existed, by an agent briefing
+a minion, so it can say what was asked for and not what was built, what it was
+checked with, or where to look. Merge requests made out of it read as instructions to
+their own implementer. Neither does the QA report: that one is written for SIANA and
+stays in the home. What the merge request says about the review is one sentence,
+which `siana-publish` adds because it is a fact about the queue rather than a
+judgment about the work.
+
+`siana-publish --dry-run` prints the exact title and body, and changes nothing.
 
 ### Leave it running
 
@@ -518,8 +546,8 @@ deleted. Your home is left alone, queue and all. Delete it by hand when you mean
     bin/        the commands. Mechanics only: they stop and report when the
                 world surprises them, and never adjudicate meaning.
     template/   what an install copies into the home: SIANA's instructions, the
-                standing orders every minion is started with, the brief
-                templates, and the store contracts.
+                standing orders every minion is started with, the brief and
+                handoff templates, and the store contracts.
     tests/      the suite.
     justfile    init, upgrade, test, doctor, uninstall.
     VISION.md   what the fleet is for.

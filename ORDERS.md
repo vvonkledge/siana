@@ -10,9 +10,9 @@ and the line between those two is the project's whole design.
 - `bin/` holds the commands. Mechanics only. They stop and report when the world
   surprises them, and they never adjudicate meaning.
 - `template/` is what an install copies into the captain's `$SIANA_HOME`: SIANA's
-  instructions, the minion orders you are reading a copy of, the brief templates, and
-  the store contracts. Changing one changes what every future SIANA and every future
-  minion is told.
+  instructions, the minion orders you are reading a copy of, the brief and handoff
+  templates, and the store contracts. Changing one changes what every future SIANA
+  and every future minion is told.
 - `tests/` is the suite. Standard-library `unittest`, no dependencies.
 - `VISION.md` says what the fleet is for. Read it before you argue with a design
   choice in here, because most of them are downstream of it.

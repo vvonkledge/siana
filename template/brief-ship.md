@@ -37,6 +37,29 @@ left it, so it is not something `done` can produce on its own. Your branch is st
 the deliverable and it still never leaves this machine - the pipeline does not push,
 and neither do you.
 
+## The handoff
+
+Your branch is one half of what you deliver. The other half is the copy a human
+reads on the merge request, and you write that too, because you are the only agent
+that will ever have understood both what was asked and what you actually built.
+
+Write it after your last commit and before you call `done`:
+
+    siana-handoff "$SIANA_TASK_ID" --scaffold
+    siana-handoff "$SIANA_TASK_ID" --head "$(git rev-parse HEAD)"
+
+The scaffold says what each section is for. The second command is the check: it
+refuses a section left empty, a title that is a task id, and a copy that describes
+a commit your branch has already moved past.
+
+It is judged like the rest of your work. The minion that reviews this branch reads
+it against the change, and publication refuses a handoff that is missing, unfilled,
+malformed or stale, so a branch nobody can describe is a branch that does not land.
+
+Write it for someone who has not read this brief, was not told what this fleet is,
+and is deciding whether to merge. Nothing else about your work travels with it: not
+this brief, not your task, and not the report of the minion that reviews you.
+
 ## The task
 
 <!-- SIANA: what to build. Concrete enough that a cold-starting minion could not

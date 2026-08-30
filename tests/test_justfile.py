@@ -295,6 +295,11 @@ class Init(Recipe):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         for f in ("siana.env", "AGENTS.md", "orders.md", "review.md",
                   "brief-ship.md", "brief-scout.md", "brief-qa.md",
+                  # The document a ship minion writes the merge request in. Without
+                  # it `siana-handoff --scaffold` has nothing to lay down, and a
+                  # minion writing the shape from memory is where format drift
+                  # starts.
+                  "handoff.md",
                   "schema-projects.yaml", "schema-obligations.yaml",
                   "schema-decisions.yaml", "schema-tasks.yaml",
                   # The principles an advisory session holds SIANA to. It ships
@@ -307,8 +312,8 @@ class Init(Recipe):
                   os.path.join(".pi", "extensions", "wake.ts")):
             self.assertTrue(os.path.exists(self.at(f)), f"init left out {f}")
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
-                  "siana-owe", "siana-retire", "siana-publish", "siana-reap",
-                  "siana-pipeline", "siana-afk", "siana-gate"):
+                  "siana-owe", "siana-retire", "siana-handoff", "siana-publish",
+                  "siana-reap", "siana-pipeline", "siana-afk", "siana-gate"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this

@@ -35,8 +35,11 @@ in this order:
    does not have. `git log --oneline <default>..HEAD` and `git diff <default>...HEAD`.
    If you cannot tell which branch it forked from, that is a `block` and never a
    diff you guessed at.
+4. its handoff, at `$SIANA_HOME/handoffs/{SHIP_TASK}.md`. That document becomes the
+   title and the body of the merge request, and it is the whole of what a human
+   outside this fleet ever reads about the work.
 
-Then judge it on four things:
+Then judge it on five things:
 
 - **Does it do what the brief asked?** Every "Done when" item, observed rather
   than inferred from the diff. If the brief describes behaviour, produce that
@@ -50,6 +53,12 @@ Then judge it on four things:
   when the code itself is good.
 - **Is its evidence real?** What the ship minion reported is a claim. Where you
   can rerun the thing it claimed, rerun it.
+- **Does its handoff describe this change?** Render it with
+  `siana-handoff {SHIP_TASK}` and read it against the diff you have just read. Copy
+  that would be true of any change, hotspots that are only the list of files
+  touched, or an intent that describes the task instead of the problem are findings
+  like any other. It is the last thing anyone can still fix, because after you it
+  goes to a human who has none of this.
 
 A green verify is not a pass by itself. It is one piece of evidence, and the ship
 minion already had it.

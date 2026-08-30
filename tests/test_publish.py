@@ -4,6 +4,12 @@ Publishing is the one thing in this fleet that leaves it. Every test here is eit
 a way the branch could go out without a second minion having accepted it, or a way
 something internal could travel with it.
 
+What travels is the ship minion's handoff and nothing else. The rules of that
+document are `test_handoff.py`; what is here is the half only this command can say:
+that the copy is bound to the head QA accepted, that a missing or stale one stops the
+publish before anything is pushed, and that the brief the work was briefed with no
+longer reaches a forge at all.
+
 The last class is the other half of that: while an advisory session runs, the branch
 does not leave at all, and what the captain gets instead is a record of what SIANA
 would have done. With no session, nothing above it changes, and that is asserted
@@ -52,33 +58,43 @@ Do not touch the config loader.
 """
 
 
-class Section(unittest.TestCase):
-    """The brief is written for one minion in this fleet. Only the parts that
-    describe the work itself are fit to read outside it."""
+HANDOFF = """# Handoff
 
-    def test_takes_the_named_section_only(self):
-        self.assertEqual(publish.section(BRIEF, "The task"),
-                         "Add a --json flag to the status command.")
+    title  Print one task per line in a shape a script can read
+    head   {head}
 
-    def test_stops_at_the_next_heading(self):
-        # Without the stop, "Done when" would swallow every section after it and
-        # carry the minion's standing limits into a merge request.
-        self.assertEqual(publish.section(BRIEF, "Done when"),
-                         "`status --json` prints one object per task.")
+## Intent
 
-    def test_drops_the_instructions_to_siana(self):
-        for heading in ("The task", "Done when"):
-            self.assertNotIn("SIANA:", publish.section(BRIEF, heading))
-            self.assertNotIn("<!--", publish.section(BRIEF, heading))
+`status` printed a table nobody could parse, so every caller that wanted one field
+grew its own fragile `awk`, and each of them broke on a different day.
 
-    def test_absent_section_is_none(self):
-        # A brief may delete "Done when" when the verify genuinely says all of it,
-        # so absence is a shape to handle and never a fault.
-        self.assertIsNone(publish.section("# Brief\n\n## The task\n\nx\n", "Done when"))
+## Solution
 
-    def test_empty_section_is_none(self):
-        self.assertIsNone(publish.section("## Done when\n\n<!-- only a note -->\n",
-                                          "Done when"))
+`--json` prints one object per task, from the same records the table is built from,
+so the two cannot disagree about what a task is.
+
+## Validation
+
+`just test` covers the flag against an empty queue, one task, and a task carrying
+every optional field.
+
+## Hotspots
+
+The empty queue prints `[]` and not nothing: a caller piping this into `jq` sees a
+document either way, and that is the case the old table got wrong.
+
+## Risks and boundaries
+
+The table is unchanged and stays the default. Nothing here makes the JSON stable
+across versions.
+"""
+
+
+def printed(block):
+    """A block of the body as `--dry-run` prints it: every line behind two spaces,
+    the blank ones included. What a dry run is for is showing the exact copy, so what
+    it shows is asserted exactly."""
+    return "".join(f"  {line}\n" for line in block.splitlines())
 
 
 class Forge(unittest.TestCase):
@@ -208,10 +224,13 @@ class Publishable(HomeTest):
                      ["commit", "--allow-empty", "-m", "base"],
                      ["checkout", "-b", "siana/add-json"],
                      ["commit", "--allow-empty", "-m", "work"],
-                     ["remote", "add", "origin", "git@gitlab.com:demo/demo.git"]):
+                     ["remote", "add", "origin", self.origin()]):
             out = subprocess.run(["git", "-C", self.repo, *argv],
                                  capture_output=True, text=True)
             self.assertEqual(out.returncode, 0, out.stderr)
+        self.head = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "siana/add-json"],
+            capture_output=True, text=True).stdout.strip()
 
         self.project("demo", path=self.repo, ship="just test", qa="just e2e",
                      target="preproduction")
@@ -227,43 +246,132 @@ class Publishable(HomeTest):
         os.makedirs(self.at("briefs"))
         with open(self.at("briefs", "add-json.md"), "w") as fh:
             fh.write(BRIEF)
+        self.handoff(HANDOFF.format(head=self.head))
+
+    def origin(self):
+        """Where `origin` points.
+
+        A URL and not a repository, because every test that inherits this stops
+        before the push. `Opened` overrides it with somewhere a push can land."""
+        return "git@gitlab.com:demo/demo.git"
+
+    def handoff(self, text):
+        """The copy the ship minion wrote. Every test that publishes needs one, so
+        it is part of a well-formed publish rather than something a test adds."""
+        os.makedirs(self.at("handoffs"), exist_ok=True)
+        with open(self.at("handoffs", "add-json.md"), "w") as fh:
+            fh.write(text)
 
 
 class DryRun(Publishable):
     """A well-formed publish, stopped before it leaves the machine."""
 
+    def dry(self):
+        return self.assertAccepted(
+            self.run_bin("siana-publish", "qa-add-json", "--dry-run"))
+
     def test_reports_what_it_would_open(self):
-        text = self.assertAccepted(self.run_bin("siana-publish", "qa-add-json",
-                                                "--dry-run"))
+        text = self.dry()
         self.assertIn("branch:  siana/add-json", text)
         self.assertIn("target:  preproduction", text)
         self.assertIn("gitlab", text)
-        self.assertIn("Add a --json flag to status", text)
-        self.assertIn("Add a --json flag to the status command.", text)
+
+    def test_the_title_and_the_body_are_the_ones_a_human_wrote(self):
+        # Exactly what would be opened, which is the whole point of a dry run: the
+        # title off the handoff, and every section of it in the published order.
+        text = self.dry()
+        self.assertIn("title:   Print one task per line in a shape a script can read",
+                      text)
+        for heading in ("Intent", "Solution", "Validation", "Hotspots",
+                        "Risks and boundaries"):
+            self.assertIn(f"## {heading}", text)
+        self.assertIn("grew its own fragile `awk`", text)
 
     def test_the_body_names_both_tasks(self):
         # Whoever reviews it can find the contract the work was held to, and the
         # verdict that let it out, without either being pasted in.
-        text = self.assertAccepted(self.run_bin("siana-publish", "qa-add-json",
-                                                "--dry-run"))
+        text = self.dry()
         self.assertIn("Shipped by `add-json`, accepted by `qa-add-json`.", text)
 
+    def test_the_review_a_human_never_sees_the_report_of_is_still_stated(self):
+        # `Validation` is the section a reader asks the question in, and the ship
+        # minion finished before any of the review happened, so this one sentence is
+        # the command's to add and nobody else's.
+        text = self.dry()
+        self.assertIn("Independently reviewed and accepted by a second agent", text)
+
     def test_nothing_internal_travels(self):
-        # The captain's ruling: the QA report stays inside SIANA. The brief's
-        # background and scope are written for one minion and are not review notes.
-        text = self.assertAccepted(self.run_bin("siana-publish", "qa-add-json",
-                                                "--dry-run"))
+        # The captain's ruling: the QA report stays inside SIANA. A brief is written
+        # before the work exists, by an agent briefing a minion, so none of it is
+        # review material - not the background, not the scope, and not the contract
+        # itself, which used to be the whole body.
+        text = self.dry()
+        self.assertNotIn("Add a --json flag to the status command.", text)
+        self.assertNotIn("`status --json` prints one object per task.", text)
+        self.assertNotIn("Done when", text)
         self.assertNotIn("The parser was rewritten", text)
         self.assertNotIn("Do not touch the config loader", text)
         self.assertNotIn("Your work lands", text)
 
-    def test_an_unfilled_brief_is_refused(self):
-        # A merge request describing the work as `{TASK}` looks like a description
-        # and is not one.
-        with open(self.at("briefs", "add-json.md"), "w") as fh:
-            fh.write("# Brief\n\n## The task\n\n{TASK}\n")
+    def test_a_line_carrying_a_note_publishes_its_prose(self):
+        """The three defects independent QA found in the parser, driven from this end.
+
+        `test_handoff.py` holds the rules; these are the same three documents seen
+        from where they would have reached a forge, because the guarantee that
+        matters is about what a reviewer is sent and not about a return value."""
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "The empty queue prints `[]` and not nothing: a caller piping this into "
+            "`jq` sees a\ndocument either way, and that is the case the old table got "
+            "wrong.",
+            "The empty queue prints `[]` and not nothing. <!-- a note to self -->\n"
+            "A caller piping this into `jq` sees a document either way."))
+        text = self.dry()
+        self.assertIn(printed(
+            "## Hotspots\n\nThe empty queue prints `[]` and not nothing.\n"
+            "A caller piping this into `jq` sees a document either way."), text)
+        self.assertNotIn("a note to self", text)
+
+    def test_a_markdown_example_of_a_section_reaches_the_forge_as_written(self):
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "`--json` prints one object per task, from the same records the table is "
+            "built from,\nso the two cannot disagree about what a task is.",
+            "`--json` prints one object per task, as in:\n\n```markdown\n## Intent\n"
+            "\nwhat was wrong.\n```\n\nand nothing else changes."))
+        self.assertIn(printed(
+            "## Solution\n\n`--json` prints one object per task, as in:\n\n"
+            "```markdown\n## Intent\n\nwhat was wrong.\n```\n\n"
+            "and nothing else changes."), self.dry())
+
+    def test_the_captains_home_written_as_a_tilde_stops_it(self):
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "`just test` covers", "see ~/.siana/reports; `just test` covers"))
         out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
-        self.assertRefused(out, "unfilled placeholder")
+        self.assertRefused(out, "names ~/.siana", "nothing was pushed")
+
+    def test_no_handoff_stops_it_before_anything_leaves(self):
+        os.remove(self.at("handoffs", "add-json.md"))
+        out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
+        self.assertRefused(out, "no handoff for add-json", "--scaffold")
+
+    def test_an_unfilled_handoff_is_refused(self):
+        # A merge request describing the work as `{TITLE}` looks like a description
+        # and is not one.
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "Print one task per line in a shape a script can read", "{TITLE}"))
+        out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
+        self.assertRefused(out, "{TITLE}")
+
+    def test_a_handoff_the_branch_has_moved_past(self):
+        """The binding between the copy and the work.
+
+        The ship minion writes the handoff, and only then does anything move: a
+        second commit, a repaired round, a rebase. A copy left behind by one of those
+        describes a commit nobody is publishing, and it stops here rather than
+        travelling with work it has never seen."""
+        self.handoff(HANDOFF.format(head="0" * 40))
+        out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
+        self.assertRefused(out, "describes 000000000000",
+                           f"at {self.head[:12]}")
 
     def test_a_missing_forge_cli_stops_a_real_run_before_it_pushes(self):
         # Discovered after the push, this leaves the branch published with no merge
@@ -288,6 +396,179 @@ class DryRun(Publishable):
                        capture_output=True, text=True)
         out = self.run_bin("siana-publish", "qa-add-json", "--dry-run")
         self.assertRefused(out, "has no branch siana/add-json")
+
+
+class TheMergeRequestsThisReplaces(Publishable):
+    """The two that landed before this, as fixtures for the failure it prevents.
+
+    Both were made the old way: the ship task's title became the merge request's
+    title, and two sections of the brief became its body. `Rebase the advisory AFK
+    branch onto merged main` named a branch operation, and said nothing about the
+    change recording what SIANA would decide while granting it no authority. `Use
+    target merge base safely` did not tell a cold reviewer that the pipeline had been
+    reviewing an unrelated oversized diff. Neither was a bad contract. Both were the
+    contract, published, which is the thing a contract cannot do.
+
+    Nothing here is about those repositories. What is asserted is that a title and a
+    body of that kind can no longer reach a forge from this command, because neither
+    of the two places they came from is read any more.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store("tasks.jsonl",
+                   {"id": "add-json",
+                    "title": "Rebase the advisory AFK branch onto merged main",
+                    "status": "done", "verify": "just test", "verify_kind": "cmd",
+                    "deps": [], "context": [], "project": "demo",
+                    "updated": "2026-08-28T09:00:00Z"})
+        with open(self.at("briefs", "add-json.md"), "w") as fh:
+            fh.write("""# Brief
+
+## Delivery: ship
+
+Your work lands.
+
+## The task
+
+Rebase this branch onto the merged main and rerun the pipeline. Only the commits
+this task added are yours; everything else is already on main.
+
+## Done when
+
+`just test` passes, then this branch earns a passing `siana-pipeline run` at its
+final head.
+""")
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "Print one task per line in a shape a script can read",
+            "Record what SIANA would decide, and grant it nothing"))
+
+    def published(self):
+        return self.assertAccepted(
+            self.run_bin("siana-publish", "qa-add-json", "--dry-run"))
+
+    def test_the_task_title_is_not_the_merge_request_title(self):
+        text = self.published()
+        self.assertIn("title:   Record what SIANA would decide, and grant it nothing",
+                      text)
+        self.assertNotIn("Rebase the advisory AFK branch onto merged main", text)
+
+    def test_instructions_to_the_implementer_do_not_travel(self):
+        # "Only this commit is yours" is a sentence about which minion owns which
+        # commit. On a forge it reads as an instruction to the reviewer.
+        text = self.published()
+        self.assertNotIn("Only the commits", text)
+        self.assertNotIn("rerun the pipeline", text)
+
+    def test_the_acceptance_a_minion_was_held_to_does_not_travel(self):
+        # Future tense, about a task: it says what would have to happen for the work
+        # to be accepted, and by the time anyone reads this it already has.
+        text = self.published()
+        self.assertNotIn("siana-pipeline run", text)
+        self.assertNotIn("earns a passing", text)
+
+
+class Opened(Publishable):
+    """A publish that reaches a forge, with the forge faked and nothing pushed off
+    this machine.
+
+    Everything above stops before the push, so the half of this command that actually
+    opens a merge request had no test at all: what reached `gh` was asserted only
+    through the dry run, which is the one path that deliberately never calls it.
+
+    `origin` is a bare repository beside the home, named so the host check reads it
+    as a forge. No credential, no network, and the push is real."""
+
+    def origin(self):
+        bare = self.at("github.git")
+        out = subprocess.run(["git", "init", "--bare", "-b", "main", bare],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return bare
+
+    def setUp(self):
+        super().setUp()
+        self.forge = self.at("forge")
+        os.makedirs(self.forge)
+        cli = os.path.join(self.home, "forge-bin")
+        os.makedirs(cli)
+        fake = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fake_forge.py")
+        for name in ("gh", "glab"):
+            os.symlink(fake, os.path.join(cli, name))
+        self.forge_env = {"PATH": self.distro_path(cli), "FAKE_FORGE": self.forge}
+
+    def publish(self, **env):
+        return self.run_bin("siana-publish", "qa-add-json",
+                            env={**self.forge_env, **env})
+
+    def opened(self):
+        with open(os.path.join(self.forge, "prs.json")) as fh:
+            return json.load(fh)
+
+    def test_it_pushes_the_branch_and_opens_one_merge_request(self):
+        text = self.assertAccepted(self.publish())
+        self.assertIn("opened", text)
+        upstream = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "--abbrev-ref",
+             "siana/add-json@{upstream}"], capture_output=True, text=True)
+        self.assertEqual(upstream.stdout.strip(), "origin/siana/add-json")
+        prs = self.opened()
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["base"], "preproduction")
+
+    def test_what_the_forge_receives_is_the_copy_a_human_wrote(self):
+        self.publish()
+        pr = self.opened()[0]
+        self.assertEqual(pr["title"],
+                         "Print one task per line in a shape a script can read")
+        self.assertIn("## Hotspots", pr["body"])
+        self.assertIn("Independently reviewed and accepted by a second agent",
+                      pr["body"])
+        self.assertIn("Shipped by `add-json`, accepted by `qa-add-json`.", pr["body"])
+        self.assertNotIn("Add a --json flag to the status command.", pr["body"])
+
+    def test_a_second_run_opens_no_second_merge_request(self):
+        # Re-running is the intended recovery from an interrupted publish, so it has
+        # to be safe rather than merely discouraged.
+        self.publish()
+        text = self.assertAccepted(self.publish())
+        self.assertIn("already open", text)
+        self.assertEqual(len(self.opened()), 1)
+
+    def test_a_second_run_carries_the_copy_that_was_accepted(self):
+        """The copy can move between two runs: a round is repaired, the handoff is
+        rewritten, and the second run is the one carrying what QA actually accepted.
+        Reporting the open merge request and leaving it as it was would make that the
+        one run whose copy never arrived."""
+        self.publish()
+        self.handoff(HANDOFF.format(head=self.head).replace(
+            "Print one task per line in a shape a script can read",
+            "Print one task per line, so callers stop parsing a table"))
+        text = self.assertAccepted(self.publish())
+        self.assertIn("copy   updated", text)
+        prs = self.opened()
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["title"],
+                         "Print one task per line, so callers stop parsing a table")
+
+    def test_a_forge_that_refuses_the_update_says_what_is_still_there(self):
+        # The merge request is open and the branch is pushed, so the failure is that
+        # it is carrying copy from an earlier run - not that nothing happened.
+        self.publish()
+        out = self.publish(FAKE_FORGE_FAIL="edit")
+        self.assertRefused(out, "refused to update the merge request",
+                           "carrying copy from an earlier run")
+
+    def test_a_handoff_the_branch_has_moved_past_pushes_nothing(self):
+        self.handoff(HANDOFF.format(head="0" * 40))
+        out = self.publish()
+        self.assertRefused(out, "describes 000000000000")
+        self.assertFalse(os.path.exists(os.path.join(self.forge, "prs.json")))
+        upstream = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "--abbrev-ref",
+             "siana/add-json@{upstream}"], capture_output=True, text=True)
+        self.assertNotEqual(upstream.returncode, 0, upstream.stdout)
 
 
 class UnderAnAdvisorySession(Publishable):
