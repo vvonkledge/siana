@@ -182,7 +182,8 @@ class Discovery(unittest.TestCase):
 
     def test_every_discovered_test_is_dispatched_exactly_once(self):
         ids = run.discover([])
-        handed = [tid for chunk in run.chunks(ids) for tid in chunk]
+        order, solo = run.chunks(ids)
+        handed = [tid for chunk in order + solo for tid in chunk]
         # A module that would not import is reported by the coordinator rather than
         # dispatched, so it is the one thing `chunks` leaves out; there are none in
         # a healthy suite, and this says so rather than assuming it.
@@ -195,8 +196,112 @@ class Discovery(unittest.TestCase):
         # The unit of work, asserted rather than assumed: a chunk that split a class
         # would still be correct, and a chunk that spanned two would be the thing
         # this suite has never had a fixture for.
-        for chunk in run.chunks(run.discover([])):
+        for chunk in run.chunks(run.discover([]))[0]:
             self.assertEqual(len({tid.rsplit(".", 1)[0] for tid in chunk}), 1)
+
+
+class Solo(unittest.TestCase):
+    """The one lane that runs with the machine to itself.
+
+    `run.SOLO` names the tests whose subject is the operating system's event
+    latency rather than this project's code, and running them beside eight hundred
+    others made one of them fail three times in roughly twenty runs. The rule they
+    need is that nothing else of this runner's is in flight while they run.
+    """
+
+    def test_the_solo_names_match_tests_that_exist(self):
+        # A rename would otherwise turn the lane into a no-op silently, and the
+        # flake would come back with nothing to point at.
+        ids = run.discover([])
+        for name in run.SOLO:
+            self.assertTrue([t for t in ids if t.startswith(name)],
+                            f"{name} matches no test in this suite")
+
+    def test_solo_tests_are_kept_out_of_the_ordinary_chunks(self):
+        ids = run.discover([])
+        order, solo = run.chunks(ids)
+        self.assertTrue(solo, "nothing is in the solo lane")
+        for chunk in order:
+            for tid in chunk:
+                self.assertFalse(tid.startswith(run.SOLO))
+        self.assertEqual(sorted(t for chunk in solo for t in chunk),
+                         sorted(t for t in ids if t.startswith(run.SOLO)))
+
+    def test_the_shuffle_never_moves_solo_work_into_the_pool(self):
+        # The stress seed reorders the ordinary chunks and must not be able to
+        # undo the one rule that is not about ordering.
+        with mock.patch.dict(os.environ, {"SIANA_TEST_SHUFFLE": "seed"}):
+            order, solo = run.chunks(run.discover([]))
+        self.assertTrue(solo)
+        for chunk in order:
+            for tid in chunk:
+                self.assertFalse(tid.startswith(run.SOLO))
+
+
+class SoloDispatch(Fixture):
+    """The rule driven for real: nothing else runs while solo work does."""
+
+    def test_nothing_else_is_in_flight_while_a_solo_test_runs(self):
+        out_dir = self.at("windows")
+        os.makedirs(out_dir)
+        where = self.suite(test_solo=f"""
+            import os, time, unittest
+
+            OUT = {out_dir!r}
+
+            def record(name):
+                start = time.monotonic()
+                time.sleep(0.5)
+                with open(os.path.join(OUT, name), "w") as fh:
+                    fh.write(f"{{start}} {{time.monotonic()}}")
+
+            class Quiet(unittest.TestCase):
+                def test_needs_the_machine(self): record("solo")
+
+            class Busy(unittest.TestCase):
+                def test_one(self): record("busy-one")
+
+            class AlsoBusy(unittest.TestCase):
+                def test_two(self): record("busy-two")
+
+            class StillBusy(unittest.TestCase):
+                def test_three(self): record("busy-three")
+        """)
+        ids = ["test_solo.Quiet.test_needs_the_machine", "test_solo.Busy.test_one",
+               "test_solo.AlsoBusy.test_two", "test_solo.StillBusy.test_three"]
+        with mock.patch.object(run, "SOLO", ("test_solo.Quiet.",)):
+            out = self.coordinated(where, ids, pool=3)
+        self.assertIn("Ran 4 tests", out)
+        self.assertIn("OK", out)
+
+        def window(name):
+            with open(os.path.join(out_dir, name)) as fh:
+                return tuple(float(v) for v in fh.read().split())
+
+        solo_start, solo_end = window("solo")
+        for name in ("busy-one", "busy-two", "busy-three"):
+            start, end = window(name)
+            self.assertTrue(end <= solo_start or start >= solo_end,
+                            f"{name} overlapped the solo test")
+        # And the point of the pool is still intact: the three ordinary tests did
+        # run beside each other, so this is a rule about the solo test and not a
+        # serial run wearing a pool's name.
+        busy = [window(n) for n in ("busy-one", "busy-two", "busy-three")]
+        self.assertTrue(any(a[0] < b[1] and b[0] < a[1]
+                            for a in busy for b in busy if a is not b),
+                        "the ordinary tests did not overlap either")
+
+    def test_the_solo_test_still_runs_when_it_is_the_only_work(self):
+        where = self.suite(test_solo="""
+            import unittest
+
+            class Quiet(unittest.TestCase):
+                def test_alone(self): pass
+        """)
+        with mock.patch.object(run, "SOLO", ("test_solo.Quiet.",)):
+            out = self.coordinated(where, ["test_solo.Quiet.test_alone"], pool=3)
+        self.assertIn("Ran 1 test", out)
+        self.assertIn("OK", out)
 
 
 class Equivalence(Fixture):

@@ -221,6 +221,34 @@ def discover(argv):
     return Plan.ids
 
 
+# The one lane that is deliberately not parallel, and the measurement that put it
+# here. `tests/test_wake.Watching` is the only place in this suite whose subject is
+# not this project's code but the operating system's: it takes the extension's
+# interval backstop away on purpose, so that a wake which still arrives arrived
+# through a real directory watch and through nothing else. With the backstop gone
+# there is no second chance, so what the test is really asserting is that macOS
+# delivers a filesystem event promptly.
+#
+# It does, until the machine is busy. Measured here: that watch normally settles in
+# 12-58ms, and under a pool it occasionally does not arrive inside the test's
+# ten-second patience at all - not a slower tail but a different mode, seen three
+# times across roughly twenty full runs. Every one of 23 runs of the test on its own
+# passed, and both serial controls passed.
+#
+# Two cheaper fixes were tried and rejected on evidence. Widening the ten seconds is
+# a guess about a tail that was never observed, since the failure jumps from 50ms to
+# past 10s with nothing in between. Folding the whole wake module into one chunk was
+# implemented and measured, and it failed again at load 7.4: the contention is not
+# these tests against each other, it is this one test against the eight hundred
+# others churning through `uv`, `git` and `just` beside it.
+#
+# So it gets what it actually needs, which is a quiet machine, and nothing else
+# changes: no assertion is touched, no test is skipped, and the wait is the wait it
+# always had. It runs last, alone, after every other chunk has drained. That costs
+# the couple of seconds the test itself takes.
+SOLO = ("test_wake.Watching.",)
+
+
 def chunks(ids):
     """The dispatchable units: one test class each, biggest first.
 
@@ -230,10 +258,17 @@ def chunks(ids):
     duration because a count is known now and a duration would have to be recorded
     from a previous run and trusted; measured against a perfect oracle on this
     suite, counting costs 4% and keeps this file honest about what it knows.
+
+    Returns the ordinary chunks and the solo ones separately, because the two are
+    dispatched under different rules: an ordinary chunk goes to whichever worker is
+    free, and a solo chunk waits for all of them to be.
     """
-    groups = {}
+    groups, solo = {}, []
     for tid in ids:
         if tid.startswith(BROKEN + "."):
+            continue
+        if tid.startswith(SOLO):
+            solo.append(tid)
             continue
         groups.setdefault(tid.rsplit(".", 1)[0], []).append(tid)
     order = sorted(groups.values(), key=len, reverse=True)
@@ -244,7 +279,7 @@ def chunks(ids):
     seed = os.environ.get("SIANA_TEST_SHUFFLE")
     if seed:
         random.Random(seed).shuffle(order)
-    return order
+    return order, ([solo] if solo else [])
 
 
 # --------------------------------------------------------------------------------
@@ -754,20 +789,40 @@ def coordinate(ids, pool, verbosity, failfast, stream):
         for number in range(1, pool + 1):
             workers.append(Worker(number, root, syspath))
 
-        pending = chunks(ids)
+        pending, solo = chunks(ids)
+        waiting = []
         selector = selectors.DefaultSelector()
         for worker in workers:
             selector.register(worker.fd, selectors.EVENT_READ, worker)
         stopping = False
         counter = len(outcomes)
 
+        def pump():
+            """Hand out whatever can be handed out now.
+
+            Called whenever a worker goes idle and again whenever one reports, so
+            that solo work is offered the moment the last other worker falls quiet
+            rather than only when somebody next asks for something.
+            """
+            while waiting and pending and not stopping:
+                waiting.pop(0).send(pending.pop(0))
+            # Solo work waits for the machine, not for a worker. See `SOLO` above:
+            # what it names measures how fast the operating system delivers a
+            # filesystem event, and beside eight hundred other tests driving `uv`,
+            # `git` and `just`, that measurement is of the load and not of the
+            # watch. So it goes out only once nothing else is in flight.
+            if solo and not pending and waiting and not stopping:
+                if not any(w.running or w.outstanding for w in workers):
+                    waiting.pop(0).send(solo.pop(0))
+            if not pending and not solo or stopping:
+                while waiting:
+                    worker = waiting.pop(0)
+                    worker.send([])
+                    worker.finished = True
+
         def hand_out(worker):
-            nonlocal stopping
-            if pending and not stopping:
-                worker.send(pending.pop(0))
-            else:
-                worker.send([])
-                worker.finished = True
+            waiting.append(worker)
+            pump()
 
         def finish(worker, reason):
             """A worker has gone. Anything it was holding is named, not forgotten.
@@ -779,6 +834,8 @@ def coordinate(ids, pool, verbosity, failfast, stream):
             not run are the point rather than a hole.
             """
             selector.unregister(worker.fd)
+            if worker in waiting:
+                waiting.remove(worker)
             if worker.process.stdin and not worker.process.stdin.closed:
                 try:
                     worker.process.stdin.close()
@@ -850,6 +907,7 @@ def coordinate(ids, pool, verbosity, failfast, stream):
                                 else event["o"]) + "\n")
                     elif event["e"] == "idle":
                         hand_out(worker)
+                pump()
                 stream.flush()
 
             # The stall, and the coordinator is what ends one. A worker dumps every
