@@ -116,9 +116,9 @@ so a contract with no `.jsonl` beside it is an empty store and not a broken inst
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
-`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`. They are
-links, so a `git pull` here updates the commands with no reinstall. It does not
-update the home; `just upgrade` does that.
+`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
+`siana-read`. They are links, so a `git pull` here updates the commands with no
+reinstall. It does not update the home; `just upgrade` does that.
 
 ### The queue integration
 
@@ -575,6 +575,80 @@ Things it says that are:
 - `GONE <task>: herdr has no agent in <pane>`. A minion died. `tasks reset` reclaims
   the task, and it stays manual, because that minion's worktree may hold work nobody
   has landed.
+
+## Read the fleet as JSON
+
+    siana-read tasks       [--fields a,b,c] [--status S] [--limit N]
+    siana-read projects
+    siana-read obligations [--closed]
+    siana-read decisions   [--since ISO]
+    siana-read fleet
+    siana-read health
+
+Everything else here prints for a person at a terminal. This prints for a program,
+so something other than a terminal can show you the fleet. It reads and only reads:
+no listener, no port, nothing served, and no path in it that writes to a store.
+
+Every run writes exactly one JSON document to standard output, whether it answered
+or refused, and the exit code is the verdict:
+
+    0   the document answers the question
+    1   the source could not be read, or could not be trusted
+    2   the request was wrong: an unknown subcommand, flag, field or timestamp
+
+`--help` is the one exception, and it is the one that is neither an answer nor a
+refusal: it prints the usage for a person to read.
+
+The four stores answer in one shape:
+
+    {"source": "tasks",
+     "revision": {"inode": 3876394, "size": 488283, "mtime_ns": 1788090878060132363},
+     "filter": {"status": "doing"},
+     "total": 123, "matched": 4,
+     "records": [...],
+     "bad_lines": []}
+
+- `revision` is the store's own snapshot, for a reader caching against it. Compare
+  `inode` as well as `size`: `datafile compact` and `roll` rewrite the file in
+  place, so a size that has not moved is not a store that has not moved.
+- `total` is the live records before filtering and `matched` is after it, so an
+  empty `records` is never ambiguous. `matched` above the number returned means
+  your `--limit` clipped the answer.
+- `bad_lines` is every line of the store `datafile` could not read, with its line
+  number and the text. A damaged store is still a successful read, and the damage
+  arrives with it rather than being smoothed over.
+
+`fleet` asks herdr what is running and answers `state: "ok"` with the agent records
+verbatim. When herdr cannot be reached it answers `state: "unknown"` with
+`agents: null` and exits nonzero. It never answers an unreachable herdr with an
+empty list: that would be a claim about every pane, and "no minions" is not
+something a silent herdr said.
+
+`health` reports three things and judges none of them: the session record with
+whether that pid is still a `siana`, the wake counters, and the exit code, stdout
+and stderr of `siana-watch --status` kept apart. `no SIANA running` is the ordinary
+state between sessions, so nothing here calls it a fault. What it will not do is
+report a process it could not verify: a dead pid and a pid now wearing something
+else both read `alive: false` with `why` saying which.
+
+Two refusals are worth knowing about, because they look like answers:
+
+- A store that cannot be read is a refusal, never `records: []`. An unreadable
+  `obligations.jsonl` reported as empty would tell you SIANA owes you nothing.
+- The contract is what says a store exists, not the log. `decisions.jsonl` does not
+  exist until the first decision is written, and that is an honest empty answer with
+  a null `inode`. A directory holding no contracts is refused on all four stores,
+  which is what a mistyped `SIANA_HOME` gets instead of a fleet with nothing in it.
+
+Three of the stores live in the home. The queue is read through `SIANA_TASKS_FILE`
+when that is set, the same way every other command here resolves it, so a minion
+pointed at a queue outside its home reads the one the rest of the fleet is using.
+Each store's contract is looked for beside it, named `schema-<store>.yaml`.
+
+It is not literally read-only on disk, and it is worth saying so plainly before
+anything is built on top of it: a `datafile` read may rewrite the `.idx` cache
+beside a store. That write is atomic and it is a cache. No authoritative record is
+ever changed.
 
 ## Uninstall
 
