@@ -64,6 +64,24 @@ export const POLL_MS = 500;
  *  wake costs once the refusal clears. */
 export const REFUSED_MS = 5_000;
 
+/** How long a send pi took in and never started is waited for before it is made
+ *  again.
+ *
+ *  Only one of `prompt()`'s throw paths - the manual compaction one - opens before
+ *  the `input` event. The rest open after it: a run that started between the gate
+ *  and the streaming check, no model selected, credentials that expired, an
+ *  automatic compaction that failed. So a send can be seen going in and never come
+ *  out, and there is no event that tells this apart from one still working. Waited
+ *  out rather than held: an attempt kept forever would block every wake for the
+ *  rest of the session, which is a worse failure than the one being repaired, and
+ *  the captain fixing what pi complained about would not restore delivery.
+ *
+ *  Two minutes because the longest legitimate gap here is the automatic compaction
+ *  `prompt()` runs between the two events, which is an LLM round trip. Cut short,
+ *  the cost is a second wake turn; left out, the cost is every wake after this one.
+ *  So it is set well past that round trip rather than tight against it. */
+export const UNCONFIRMED_MS = 120_000;
+
 /** Where the two counters and the liveness record live. The watcher looks here by
  *  the same name, so this is a shared constant in spirit and neither side may
  *  rename it alone. */
@@ -214,27 +232,31 @@ export default function (pi: ExtensionAPI): void {
    * answer had already come back.
    */
   function flush(ctx: ExtensionContext): void {
-    // A send pi threw away before it reached its input gate. `prompt()` emits
-    // `input` before it awaits anything, and the runner calls handlers in turn, so
-    // the handler below runs inside the `sendUserMessage` call or within a
-    // microtask of it - and a send still unentered five seconds later never got
-    // that far. `prompt()` refused it while the session reported idle, which is
-    // what a manual compaction does for its whole duration. Nothing was delivered
-    // and no turn was started, so the attempt is dropped and the wake goes out
-    // again.
+    // A send that is not going to be answered, dropped so the wake can be made
+    // again. Which wait applies is the only thing `entered` decides here, and the
+    // two are far apart because they are bounded by different things.
     //
-    // The five seconds are `REFUSED_MS` and they are pacing, not the argument: what
-    // makes delivery once-only is that only an acceptance advances the mark. They
-    // are long enough to be an unhurried answer to the one thing that could delay
-    // that handler - another extension's `input` handler awaiting ahead of it -
-    // rather than a race read at the poll.
-    if (attempt && !attempt.entered && Date.now() - attempt.at >= REFUSED_MS) {
-      attempt = null;
-    }
+    // Unentered is a send pi threw away before it reached its input gate. `prompt()`
+    // emits `input` before it awaits anything and the runner calls handlers in
+    // turn, so the handler below runs inside the `sendUserMessage` call or within a
+    // microtask of it: a send still unentered after `REFUSED_MS` never got that
+    // far, and a manual compaction is what does that for its whole duration.
+    // Nothing was delivered and no turn was started. The five seconds are pacing
+    // and not the argument - what makes delivery once-only is that only an
+    // acceptance advances the mark - and they are an unhurried answer to the one
+    // thing that could delay that handler, another extension's `input` handler
+    // awaiting ahead of it.
+    //
+    // Entered is a send pi took in and never started, which every throw path but
+    // the compaction one produces. `UNCONFIRMED_MS` says why that is waited out
+    // rather than held forever, and why it is minutes rather than seconds.
+    const wait = attempt?.entered ? UNCONFIRMED_MS : REFUSED_MS;
+    if (attempt && Date.now() - attempt.at >= wait) attempt = null;
     // One attempt at a time, and it outlives the callback that made it: a wake pi
     // has taken and not yet started is not sent again by the next poll or the next
-    // watch event, because a second send is a second paid turn. Only a new session
-    // clears one, and it clears it because the prompt belonged to the old one.
+    // watch event, because a second send is a second paid turn. Nothing else clears
+    // one but the wait above, an acceptance, and a new session - the last because
+    // the prompt belonged to the session that is gone.
     if (attempt === null && held > consumed) {
       // No editor at all - print mode, rpc - is an empty editor: there is no draft
       // to arrive in the wrong order behind the wake.

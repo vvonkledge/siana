@@ -337,8 +337,9 @@ four reasons and they want different things from you:
   within half a second. Nothing else is needed, and restarting SIANA here would
   throw the draft away.
 - **SIANA is compacting.** A `/compact` you asked for refuses every message for as
-  long as it runs, while the session still reports itself idle. The wake is held,
-  and it goes out within five seconds of the compaction finishing. Nothing to do.
+  long as it runs, while the session still reports itself idle. The extension is
+  told nothing about the refusal, so it waits and sends the wake again: it goes out
+  within five seconds of the compaction finishing. Nothing to do.
 - **The session is gone.** `just doctor` says whether one is running. Start SIANA
   again and it drains everything counted while it was away.
 

@@ -84,6 +84,19 @@ fs.unlinkSync = (path, ...rest) => {
   removed.push(String(path));
   return realUnlinkSync(path, ...rest);
 };
+// The clock the extension reads, which is deliberately not the one the event loop
+// runs on. Two of its rules are ages - how long a send pi never took is left alone,
+// and how long one pi took and never started is waited for - and the second is
+// minutes, because the legitimate gap it must not cut short is an automatic
+// compaction's round trip. Sleeping through that would put minutes into a suite
+// that has to stay in seconds, and would still be a race rather than a rule. So a
+// test moves this offset and leaves the timers alone: the poll goes on firing at
+// its real cadence and reads an age that has really passed as far as the extension
+// can tell.
+const realNow = Date.now;
+let clockOffset = 0;
+Date.now = () => realNow() + clockOffset;
+
 // A disk that will not take the write. Wrapped at the rename because that is where
 // a staged write becomes the file, so a failure here is the one that leaves the
 // counter on disk behind what has actually been delivered.
@@ -108,6 +121,12 @@ const sent = [];
 // gives it.
 const refused = [];
 let sendRejects = false;
+// A prompt pi took past its input gate and then threw on: no model selected,
+// credentials that expired, a run that began between the gate and the streaming
+// check, an automatic compaction that failed. The extension has seen its own send
+// go in and will never be told what became of it, which is a different shape from
+// `sendRejects` and not covered by it.
+let startRejects = false;
 // Every `before_agent_start` pi emitted, which is the first moment a prompt is
 // known to have been accepted: `prompt()` emits it after all four of its throw
 // paths and immediately before it starts the run.
@@ -218,6 +237,7 @@ function prompt(text, source, deliverAs, holdable) {
     queued.push(text);
     return;
   }
+  if (startRejects) return;
   // Asked when the start would fire and not when the prompt was made: a test
   // reaches for the hold after seeing the send, which is already a task late.
   setTimeout(() => {
@@ -294,6 +314,15 @@ async function run(command) {
       // `/compact` is a stable window where the gate says yes and the send is
       // thrown away.
       sendRejects = command.value;
+      return {};
+    case "refuse-starts":
+      // Refused after the input gate rather than before it. Every throw path in
+      // `prompt()` except the compaction one is this shape, and from the
+      // extension's side it is a send that went in and never came out.
+      startRejects = command.value;
+      return {};
+    case "advance":
+      clockOffset += command.ms;
       return {};
     case "hold-starts":
       // Stand inside the window between an accepted send and its confirmation.

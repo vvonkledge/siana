@@ -475,6 +475,70 @@ class Acceptance(WakeTest):
         self.assertEqual(self.consumed(), 0)
 
 
+class Unanswered(WakeTest):
+    """A send pi took in and never started, which is every throw path but one.
+
+    Only the manual-compaction throw opens before the `input` event. A run that
+    began between the gate and the streaming check, a model that is not selected,
+    credentials that expired, an automatic compaction that failed - all of those
+    throw after it, so the extension sees its own send go in and is never told what
+    became of it. There is no event that tells that apart from a send still working
+    its way through, so it is waited out: held forever, one such send would block
+    every wake for the rest of the session, and the captain fixing whatever pi
+    complained about would not bring delivery back.
+
+    The wait is minutes, so these move the clock the extension reads rather than
+    sleeping through it. The poll goes on firing at its own real cadence."""
+
+    def unconfirmed_ms(self):
+        return int(exported("UNCONFIRMED_MS"))
+
+    def test_a_send_that_is_never_started_is_not_made_again_while_it_could_be(self):
+        # The gap this must not cut short is the automatic compaction `prompt()`
+        # runs between the two events, which is an LLM round trip. Half the wait is
+        # inside it, so the wake is still in flight and must not be sent twice.
+        pi = self.session()
+        pi("start")
+        pi("refuse-starts", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        pi("advance", ms=self.unconfirmed_ms() // 2)
+        state = pi("quiet")
+        self.assertEqual(len(state["sent"]), 1, state["sent"])
+        self.assertEqual(self.consumed(), 0)
+
+    def test_a_send_that_is_never_started_is_made_again_once_the_wait_is_out(self):
+        # And the session is not wedged by it: this is the failure that would
+        # otherwise cost every wake after the first, not just the first.
+        pi = self.session()
+        pi("start")
+        pi("refuse-starts", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        self.assertEqual(self.consumed(), 0)
+        pi("advance", ms=self.unconfirmed_ms())
+        state = pi("settle", sent=2)
+        self.assertEqual(len(state["sent"]), 2, state["sent"])
+        self.assertEqual(self.consumed(), 0, "an unstarted send took the wake")
+
+    def test_the_wake_lands_once_the_session_starts_turns_again(self):
+        # The captain runs `/login`, or selects a model. Nothing raises `pending`
+        # again and nothing is restarted: the wake converges on the extension's own
+        # cadence and arrives exactly once.
+        pi = self.session()
+        pi("start")
+        pi("refuse-starts", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        pi("refuse-starts", value=False)
+        pi("advance", ms=self.unconfirmed_ms())
+        state = pi("settle", sent=2)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE, WAKE])
+        self.took(1)
+        state = pi("quiet")
+        self.assertEqual(len(state["sent"]), 2, state["sent"])
+
+
 class Refused(WakeTest):
     """A session that reports idle and refuses the prompt anyway.
 
@@ -539,8 +603,8 @@ class Refused(WakeTest):
 
     def test_a_restart_makes_an_unconfirmed_wake_again(self):
         # The send was never taken, so no turn ran and nothing was recorded. A
-        # session coming up finds the wake untaken on disk, which is the recovery
-        # for the shapes that do not clear on their own - no model, no credentials.
+        # session coming up finds the wake untaken on disk: an attempt belongs to
+        # the session that made it and never outlives one.
         pi = self.session()
         pi("start")
         pi("refuse-sends", value=True)
