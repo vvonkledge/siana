@@ -152,6 +152,17 @@ GUARDS = {
 }
 
 
+# The commands the cleaner delegates to, which are themselves the safety boundary.
+# They are exec'd with the guard taken off their PATH, because they have to reach the
+# real tools to do their job: `siana-retire`'s last act is `git worktree remove`, and
+# with the guard in front of it a cleanup run passed every one of retire's own checks
+# and then died on that line. The guard exists to stop the *cleaner* reaching git
+# directly, not to stop the command whose judgment the whole design defers to.
+#
+# Everything else keeps the guard, so a fleet command cannot become a way to launder
+# an arbitrary call: these two take a task id and a project handle and nothing else.
+DELEGATES = ("siana-retire", "siana-reap")
+
 # `git worktree` and `git branch` read in their common form and destroy in their
 # flagged one, so they are matched on the pair rather than on the verb. Kept apart
 # from GUARDS because the rule is a different shape, and one table holding both would
@@ -484,7 +495,10 @@ def shim(name: str, clauses, real, grants, question: str) -> str:
         lines += ['if [ "$BAD" = 1 ]; then',
                   *[f"  {line}" for line in refuse],
                   "fi"]
-    lines.append(f'exec {sq(real)} "$@"')
+    if name in DELEGATES:
+        lines.append(f'PATH={sq(clean_path())} exec {sq(real)} "$@"')
+    else:
+        lines.append(f'exec {sq(real)} "$@"')
     return "\n".join(lines) + "\n"
 
 
@@ -571,6 +585,65 @@ def runbook_append(path: str, qid: str, question: str, answer: str) -> bool:
         fh.write(f"\n<!-- siana-clean:{qid} -->\n"
                  f"## {question.strip()}\n\n{answer.strip()}\n")
     return True
+
+
+def captain_decided(home: str, oid: str) -> dict:
+    """The obligation a captain's answer was recorded under, or a refusal.
+
+    Checked rather than taken on trust, because "an answer given here can never
+    manufacture captain authority" is the design guarantee and an id nobody verified
+    makes it a spelling convention. Before this, `--captain-decided anything`
+    unblocked a captain-kind question.
+
+    Three things have to hold, and each is a different way of being wrong: the
+    obligation exists, it is a `decision` rather than a promise SIANA made to itself,
+    and it is closed with an answer. An open one is a captain who has not spoken yet.
+
+    Folded here rather than asked of `siana-owe`, because this is a read of an
+    append-only store and the fold is the same three lines every reader in this fleet
+    writes. Nothing here writes to it: closing an obligation stays `siana-owe`'s, so
+    no cleanup run can retire a decision by answering a cleaner.
+    """
+    store = os.path.join(home, "obligations.jsonl")
+    if not os.path.isfile(os.path.join(home, "schema-obligations.yaml")):
+        die("this home has no obligations contract",
+            "a captain's decision is recorded there, and without it there is no",
+            "way to check that one was", "run `just upgrade` in the distro")
+    records = {}
+    try:
+        with open(store) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                rid = rec.get("id")
+                if rid is None:
+                    continue
+                if rec.get("_deleted"):
+                    records.pop(rid, None)
+                else:
+                    records[rid] = rec
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot read {store}: {exc}",
+            "run `datafile -f obligations.jsonl repair` to quarantine the bad line")
+    rec = records.get(oid)
+    if rec is None:
+        die(f"no obligation under that id: {oid}",
+            "`siana-owe` lists what is open; record the captain's decision there",
+            "first, and name it here once they have answered")
+    if rec.get("kind") != "decision":
+        die(f"{oid} is a {rec.get('kind')}, not a decision",
+            "only a decision the captain answered can unblock a captain question")
+    if rec.get("status") != "closed" or not rec.get("answer"):
+        die(f"{oid} is still open: the captain has not answered it",
+            f"  {rec.get('body', '')}".rstrip(),
+            f"close it with what they said: siana-owe close {oid} --answer <text>",
+            "answering here first would be manufacturing the authority this",
+            "whole path exists to require")
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -1108,17 +1181,20 @@ def cmd_answer(paths: Home, args) -> int:
         die(f"what is the answer to {question['qid']}?",
             f"  {question['body']}",
             "usage: siana-clean answer <run> --text <answer>")
-    if question["kind"] == "captain" and not args.captain_decided:
-        die("this question is the captain's, not SIANA's",
-            f"  {question['body']}",
-            "record it as an ordinary decision and wait for the captain:",
-            "  siana-owe decision <the question> --situation ... --option ...",
-            "then answer here with --captain-decided <obligation id> once they",
-            "have said. An answer given here cannot make captain authority; it",
-            "only unblocks a cleaner already told what the captain decided")
+    decision = None
+    if question["kind"] == "captain":
+        if not args.captain_decided:
+            die("this question is the captain's, not SIANA's",
+                f"  {question['body']}",
+                "record it as an ordinary decision and wait for the captain:",
+                "  siana-owe decision <the question> --situation ... --option ...",
+                "then answer here with --captain-decided <obligation id> once they",
+                "have said. An answer given here cannot make captain authority; it",
+                "only unblocks a cleaner already told what the captain decided")
+        decision = captain_decided(paths.home, args.captain_decided)
 
     resolved = dict(question, answer=text, answered=now())
-    if args.captain_decided:
+    if decision is not None:
         resolved["decision"] = args.captain_decided
     # The answer lands in three places and the order is the whole of its safety. The
     # append-only log first, because that is what `resume` reads and what survives a
@@ -1134,6 +1210,9 @@ def cmd_answer(paths: Home, args) -> int:
                dict(rec, status="answered", updated=now(),
                     detail=f"answered {resolved['qid']}; resume to carry on"))
     print(f"answered {resolved['qid']}")
+    if decision is not None:
+        print(f"  captain {decision['answer']}")
+        print(f"    from {args.captain_decided}")
     print(f"  runbook {'written' if added else 'already had this one'}")
     print(f"  resume  siana-clean resume {args.run}")
     return 0

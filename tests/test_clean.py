@@ -80,6 +80,19 @@ class Shims(unittest.TestCase):
         self.assertIn("'worktree') SAW=1 ;;", body)
         self.assertIn("'add'|'remove'|'prune'|'move'|'repair') BAD=1 ;;", body)
 
+    def test_a_delegated_command_is_exec_with_the_guard_off_its_path(self):
+        # `siana-retire` ends with `git worktree remove`, and the guard refuses that.
+        # It is the safety boundary this whole design defers to, so it reaches the
+        # real tools; the guard is there to stop the cleaner reaching them directly.
+        body = self.shim("siana-retire", (("grant:retire", "no"),), "/bin/true",
+                         ["inventory", "retire"])
+        self.assertIn("PATH=", body)
+        self.assertIn("exec '/bin/true'", body)
+
+    def test_a_primitive_is_not_exempted_that_way(self):
+        body = self.shim("git", (("words:push", "no"),), "/bin/true", ["inventory"])
+        self.assertNotIn("PATH=", body)
+
     def test_a_second_clause_still_applies_once_the_first_is_granted(self):
         # `siana-reap` is the reason clauses are a list. With one clause it had only
         # the flag rule, so the `reap-report` grant unlocked nothing while four
@@ -438,17 +451,78 @@ class Run(HomeTest):
                            "siana-owe decision",
                            "cannot make captain authority")
 
+    def decision(self, answer=None):
+        """A real decision in the obligation store, written by `siana-owe` so that it
+        passes the same contract a live one does. Returns its id."""
+        self.contract("obligations", "attended")
+        out = self.run_bin(
+            "siana-owe", "decision", "Whether to reap the retained branches",
+            "--situation", "Two are older than a week",
+            "--option", "Reap them now", "--consequence", "Recovery is the forge",
+            "--option", "Keep them", "--consequence", "The list grows",
+            "--recommend", "Keep them", "--because", "A wrong reap loses work")
+        self.assertAccepted(out)
+        with open(self.at("obligations.jsonl")) as fh:
+            oid = json.loads(fh.readline())["id"]
+        if answer is not None:
+            self.assertAccepted(
+                self.run_bin("siana-owe", "close", oid, "--answer", answer))
+        return oid
+
     def test_a_captain_question_is_answered_only_against_an_obligation(self):
+        oid = self.decision(answer="the captain said reap them")
         self.write_script(self.ask_script(kind="captain"))
         self.clean("start")
         run_id = self.only_run()
         out = self.assertAccepted(
             self.clean("answer", run_id, "--text", "the captain said go ahead",
-                       "--captain-decided", "whether-to-reap"))
-        self.assertIn("answered", out)
+                       "--captain-decided", oid))
+        self.assertIn("the captain said reap them", out)
         with open(self.at("cleanup", "runs", run_id, "answers.jsonl")) as fh:
-            self.assertEqual(json.loads(fh.readline())["decision"],
-                             "whether-to-reap")
+            self.assertEqual(json.loads(fh.readline())["decision"], oid)
+
+    def test_an_obligation_id_that_does_not_exist_is_refused(self):
+        # Otherwise the whole captain path is a spelling convention: before this,
+        # `--captain-decided anything` unblocked a captain question.
+        self.contract("obligations")
+        self.write_script(self.ask_script(kind="captain"))
+        self.clean("start")
+        out = self.clean("answer", self.only_run(), "--text", "go ahead",
+                         "--captain-decided", "no-such-decision")
+        self.assertRefused(out, "no obligation under that id")
+
+    def test_a_decision_the_captain_has_not_answered_yet_is_refused(self):
+        oid = self.decision()
+        self.write_script(self.ask_script(kind="captain"))
+        self.clean("start")
+        out = self.clean("answer", self.only_run(), "--text", "go ahead",
+                         "--captain-decided", oid)
+        self.assertRefused(out, "still open", "manufacturing the authority")
+
+    def test_a_promise_is_not_a_decision(self):
+        self.contract("obligations")
+        self.assertAccepted(self.run_bin("siana-owe", "promise", "Report at noon"))
+        with open(self.at("obligations.jsonl")) as fh:
+            oid = json.loads(fh.readline())["id"]
+        self.assertAccepted(
+            self.run_bin("siana-owe", "close", oid, "--answer", "the noon report"))
+        self.write_script(self.ask_script(kind="captain"))
+        self.clean("start")
+        out = self.clean("answer", self.only_run(), "--text", "go ahead",
+                         "--captain-decided", oid)
+        self.assertRefused(out, "is a promise, not a decision")
+
+    def test_answering_a_captain_question_never_closes_the_obligation(self):
+        # Closing one stays `siana-owe`'s. A cleanup run that could retire a
+        # decision by answering a cleaner would be the same manufactured authority
+        # arriving from the other side.
+        oid = self.decision(answer="reap them")
+        self.write_script(self.ask_script(kind="captain"))
+        self.clean("start")
+        before = os.path.getsize(self.at("obligations.jsonl"))
+        self.assertAccepted(self.clean("answer", self.only_run(), "--text", "go",
+                                       "--captain-decided", oid))
+        self.assertEqual(os.path.getsize(self.at("obligations.jsonl")), before)
 
     # -- one run at a time -------------------------------------------------
 
@@ -633,6 +707,32 @@ class Run(HomeTest):
         # somebody is in that tree, and retire is what knows so.
         self.assertNotIn("not this cleanup run's to call", out.stdout)
         self.assertIn("a-task is still held by a minion", out.stdout)
+
+    def test_a_delegated_command_reaches_the_real_git(self):
+        # The test above stops at retire's first check, so for a long time it said
+        # nothing about retire's last one. `siana-retire` ends with `git worktree
+        # remove`, resolved through PATH, and the guard refuses exactly that: a
+        # cleanup run passed every one of retire's own safety checks and then died on
+        # the final line. The `retire` grant could not retire anything.
+        #
+        # Stood in for here, because what is under test is whether a delegated
+        # command reaches the real git rather than what retire does with it.
+        stand_in = os.path.join(self.fakebin, "siana-retire")
+        with open(stand_in, "w") as fh:
+            fh.write("#!/bin/sh\ngit worktree remove /nowhere 2>&1 | head -1\n")
+        os.chmod(stand_in, 0o755)
+        self.write_script({"steps": [{"run": ["siana-retire", "a-task"]}],
+                           "exit": 0})
+        out = self.clean("start", "--grant", "retire")
+        self.assertNotIn("not this cleanup run's to call", out.stdout)
+        # git's own complaint about the path, which is proof it was reached.
+        self.assertIn("fatal", out.stdout)
+
+    def test_the_cleaner_itself_still_cannot_reach_that_git(self):
+        # The other half, and the reason the exemption is per command rather than
+        # global: the guard exists to stop the cleaner calling git directly.
+        self.assertIn("not this cleanup run's to call",
+                      self.probe("git", "worktree", "remove", "/nowhere"))
 
     def test_reap_is_refused_outright_without_the_grant(self):
         # The grant has to unlock something, or SIANA choosing the narrowest one is

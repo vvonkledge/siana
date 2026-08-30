@@ -22,6 +22,12 @@ from helpers import TEMPLATE
 
 PACKAGE = os.path.join(TEMPLATE, "pi-siana")
 
+# What pi bundles for extensions and skills, from its own `docs/packages.md`: import
+# one of these and it goes in `peerDependencies` with a `"*"` range, never bundled.
+PI_BUNDLED = {"@earendil-works/pi-ai", "@earendil-works/pi-agent-core",
+              "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui",
+              "typebox"}
+
 
 def read(*parts):
     with open(os.path.join(PACKAGE, *parts)) as fh:
@@ -73,11 +79,31 @@ class Manifest(unittest.TestCase):
         # Pi bundles these for extensions. Depending on them would ship a second
         # copy, and pi loads packages with separate module roots, so the extension
         # would be typed against a different build than the one running it.
+        #
+        # Read out of the imports rather than listed here. The first version listed
+        # two of them by hand, the extension imported a third, and the test agreed
+        # with the omission instead of catching it - which a list only compared
+        # against itself always will. It resolves today because a local install
+        # never runs npm, so nothing else would have found it either.
         peers = self.manifest.get("peerDependencies", {})
-        for name in ("@earendil-works/pi-coding-agent", "typebox"):
+        for name in self.imported_core():
             self.assertEqual(peers.get(name), "*", name)
         self.assertNotIn("dependencies", self.manifest)
         self.assertNotIn("bundledDependencies", self.manifest)
+
+    def imported_core(self):
+        """The packages pi bundles that this package's extensions actually import."""
+        imported = set()
+        for name in os.listdir(os.path.join(PACKAGE, "extensions")):
+            imported.update(re.findall(r'from "([^"]+)"',
+                                       read("extensions", name)))
+        return sorted(imported & PI_BUNDLED)
+
+    def test_it_declares_no_peer_it_does_not_import(self):
+        # The other direction, because a peer nobody imports is a claim about what
+        # this package needs that stops being true without anything failing.
+        peers = set(self.manifest.get("peerDependencies", {}))
+        self.assertEqual(peers, set(self.imported_core()))
 
 
 class Skill(unittest.TestCase):
