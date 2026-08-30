@@ -327,7 +327,7 @@ session drains it as it starts.
 
 If wakes stop being taken while the watcher runs, it says so on its stderr every
 five minutes and keeps counting. It cannot say why, and it does not guess. There are
-four reasons and they want different things from you:
+five reasons and they want different things from you:
 
 - **SIANA is mid-turn.** A long turn holds every wake raised during it. Nothing to
   do: the wake goes out within half a second of the turn ending.
@@ -340,12 +340,21 @@ four reasons and they want different things from you:
   long as it runs, while the session still reports itself idle. The extension is
   told nothing about the refusal, so it waits and sends the wake again: it goes out
   within five seconds of the compaction finishing. Nothing to do.
+- **SIANA cannot start a turn on it.** Pi took the message past its input gate and
+  then refused to run it: no model is selected, or the credentials have expired. The
+  extension is told nothing, so it sends the wake again every two minutes and nothing
+  ever accepts it. This is the only one of the five that never clears on its own, and
+  the only one `just doctor` is no help with - it reports that session present and
+  healthy throughout. What says so is pi's own error, printed into SIANA's transcript
+  on every retry. Select a model, or run `/login`, and the held wake goes out on the
+  next retry.
 - **The session is gone.** `just doctor` says whether one is running. Start SIANA
   again and it drains everything counted while it was away.
 
 Only the last of those is a reason to restart anything, which is why the warning
-names all four and diagnoses none: restarting SIANA over any of the first three
-discards the draft, the turn, or the compaction that the wake was waiting on.
+names all five and diagnoses none: restarting SIANA over any of the first four
+discards the draft, the turn, or the compaction that the wake was waiting on, and
+leaves a missing model or expired credentials exactly where they were.
 
 ### Leave it advisory
 

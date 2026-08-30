@@ -777,22 +777,36 @@ def watch(h, pane, home, tasks_file, harness, pending, interval):
             elif time.time() - behind_since > SETTLE_WARN_S:
                 behind_since = time.time()
                 # What this can see is that the two counters disagree, and that is
-                # all it says. Four states produce it and they want different
+                # all it says. Five states produce it and they want different
                 # things: a session that is gone, a session mid-turn, one holding
-                # every wake behind a draft the captain left in the editor, and one
+                # every wake behind a draft the captain left in the editor, one
                 # compacting - pi refuses every message for the whole of a
                 # `/compact` while reporting itself idle, so the extension holds the
-                # wake and sends it again after. Naming the first would send them to
+                # wake and sends it again after - and one where pi took the wake in
+                # and could not start a turn on it, because no model is selected or
+                # the credentials have expired. Naming the first would send them to
                 # restart SIANA, which is exactly what discards the draft this whole
                 # path exists to protect and what kills the turn or the compaction
-                # the other three are waiting on.
+                # two of the others are waiting on.
+                #
+                # The last is the one that never clears on its own and the only one
+                # with no signal here at all: the extension goes on re-sending, the
+                # counters go on disagreeing, and `just doctor` reports that session
+                # present and healthy throughout. What does say so is pi's own error
+                # in the captain's transcript, so this points at it and gives the
+                # two recoveries rather than leaving them with nothing to do.
                 print(f"held     SIANA has taken {consumed} of {pending} wake(s) in "
                       f"{SETTLE_WARN_S:.0f}s\n"
                       "         a wake waits for an idle session with an empty "
                       "editor, so a long turn, a\n"
                       "         draft left there or a running `/compact` holds it; "
                       "`just doctor` says\n"
-                      "         whether that session is there at all",
+                      "         whether that session is there at all; and an error "
+                      "in SIANA's own\n"
+                      "         transcript says pi took the wake and could not "
+                      "start the turn - select\n"
+                      "         a model or `/login` for that one, which no restart "
+                      "repairs",
                       file=sys.stderr, flush=True)
         elif behind_since is not None:
             behind_since = None
