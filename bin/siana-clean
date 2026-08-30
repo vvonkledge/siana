@@ -85,6 +85,14 @@ obvious command. It is not a sandbox: an agent invoking `/usr/bin/git` by absolu
 path would be outside it. What actually holds is that the destructive mechanics live
 in commands that fail closed on their own inputs; the guard is what keeps the cleaner
 from reaching for them by mistake, and what makes that fact testable.
+
+The same caveat covers the runbook, and it is worth stating rather than leaving to be
+discovered. Nothing but `answer` *writes* it, so a guess cannot be recorded through
+this command - but the cleaner runs with a shell, and a shell redirection reaches any
+file its user can write. The child is started without pi's `write` and `edit` tools,
+because it has no use for either and they are the two that reach that file most
+easily. That narrows the opening; it does not close it, and the cleaner's own
+instructions carry the rule the way the grant does.
 """
 
 import argparse
@@ -960,7 +968,15 @@ def spawn(paths: Home, rec: dict, resolved) -> dict:
     # deliberate rather than incidental: a project-local prompt is trusted because
     # somebody approved the directory, and this one is trusted because this command
     # read it out of the distro it ships in and handed it over by path.
+    # `-xt write,edit` because a cleaner writes nothing. It enumerates and delegates,
+    # and the two tools it has no use for are the two that reach the runbook - the
+    # one file whose whole value is that only a recorded answer lands in it. This
+    # narrows that opening rather than closing it: a shell redirection still reaches
+    # any file the user can write, exactly as an absolute path still gets past the
+    # PATH guard, and the documentation says so in both places rather than claiming
+    # a sandbox neither of them is.
     argv = [pi, "--mode", "json", "-p", "--no-session", "--no-approve", "-nc",
+            "-xt", "write,edit",
             "--append-system-prompt", system, brief(paths, rec, resolved)]
 
     try:
@@ -1008,6 +1024,30 @@ def spawn(paths: Home, rec: dict, resolved) -> dict:
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
+    def on_signal(signum, _frame):
+        killed.append(f"cancelled by signal {signum}")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    # The cleaner is in its own session, so a signal sent to *this* process reaches
+    # nothing but this process. Without these handlers a cancelled or timed-out call
+    # killed the command and left the cleaner running as an orphan - still holding
+    # its grant, still able to call `siana-retire` through the guard, with nothing
+    # watching it and no round ever recorded. Python installs no SIGTERM handler, so
+    # the `finally` below did not run either: the lock stayed taken.
+    #
+    # Handled rather than defaulted, so a cancel does what it is asked: kill the
+    # cleaner, let the read loop end on the closed pipe, record the round, release
+    # the lock. The exit is then an ordinary failed round rather than a death.
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous[sig] = signal.signal(sig, on_signal)
+        except ValueError:
+            pass                       # not the main thread; nothing to restore
+
     watchdog = threading.Timer(ROUND_S, on_deadline)
     watchdog.daemon = True
     watchdog.start()
@@ -1029,6 +1069,8 @@ def spawn(paths: Home, rec: dict, resolved) -> dict:
         killed.append("interrupted")
         raise
     finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         watchdog.cancel()
         if killed:
             reap(proc)

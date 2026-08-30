@@ -251,9 +251,15 @@ class Extension(unittest.TestCase):
         self.assertEqual(re.findall(r'spawn\("([a-z-]+)"', self.text),
                          ["siana-clean"])
 
-    def test_the_child_is_detached_so_a_cancel_reaches_what_it_started(self):
+    def test_a_cancel_is_sent_to_a_group_and_not_to_one_process(self):
+        # Only the first hop of the cancellation is this file's. `detached` puts
+        # `siana-clean` in its own group so the kill reaches it whatever group this
+        # host is in; killing the cleaner is `siana-clean`'s own signal handler,
+        # because the cleaner is in a session of its own and receives nothing sent
+        # from here. `tests/test_clean.py` drives that second hop for real.
         self.assertIn("detached: true", self.text)
-        self.assertIn("process.kill(-proc.pid!", self.text)
+        self.assertIn('process.kill(-proc.pid!, "SIGTERM")', self.text)
+        self.assertIn('process.kill(-proc.pid!, "SIGKILL")', self.text)
 
     def test_the_output_it_returns_is_bounded(self):
         self.assertIn("OUTPUT_CAP", self.text)

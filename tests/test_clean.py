@@ -660,6 +660,43 @@ class Run(HomeTest):
         self.assertIn("passed 0 minutes", out.stdout)
         self.assertLess(time.time() - started, 60)
 
+    def test_a_terminated_command_kills_the_cleaner_and_records_the_round(self):
+        # The cleaner is in a session of its own, so a signal sent to this command
+        # reaches nothing but this command. Without a handler a cancelled call killed
+        # the command and left the cleaner running as an orphan - still holding its
+        # grant, with nothing watching it, no round recorded and the lock still taken.
+        self.write_script({"steps": [{"say": "started"}, {"sleep": 120}],
+                           "exit": 0})
+        proc = subprocess.Popen(
+            [os.path.join(BIN, "siana-clean"), "start"], cwd=self.home,
+            env=self.command_env({"PATH": self.distro_path(self.fakebin),
+                                  "SIANA_FAKE_PI": self.script_path}),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True)
+        self.addCleanup(proc.kill)
+        self.assertTrue(until(lambda: self.calls()), "the cleaner never started")
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=30), 1)
+        # The cleaner is gone, the round is on disk, and the lock was released.
+        self.assertTrue(until(lambda: not self.stray_children()),
+                        "the cleaner outlived the command that was cancelled")
+        self.assertEqual(self.record(self.only_run())["status"], "failed")
+        self.assertEqual(len(self.rounds(self.only_run())), 1)
+        self.assertFalse(os.path.exists(self.at("cleanup", "lock")))
+
+    def rounds(self, run_id):
+        with open(self.at("cleanup", "runs", run_id, "rounds.jsonl")) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_the_child_has_no_file_writing_tools(self):
+        # It enumerates and delegates, so it needs neither, and they are the two that
+        # reach the runbook most easily. This narrows that opening; a shell
+        # redirection still reaches any file, which the documentation now says.
+        self.assertAccepted(self.clean("start"))
+        argv = self.calls()[0]["argv"]
+        self.assertIn("-xt", argv)
+        self.assertEqual(argv[argv.index("-xt") + 1], "write,edit")
+
     def test_a_killed_round_leaves_nothing_of_the_child_behind(self):
         # The whole process group, because pi spawns tools and a SIGTERM to the
         # parent alone leaves a `git` or a `herdr` holding the terminal.

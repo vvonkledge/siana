@@ -521,9 +521,16 @@ A question the cleaner marks `captain` is one SIANA cannot answer for you. It be
 an ordinary recorded decision, you answer it, and only then can the run be unblocked.
 
 Every answer lands in `$SIANA_HOME/runbook.md`, which the next cleaner reads first.
-Nothing else can write there: entries are built out of the question a cleaner wrote
-down and the answer SIANA recorded, so a guess, a secret or a stray piece of
-transcript has no way in.
+Entries are built out of the question a cleaner wrote down and the answer SIANA
+recorded, and nothing else can be *recorded* there, so a guess, a secret or a stray
+piece of transcript cannot get in that way.
+
+That is a property of the command and not a wall around the file. A cleaner runs with
+a shell, and a shell can write any file its user can, so the rule against editing the
+runbook by hand is carried in the cleaner's instructions the way the rest of its
+scope is. The child is started without the harness's file-writing tools, which
+narrows it. Treat the runbook the way you treat the guard below: a real boundary
+against the ordinary mistake, not a sandbox.
 
 If anything goes wrong, nothing was half-done. The mutations belong to commands that
 fail closed on their own inputs, so a killed cleaner, an unavailable model or a

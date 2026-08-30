@@ -76,11 +76,19 @@ that fail closed on their own inputs.
 ## The runbook
 
 `$SIANA_HOME/runbook.md` is what a cleaner reads at the start of every run. It is
-written only by `siana-clean answer`, and only out of two strings: the question a
-cleaner wrote down before it stopped, and the answer SIANA recorded. Nothing else can
-reach it, so a guess cannot land there and neither can a stream fragment, a secret a
-tool printed, or a private transcript. Entries are keyed by question id, so appending
-one twice is a no-op and a retried answer is safe.
+recorded only by `siana-clean answer`, and only out of two strings: the question a
+cleaner wrote down before it stopped, and the answer SIANA recorded. So a guess
+cannot be recorded there, and neither can a stream fragment, a secret a tool printed,
+or a private transcript. Entries are keyed by question id, so appending one twice is a
+no-op and a retried answer is safe.
+
+The same caveat as the guard applies, and for the same reason. A cleaner runs with a
+shell, and a shell redirection reaches any file its user can write, so no interception
+can cover that. The child is started without the harness's `write` and `edit` tools,
+because it has no use for either and they are the two that reach the runbook most
+easily; the rule against editing it by hand is then carried in the cleaner's
+instructions the way its grant is. A real boundary against the ordinary mistake, and
+not a wall.
 
 ## Recovering from a failure
 

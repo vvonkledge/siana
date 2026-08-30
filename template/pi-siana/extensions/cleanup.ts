@@ -52,10 +52,16 @@ interface Ran {
 /**
  * Run `siana-clean` and return what it said.
  *
- * The child gets its own process group so that a cancellation reaches the cleaner it
- * started and not only the command holding it. `signal` is pi's abort, which fires
- * on Ctrl+C; a run killed that way leaves its state on disk exactly as an interrupted
- * one does, and `status` reports it as interrupted rather than as running.
+ * Cancellation travels in two hops, and both are needed. `detached` puts
+ * `siana-clean` in its own process group so the kill below reaches it whatever group
+ * this host is in; `siana-clean` then handles that signal and kills the cleaner,
+ * which is in a session of its own and receives nothing sent here. Without the
+ * second hop a cancel killed the command and left the cleaner running as an orphan,
+ * still holding its grant with nothing watching it.
+ *
+ * `signal` is pi's abort, which fires on Ctrl+C. A run cancelled that way records
+ * the round as a failed one and releases its lock, because `siana-clean` gets to
+ * run its own cleanup rather than dying where it stood.
  */
 function sianaClean(args: string[], signal?: AbortSignal): Promise<Ran> {
 	return new Promise((resolve) => {
