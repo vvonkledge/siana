@@ -136,6 +136,8 @@ class HomeTest(unittest.TestCase):
         # A fresh root per call. Two PATHs built in one test hide different names,
         # and a mirror keyed by the entry's position alone would be reused across
         # both - handing the second one whatever the first had left out.
+        # `test_repair.TwoPathsFromOneTest` is that test, and it is the only thing
+        # that fails if this goes back to a key the two calls share.
         root = tempfile.mkdtemp(prefix="path-", dir=self.home)
         out = []
         for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):

@@ -707,9 +707,21 @@ class AForgeClientTheHostProvides(Fleet):
     a test, so the client stands at the front of that PATH instead of inside it;
     what the old fixture trusted was the directory, and either way it is the host
     providing the client and not the test handing it over.
+
+    The clients alone cannot tell the two fixtures apart, because the old one hid
+    them too - by naming directories it hoped were clean, which on most machines
+    they are. So the same directory also holds a command nothing else here answers
+    to, and the boundary test below asks for it by name. That is what makes putting
+    the literal `/usr/bin:/bin` back fail on every machine, rather than only on one
+    that happens to keep a client in one of those two.
     """
 
     CLI = "gh"
+    # A command only this fixture's directory holds. The question a reversion has to
+    # fail is whether the PATH handed back is derived from the environment this test
+    # changed, and the clients cannot be asked it: making them unreachable is the
+    # fixture's whole job.
+    MARKER = "siana-test-host-marker"
 
     def setUp(self):
         super().setUp()
@@ -722,6 +734,10 @@ class AForgeClientTheHostProvides(Fleet):
                          f"echo '{says}' >&2\n"
                          "exit 4\n")
             os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        marker = os.path.join(self.hostbin, self.MARKER)
+        with open(marker, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(marker, os.stat(marker).st_mode | stat.S_IXUSR)
         # On the environment's own PATH, because that is where every fixture here
         # starts from. Handed to one command as an argument it would prove nothing:
         # what failed on CI was the machine underneath the fixture.
@@ -748,6 +764,12 @@ class AForgeClientTheHostProvides(Fleet):
             self.assertIsNone(shutil.which(name, path=path), name)
         for name in ("git", "env", "python3"):
             self.assertIsNotNone(shutil.which(name, path=path), name)
+        # And the directory the clients came from is still reached, minus them. A
+        # fixture built from a list of directories it believes are clean drops this
+        # one whole, wherever the clients happen to live - so this is the assertion
+        # that fails here, on a machine where neither `/usr/bin` nor `/bin` holds a
+        # client at all, which is every machine the old literal was green on.
+        self.assertIsNotNone(shutil.which(self.MARKER, path=path), self.MARKER)
 
     def test_a_real_run_reports_absence_and_never_the_hosts_client(self):
         out = self.publish(PATH=self.path_with_no_forge_client())
@@ -778,6 +800,50 @@ class AForgeClientTheHostProvidesOnGitlab(AForgeClientTheHostProvides):
     FORGE = "gitlab"
     CLI = "glab"
     URL = "https://gitlab.com/demo/demo/-/merge_requests/15"
+
+
+class TwoPathsFromOneTest(HomeTest):
+    """One directory holding a forge client and a command this distro owns, and two
+    PATHs built over it in the same test.
+
+    `Fleet.publish` builds a PATH on every call, so a test that hides the clients for
+    one call and not for the next already has two of these in flight; all the machine
+    has to add is a directory that keeps `gh` next to a `siana`, which is what any
+    single `~/.local/bin` looks like. A mirror keyed by the entry's position alone is
+    the same directory for both calls, so the second one - hiding fewer names - writes
+    the client back into the mirror the first already handed out, and a PATH built to
+    have no client resolves one.
+
+    Named here because the rule is a line of `distro_path` and nothing else says it
+    out loud: the next agent tidying that key away gets a green suite otherwise.
+    """
+
+    def setUp(self):
+        super().setUp()
+        both = self.at("both")
+        os.makedirs(both)
+        # `siana` is what makes the second call mirror this directory at all: a
+        # directory holding nothing hidden is passed through whole, and a mirror
+        # that is never built cannot be written into.
+        for name in ("gh", "siana"):
+            path = os.path.join(both, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        patched = mock.patch.dict(
+            os.environ, {"PATH": os.pathsep.join([both, os.environ["PATH"]])})
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def test_a_later_path_cannot_put_the_client_back_into_an_earlier_one(self):
+        hidden = self.path_with_no_forge_client()
+        self.assertIsNone(shutil.which("gh", path=hidden), hidden)
+        # The control and the write in one: this call hides the distro and not the
+        # client, so it mirrors the same directory with `gh` left in. Under a shared
+        # mirror that link lands in the directory the line above is holding.
+        self.assertIsNotNone(shutil.which("gh", path=self.distro_path()))
+        self.assertIsNone(shutil.which("gh", path=hidden),
+                          "the first PATH gained gh back")
 
 
 class Refusals(Fleet):
