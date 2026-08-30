@@ -464,6 +464,22 @@ class Init(Recipe):
         self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
         self.assertIn("holds no package.json", doctor.stderr)
 
+    def test_settings_that_are_json_but_hold_no_object_are_told_apart(self):
+        # `null` parses without error, so the parse guard passes it straight
+        # through, and the check then had nothing to ask about and no answer
+        # assigned: it raised a NameError and printed a traceback where the reason
+        # and the repair belong. Doctor still failed, which is why this is a report
+        # defect and not a safety one - and it is the same tracing-instead-of-
+        # refusing this branch has already fixed twice elsewhere.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json"), "w") as fh:
+            fh.write("null\n")
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("does not hold a JSON object", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+        self.assertNotIn("Traceback", doctor.stderr)
+
     def test_settings_that_will_not_parse_is_never_a_healthy_package(self):
         self.assertEqual(self.just("init").returncode, 0)
         with open(self.at(".pi", "settings.json"), "w") as fh:

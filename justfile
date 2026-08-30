@@ -561,15 +561,20 @@ doctor: _contract-drift
     python3 - "$home/.pi/settings.json" "$siana_pkg" <<'PACKAGE' || unhealthy=1
     import json, os, sys
     settings_path, pkg = sys.argv[1], sys.argv[2]
+    name = os.path.basename(settings_path)
+    # Both assigned before anything can fail, and the shape checked rather than the
+    # parse alone. A settings file holding `null` parses without error and is not a
+    # mapping, and an unset `why` at the bottom was a Python traceback printed where
+    # the repair line belongs - a report tracing instead of refusing.
+    why, settings = "", None
     try:
         with open(settings_path) as fh:
             settings = json.load(fh)
     except (OSError, ValueError) as exc:
-        settings = None
-        why = f"{os.path.basename(settings_path)} will not parse: {exc}"
-    if settings is not None and not isinstance(settings, dict):
-        why = f"{os.path.basename(settings_path)} is not a JSON object"
-    elif settings is not None:
+        why = f"{name} will not parse: {exc}"
+    if not why and not isinstance(settings, dict):
+        why = f"{name} does not hold a JSON object"
+    if not why:
         packages = settings.get("packages", [])
         if not isinstance(packages, list):
             why = "its `packages` is not a list"
@@ -594,8 +599,6 @@ doctor: _contract-drift
                 why = f"its entry resolves to {found[0]}, which is not there"
             elif not os.path.isfile(os.path.join(found[0], "package.json")):
                 why = f"its entry resolves to {found[0]}, which holds no package.json"
-            else:
-                why = ""
     if not why:
         print("  ok      .pi/settings.json (pi-siana)")
         raise SystemExit(0)
