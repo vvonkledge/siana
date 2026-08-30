@@ -10,14 +10,24 @@
 # The mechanics are here instead: pick the right contract for the delivery kind,
 # refuse a task that does not exist, and never clobber a brief that already does.
 #
-# Usage: siana-brief <task-id> --ship --type <type> | --scout
+# Usage: siana-brief <task-id> --ship --type <type> [--repairs <ship-task>] | --scout
 #
-#   --ship   the work lands. The minion commits on `siana/<type>/<task-id>` and the
-#            branch is the deliverable; SIANA lands it.
-#   --scout  the work reports. The minion writes $SIANA_HOME/reports/<task-id>.md and
-#            lands nothing; its worktree is scratch.
-#   --type   the Conventional Commit type a ship task's commits will carry, and the
-#            middle segment of its branch. Required for --ship, refused for --scout.
+#   --ship     the work lands. The minion commits on `siana/<type>/<task-id>` and the
+#              branch is the deliverable; SIANA lands it.
+#   --scout    the work reports. The minion writes $SIANA_HOME/reports/<task-id>.md
+#              and lands nothing; its worktree is scratch.
+#   --type     the Conventional Commit type a ship task's commits will carry, and the
+#              middle segment of its branch. Required for --ship, refused for --scout.
+#   --repairs  this ship task repairs work that is already published, named by the
+#              ship task that published it. Ship work only, and `--type fix`.
+#
+# A repair keeps a branch and a QA task of its own, because a minion may not work in
+# a tree a live run is reading. What changes is where it lands: the brief records the
+# branch the repaired work was published from, and `siana-publish` fast-forwards that
+# branch to the head QA accepts instead of opening a second request holding the same
+# commits. That record is stated here and never inferred later, because every fix is
+# cut from the branch it repairs, so ancestry says nothing about which of them is
+# one.
 #
 # The type is stated here and nowhere else. Nothing downstream reads it back off a
 # title, a diff, a commit or a minion's report, because by then it would be a guess
@@ -112,6 +122,154 @@ print(qa)
 PYEOF
 }
 
+# Where a repair lands, read out of the brief of the work it repairs. Two lines: the
+# branch that task's own work lives on, which is what a repair has to be cut from,
+# and the branch its work is published from, which is where an accepted repair goes.
+# The two are the same until the work being repaired is itself a repair.
+#
+# The reader below is `siana-publish`'s, verbatim, and `tests/test_ship_branch.py`
+# compares the copies as text. Duplicated rather than imported because these are
+# commands and not a package, so there is nowhere for one copy to live: what a writer
+# has to agree with is the command that reads the record back, and a record written
+# against a branch that command does not answer is a repair nobody can publish.
+repair_branches() {
+    python3 - "$home" "$1" <<'PYEOF'
+import os
+import re
+import sys
+
+
+def die(message, *hints):
+    print(f"error: {message}", file=sys.stderr)
+    for hint in hints:
+        print(f"  {hint}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# The one line in a ship brief that a script reads. Indented and a single token, so
+# prose about the branch cannot be mistaken for the record of it.
+BRANCH_LINE = re.compile(r"^[ \t]+branch[ \t]+(\S+)[ \t]*$", re.M)
+
+# Only a ship brief names a ship branch. A QA brief carries the branch it judges in
+# the same shape, and reading that as the QA task's own would put its minion on the
+# branch it was meant to be cut from rather than beside it.
+SHIP_SECTION = re.compile(r"^## Delivery: ship[ \t]*$(.*?)(?=^## |\Z)", re.M | re.S)
+
+# `siana/<task-id>`, or `siana/<type>/<task-id>`. Shape only: which types are allowed
+# is `siana-brief`'s to say, because that is the one place a type is ever stated, and
+# a second opinion here would be a second place to change when that list moves.
+BRANCH_NAME = re.compile(r"siana/[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9_-]*)?")
+
+
+def ship_branch(home: str, task_id: str) -> str:
+    """The branch this task's work lives on.
+
+    Ship work is briefed with an explicit Conventional Commit type, and `siana-brief`
+    writes the `siana/<type>/<task-id>` that follows from it into the brief's own
+    delivery section. That line is the fleet's only record of the type, because the
+    type is stated and never inferred: rebuilding a branch name here out of a title,
+    a diff or a commit is the guess the whole convention exists to prevent.
+
+    A brief that names no branch answers `siana/<task-id>`. That covers scout and QA
+    work, whose branch names are fleet roles rather than commit types, and every task
+    briefed before this existed, so nothing already in flight has to be migrated to
+    stay dispatchable.
+
+    A line this cannot read refuses instead of falling back. Every caller is asking
+    which branch holds the work, and answering `siana/<task-id>` when the brief says
+    otherwise would put a worktree, a review or a publish on a branch nobody named.
+    """
+    path = os.path.join(home, "briefs", f"{task_id}.md")
+    try:
+        with open(path) as fh:
+            section = SHIP_SECTION.search(fh.read())
+    except OSError:
+        return f"siana/{task_id}"
+    named = sorted(set(BRANCH_LINE.findall(section.group(1)))) if section else []
+    if not named:
+        return f"siana/{task_id}"
+    if len(named) > 1:
+        die(f"{path} names more than one branch: {', '.join(named)}",
+            "a brief records exactly one, and which of them holds the work is not",
+            "something a script may choose between; fix the brief")
+    if not BRANCH_NAME.fullmatch(named[0]):
+        die(f"{path} records the branch as {named[0]!r}",
+            "a fleet branch is `siana/<type>/<task-id>` for ship work and",
+            "`siana/<task-id>` otherwise; nothing here may guess at what was meant")
+    return named[0]
+
+
+# The second line a repair's ship brief records, beside the branch. It names the ship
+# task whose published work this repairs, and the branch that work was published
+# from, in that order and on one line, so an accepted repair lands on the request
+# that is already open instead of opening a second one for the same work.
+REPAIR_LINE = re.compile(r"^[ \t]+repairs[ \t]+(\S+)[ \t]+(\S+)[ \t]*$", re.M)
+
+# Anything indented that even claims to be that record. What it catches is a record
+# the strict line cannot read: half of it, three of it, a name wearing a space. Read
+# as no record at all, such a brief publishes a second request for work that already
+# has one, which is the exact failure the record exists to prevent, so it stops here
+# instead.
+REPAIR_CLAIM = re.compile(r"^[ \t]+repairs\b.*$", re.M)
+
+# A task id as the store's own contract writes one. Compared rather than trusted: a
+# record naming something else is a record nothing can look up.
+TASK_ID = re.compile(r"[a-z][a-z0-9-]*")
+
+
+def repair_record(home: str, task_id: str):
+    """The ship task this task repairs and the branch that work was published from,
+    or None when this is ordinary ship work.
+
+    Stated by SIANA at briefing time and never inferred here. A repair is not
+    readable off prose, a title, a commit message, ancestry, or the forge: a branch
+    cut from another one is the ordinary shape of every fix, and a request that
+    happens to be open over there is not evidence that this work belongs on it.
+
+    Every unreadable shape refuses rather than answering None. None means ordinary
+    ship work, which opens a request of its own, so answering it about a brief that
+    says `repairs` is how the duplicate this record exists to prevent gets opened."""
+    path = os.path.join(home, "briefs", f"{task_id}.md")
+    try:
+        with open(path) as fh:
+            section = SHIP_SECTION.search(fh.read())
+    except OSError:
+        return None
+    if section is None:
+        return None
+    claimed = REPAIR_CLAIM.findall(section.group(1))
+    if not claimed:
+        return None
+    named = REPAIR_LINE.findall(section.group(1))
+    if len(claimed) > 1 or len(named) != 1:
+        die(f"{path} does not record exactly one repair",
+            *[f"  {line.strip()}" for line in claimed],
+            "a repair record is one line of `repairs <ship-task> <branch>`, and",
+            "which request an accepted repair lands on is not something a script",
+            "may choose between; fix the brief")
+    target, branch = named[0]
+    if not TASK_ID.fullmatch(target) or not BRANCH_NAME.fullmatch(branch):
+        die(f"{path} records the repair as {target!r} {branch!r}",
+            "it names the ship task whose work this repairs and the branch that",
+            "work was published from; nothing here may guess at what was meant")
+    return target, branch
+
+
+def publication_branch(home: str, task_id: str) -> str:
+    """The branch whose merge request this task's work is published on.
+
+    Its own branch, unless it is itself a repair: a repair of a repair belongs on the
+    same request as the work it descends from, and the record carries that branch
+    already, so the chain is one hop long however many repairs deep the work is."""
+    record = repair_record(home, task_id)
+    return record[1] if record else ship_branch(home, task_id)
+
+
+print(ship_branch(sys.argv[1], sys.argv[2]))
+print(publication_branch(sys.argv[1], sys.argv[2]))
+PYEOF
+}
+
 # The eleven Conventional Commit types, and the whole of what may stand between
 # `siana/` and a task id. A branch named for anything else announces a commit its
 # project's CI will reject, so the list is checked here rather than trusted.
@@ -120,6 +278,7 @@ TYPES="build chore ci docs feat fix perf refactor revert style test"
 id=""
 kind=""
 type=""
+repairs=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
@@ -136,6 +295,14 @@ while [ $# -gt 0 ]; do
         # retype here costs SIANA a whole turn.
         --type=*) [ -z "$type" ] || die "one type at a time; got '$type' and '${1#--type=}'"
                  type="${1#--type=}" ;;
+        --repairs) [ $# -ge 2 ] || die "--repairs needs the ship task whose published" \
+                       "work this repairs"
+                 [ -z "$repairs" ] || die "one repair target at a time; got" \
+                     "'$repairs' and '$2'"
+                 repairs="$2"; shift ;;
+        --repairs=*) [ -z "$repairs" ] || die "one repair target at a time; got" \
+                     "'$repairs' and '${1#--repairs=}'"
+                 repairs="${1#--repairs=}" ;;
         -*) die "unknown option: $1" "run \`siana-brief --help\`" ;;
         *)  [ -z "$id" ] || die "one task at a time; got '$id' and '$1'"
             id="$1" ;;
@@ -179,11 +346,28 @@ if [ "$kind" = ship ]; then
         "a branch named for anything else announces a commit that this" \
         "project's CI rejects on the merge request"
     branch="siana/$type/$id"
+    # A repair is a fix by definition, and the branch it lands on already carries the
+    # feature it repairs. Any other type here would announce a commit that disagrees
+    # with the branch it sits on, on somebody else's merge request.
+    if [ -n "$repairs" ] && [ "$type" != fix ]; then
+        die "$id repairs $repairs, and repairs are briefed --type fix" \
+            "got --type $type" \
+            "a repair adds no category of its own: what it lands on is the request" \
+            "the work it repairs was published on, and that request is already" \
+            "whatever the work it holds is"
+    fi
+    [ "$repairs" != "$id" ] || die "$id cannot repair itself" \
+        "--repairs names the ship task whose published work this repairs, and a" \
+        "task that named itself would record a branch that publishes nothing"
 elif [ -n "$type" ]; then
     die "--type is for ship work, and $id was briefed --scout" \
         "a scout lands nothing, so there is no commit for a type to describe" \
         "its branch is siana/<task-id>, which is a role in this fleet rather than" \
         "a category of change"
+elif [ -n "$repairs" ]; then
+    die "--repairs is for ship work, and $id was briefed --scout" \
+        "a repair lands on the merge request the work it repairs was published on," \
+        "and a scout lands nothing at all"
 fi
 
 home="${SIANA_HOME:-$HOME/.siana}"
@@ -231,12 +415,58 @@ if [ "$kind" = ship ]; then
     fi
 fi
 
+# Where an accepted repair lands, resolved before anything is written. Both branches
+# come from the repaired task's own brief rather than from its id: a repair of a
+# repair belongs on the same request as the work underneath it, and the record on the
+# middle brief is the only thing that says which request that is.
+publication=""
+if [ -n "$repairs" ]; then
+    if ! repaired_show="$(tasks --file "$tasks_file" show "$repairs" 2>&1)"; then
+        die "no such task to repair: $repairs" \
+            "$(printf '%s' "$repaired_show" | head -1)" \
+            "--repairs names the ship task whose published work this repairs, and a" \
+            "task the queue does not have published nothing"
+    fi
+    [ -f "$home/briefs/$repairs.md" ] || \
+        die "no brief at $home/briefs/$repairs.md" \
+            "it is where the branch that work was published from is recorded, and" \
+            "the fallback for a task with no brief is a name only legacy work has" \
+            "a repair recorded against a branch nobody published is a repair that" \
+            "cannot land, and it would open the second request this exists to stop"
+    resolved="$(repair_branches "$repairs")" || exit 1
+    repaired_branch="$(printf '%s\n' "$resolved" | sed -n 1p)"
+    publication="$(printf '%s\n' "$resolved" | sed -n 2p)"
+
+    # The base is what makes this a repair of that work rather than a second attempt
+    # at it. A minion cut from anywhere else starts without the commits it is meant
+    # to be fixing, and its accepted head would not be a fast-forward of the branch
+    # this records - which publication refuses, after the work is done.
+    base="$(printf '%s\n' "$show" | sed -n 's/^  base: //p')"
+    [ "$base" = null ] && base=""
+    if [ "$base" != "$repaired_branch" ]; then
+        die "$id was cut from ${base:-nothing}, and $repairs built $repaired_branch" \
+            "a repair starts from the work it repairs, so that branch is its base" \
+            "queue it again with \`--base $repaired_branch\`, or name the task this" \
+            "work actually repairs"
+    fi
+fi
+
 mkdir -p "$home/briefs"
 # The branch is substituted rather than left as a placeholder for SIANA to fill. It
 # is the one thing in a brief a script derives rather than judges, and a name typed
 # twice is a name that can disagree with itself; every command downstream reads this
 # line, so the copy in the brief is the only record there is.
-sed -e "s|{SHIP_BRANCH}|$branch|g" "$template" > "$brief"
+#
+# `{REPAIR}` is a line of its own, and it is either the repair record or nothing: an
+# ordinary ship brief has no such line at all, so nothing downstream has to tell an
+# empty record from an absent one. The marker is this command's, so a template
+# carrying it inside a sentence loses that sentence rather than half a record.
+if [ -n "$publication" ]; then
+    sed -e "s|{SHIP_BRANCH}|$branch|g" \
+        -e "s|{REPAIR}|    repairs $repairs $publication|" "$template" > "$brief"
+else
+    sed -e "s|{SHIP_BRANCH}|$branch|g" -e "/{REPAIR}/d" "$template" > "$brief"
+fi
 
 # The substitution is checked, not assumed. Every command reads the branch back out
 # of this file the same way: an indented `branch <name>` line, inside the brief's own
@@ -266,8 +496,32 @@ if [ -n "$branch" ] && ! delivery_section "$brief" |
         "nothing has been written and nothing has been queued"
 fi
 
+# The repair record is checked the same way and for the same reason, with one thing
+# added: it has to be there exactly once. A template that lost `{REPAIR}` writes a
+# brief publication reads as ordinary ship work, and ordinary ship work opens a
+# second merge request holding the same commits - which is the whole of what this
+# record exists to prevent, arriving as a duplicate on the captain's forge rather
+# than as an error here. One that carries the marker twice records the same repair
+# twice, and `siana-publish` refuses a brief it cannot read one record out of.
+if [ -n "$publication" ]; then
+    keyword="^[[:space:]]\{1,\}repairs[[:space:]]\{1,\}"
+    record="$keyword$repairs[[:space:]]\{1,\}$publication[[:space:]]*$"
+    stated="$({ delivery_section "$brief" | grep -c "$keyword" || true; })"
+    if [ "$stated" != 1 ] || ! delivery_section "$brief" | grep -q "$record"; then
+        rm -f "$brief"
+        die "$template does not record this repair where publication looks for it" \
+            "$id would be briefed as ordinary ship work, and publishing it would" \
+            "open a second merge request for what $publication already carries" \
+            "the '## Delivery: ship' section needs the marker on a line of its own:" \
+            "    {REPAIR}" \
+            "exactly once, and under no other heading" \
+            "nothing has been written and nothing has been queued"
+    fi
+fi
+
 echo "briefed  $brief ($kind)"
 [ -n "$branch" ] && echo "  branch $branch"
+[ -n "$publication" ] && echo "  repairs $repairs, published from $publication"
 
 # Filling this in is the whole point of scaffolding it, so say what is still empty.
 # The minion refuses to work on an unfilled placeholder, which keeps a forgotten one

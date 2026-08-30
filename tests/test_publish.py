@@ -17,7 +17,9 @@ rather than assumed - a safety feature that quietly made a direct instruction
 impossible would be a worse fleet, not a safer one.
 """
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -107,6 +109,117 @@ class Forge(unittest.TestCase):
         # Guessing wrong runs a CLI that does not exist, or publishes somewhere
         # nobody asked for. Neither is recoverable by re-running.
         self.assertIsNone(publish.forge_of("git@git.example.internal:o/r.git"))
+
+
+REPAIR = """# Brief
+
+## Delivery: ship
+
+Your work lands. This branch is the deliverable:
+
+    branch  siana/fix/repair-the-ci
+    repairs make-it-typed siana/feat/make-it-typed
+
+Commit there and nowhere else.
+
+## The task
+
+Repair it.
+"""
+
+
+class RepairRecord(HomeTest):
+    """Where an accepted repair lands, read off the brief of the work being fixed.
+
+    Everything this cannot read refuses instead of answering None. None means
+    ordinary ship work, which opens a merge request of its own, so answering it
+    about a brief that says `repairs` is how the duplicate the record exists to
+    prevent reaches the forge.
+    """
+
+    def brief(self, task_id, text):
+        os.makedirs(self.at("briefs"), exist_ok=True)
+        with open(self.at("briefs", f"{task_id}.md"), "w") as fh:
+            fh.write(text)
+
+    def record(self, text):
+        self.brief("repair-the-ci", text)
+        return publish.repair_record(self.home, "repair-the-ci")
+
+    def refused(self, text):
+        """The refusal, and what it said. `die` writes to stderr on its way out, and
+        a suite that let that through would print a wall of expected refusals."""
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said), self.assertRaises(SystemExit):
+            self.record(text)
+        return said.getvalue()
+
+    def test_a_repair_names_its_target_and_the_branch_it_lands_on(self):
+        self.assertEqual(self.record(REPAIR),
+                         ("make-it-typed", "siana/feat/make-it-typed"))
+
+    def test_ordinary_ship_work_records_none(self):
+        self.assertIsNone(self.record(BRIEF))
+
+    def test_a_task_with_no_brief_records_none(self):
+        self.assertIsNone(publish.repair_record(self.home, "never-briefed"))
+
+    def test_the_record_is_read_inside_the_delivery_section_only(self):
+        # A QA brief carries the branch it judges in the same shape, and prose
+        # elsewhere in a brief is prose.
+        outside = REPAIR.replace("    repairs make-it-typed siana/feat/make-it-typed\n",
+                                 "")
+        self.assertIsNone(self.record(outside + "\n    repairs a siana/feat/a\n"))
+
+    def test_half_a_record_is_refused_and_never_read_as_none(self):
+        # The failure this shape has: read as ordinary ship work, it opens a second
+        # merge request for commits the other branch already carries.
+        for bad in ("    repairs make-it-typed\n",
+                    "    repairs\n",
+                    "    repairs make-it-typed siana/feat/make-it-typed extra\n"):
+            with self.subTest(bad=bad.strip()):
+                text = REPAIR.replace(
+                    "    repairs make-it-typed siana/feat/make-it-typed\n", bad)
+                self.assertIn("does not record exactly one repair",
+                              self.refused(text))
+
+    def test_two_records_are_refused(self):
+        # Which request an accepted repair lands on is not something a script may
+        # choose between.
+        text = REPAIR.replace("Commit there and nowhere else.",
+                              "    repairs other siana/feat/other")
+        self.assertIn("does not record exactly one repair", self.refused(text))
+
+    def test_the_same_record_twice_is_still_two_records(self):
+        text = REPAIR.replace("Commit there and nowhere else.",
+                              "    repairs make-it-typed siana/feat/make-it-typed")
+        self.assertIn("does not record exactly one repair", self.refused(text))
+
+    def test_a_branch_this_fleet_would_never_publish_is_refused(self):
+        for bad in ("main", "../elsewhere", "siana/", "origin/main"):
+            with self.subTest(bad=bad):
+                self.assertIn("records the repair as",
+                              self.refused(REPAIR.replace("siana/feat/make-it-typed",
+                                                          bad)))
+
+    def test_a_target_that_is_not_a_task_id_is_refused(self):
+        # A name wearing a space is the malformed line above, not this: it is the
+        # shape the strict line cannot read at all.
+        for bad in ("Make-It-Typed", "../make-it-typed", "1st-attempt"):
+            with self.subTest(bad=bad):
+                self.assertIn("records the repair as",
+                              self.refused(REPAIR.replace("make-it-typed ",
+                                                          bad + " ")))
+
+    def test_the_branch_it_publishes_on_is_its_own_until_it_is_a_repair(self):
+        self.brief("make-it-typed", BRIEF.replace(
+            "Your work lands. Your branch is the deliverable.",
+            "    branch  siana/feat/make-it-typed"))
+        self.assertEqual(publish.publication_branch(self.home, "make-it-typed"),
+                         "siana/feat/make-it-typed")
+        self.brief("repair-the-ci", REPAIR)
+        self.assertEqual(publish.publication_branch(self.home, "repair-the-ci"),
+                         "siana/feat/make-it-typed")
 
 
 class Refusals(HomeTest):

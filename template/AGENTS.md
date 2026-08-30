@@ -288,6 +288,28 @@ its minion starts from the work rather than from a tree that never had it, and b
 it with what the report found. That fix task gets a QA pair of its own, because it is
 ship work like any other, so it gets a `--type` of its own too.
 
+**When the work being repaired is already published, say so:**
+
+    siana-brief <fix-id> --ship --type fix --repairs <the published ship task>
+
+That is the difference between a fix that opens a merge request of its own and one
+that lands on the request the work is already being reviewed on. It is ship work
+only, it is `--type fix` only, and the fix task's `--base` has to be the branch that
+task built: a minion cut from anywhere else does not have the commits it is meant to
+be fixing. The brief then records the branch that work was published from, beside the
+fix's own, and `siana-publish` fast-forwards that branch to the head QA accepts.
+
+Nothing infers this. Every fix is cut from the branch it repairs, so ancestry, a
+title and a commit message describe an ordinary fix exactly as well as they describe
+a repair - you hold the contract at briefing time and nothing downstream does.
+Repairing a repair is `--repairs <the first fix task>`: the chain is resolved when the
+brief is written, so it stays one request however many repairs deep the work goes.
+
+The fix minion and its QA stay where they were: their own branches, their own
+worktrees, their own pipeline. Only publication touches the published branch. Its
+handoff is its own too, and it is the copy that request ends up carrying, so brief it
+to describe the whole of the work and not the round that failed.
+
 Skipping QA for one task is `tasks drop <qa-id>`. It is a decision you report to
 the captain, never a tidy-up: the registry field is their standing answer for that
 project, and dropping the pair overrides them for one piece of work.
@@ -313,6 +335,24 @@ publishing something QA never saw is not a mistake you can make.
 so a restart between a verdict and this call leaves you unable to say whether the
 merge request exists. Do not go looking: run it again. It asks the forge, reports what
 is already open, and exits without opening a second one.
+
+**A repair publishes the other way.** If the ship task's brief records a `repairs`
+line, this opens nothing: it finds the one open request whose source is the branch
+recorded there, proves the accepted head is a fast-forward of what that branch holds
+now, and pushes exactly that head to it. The request keeps its number, its target and
+its review; what changes is the commits under it, and the copy describing them, which
+is rewritten from the repair's own handoff because that is what those commits now
+are. Everything else refuses before the push - no request, two requests, a closed or
+merged one, a forge that cannot answer, a branch that moved under the request, a head
+that is not a fast-forward, a minion still sitting on the branch, or a repair branch
+that moved after its verdict - and a refusal there is yours to look at rather than to
+work around.
+
+**A repair is two calls to the forge, so it has a half-done state.** The push lands
+before the copy does, and a run that ends between them leaves the request holding the
+right commits under the previous description. Run it again: the branch is already at
+the accepted head, so it pushes nothing, puts the copy on, and says so. That is the
+whole recovery, and there is no state anywhere to unwind first.
 
 **The brief does not travel, and neither does the QA report.** What a human reads is
 the handoff the ship minion wrote at `$SIANA_HOME/handoffs/<ship-id>.md`: the intent,

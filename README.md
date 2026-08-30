@@ -275,6 +275,32 @@ judgment about the work.
 
 `siana-publish --dry-run` prints the exact title and body, and changes nothing.
 
+### A repair of something already published
+
+A merge request that comes back red - a failing check, a review you want answered -
+is repaired the way everything else is: SIANA queues a fix task, and a minion works
+it on a branch of its own with its own independent QA behind it. What it does not do
+is open a second merge request holding the same commits. Tell SIANA the fix repairs
+published work, and it briefs it with:
+
+    siana-brief <fix-id> --ship --type fix --repairs <the published ship task>
+
+The brief then records the branch that work was published from, and once QA accepts
+the fix, `siana-publish` fast-forwards that branch to exactly the head QA accepted.
+Your merge request keeps its number and its review, and gains the commits that fix
+it. Its description is rewritten from the repair minion's own handoff, because after
+that push it is describing that minion's work. Nothing merges: that is still yours,
+in person.
+
+It refuses rather than guesses. No open request from that branch, more than one, a
+closed or merged one, a branch that has moved under the request, a head that is not a
+fast-forward of what the request holds, or a minion still working on that branch all
+stop before anything is pushed. So does a repair branch that moved after its verdict,
+because the head that goes out is the one a second minion actually read.
+
+The push and the description are two calls, so an interrupted run can leave the new
+commits under the old copy. Running it again pushes nothing and puts the copy on.
+
 ### Leave it running
 
     siana-watch

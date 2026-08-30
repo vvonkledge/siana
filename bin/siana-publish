@@ -29,6 +29,20 @@ store, so a SIANA that restarts between a QA verdict and this call cannot know
 whether the merge request exists; asking the forge is cheaper than inventing
 somewhere to record it, so an existing merge request is reported and exits zero.
 
+A repair of already published work publishes the other way. Its brief records the
+branch that work was published from, so instead of opening a second request holding
+the same commits, this fast-forwards that branch to the head QA accepted and the
+repair arrives on the thread the captain is already reading. The record is stated by
+SIANA at briefing time and never inferred here: every fix is cut from the branch it
+repairs, so ancestry, a title or a request that happens to be open over there would
+make ordinary work land on somebody else's review.
+
+The copy on that request is rewritten from the repair's own handoff, for the reason
+the same-branch path rewrites one: what a reviewer is reading has to describe the
+commits under it, and after a repair those are the repair's. So a repair minion writes
+a standalone handoff - what the work was for, and what the repaired solution now does -
+and it is validated against the head QA accepted before anything is pushed.
+
 **While an advisory session is in force, this asks `siana-gate` before it pushes.**
 An advisory session permits nothing, so what actually happens is that the proposal is
 written into the captain's decision ledger - the exact command, the evidence, the
@@ -146,6 +160,72 @@ def ship_branch(home: str, task_id: str) -> str:
             "a fleet branch is `siana/<type>/<task-id>` for ship work and",
             "`siana/<task-id>` otherwise; nothing here may guess at what was meant")
     return named[0]
+
+
+# The second line a repair's ship brief records, beside the branch. It names the ship
+# task whose published work this repairs, and the branch that work was published
+# from, in that order and on one line, so an accepted repair lands on the request
+# that is already open instead of opening a second one for the same work.
+REPAIR_LINE = re.compile(r"^[ \t]+repairs[ \t]+(\S+)[ \t]+(\S+)[ \t]*$", re.M)
+
+# Anything indented that even claims to be that record. What it catches is a record
+# the strict line cannot read: half of it, three of it, a name wearing a space. Read
+# as no record at all, such a brief publishes a second request for work that already
+# has one, which is the exact failure the record exists to prevent, so it stops here
+# instead.
+REPAIR_CLAIM = re.compile(r"^[ \t]+repairs\b.*$", re.M)
+
+# A task id as the store's own contract writes one. Compared rather than trusted: a
+# record naming something else is a record nothing can look up.
+TASK_ID = re.compile(r"[a-z][a-z0-9-]*")
+
+
+def repair_record(home: str, task_id: str):
+    """The ship task this task repairs and the branch that work was published from,
+    or None when this is ordinary ship work.
+
+    Stated by SIANA at briefing time and never inferred here. A repair is not
+    readable off prose, a title, a commit message, ancestry, or the forge: a branch
+    cut from another one is the ordinary shape of every fix, and a request that
+    happens to be open over there is not evidence that this work belongs on it.
+
+    Every unreadable shape refuses rather than answering None. None means ordinary
+    ship work, which opens a request of its own, so answering it about a brief that
+    says `repairs` is how the duplicate this record exists to prevent gets opened."""
+    path = os.path.join(home, "briefs", f"{task_id}.md")
+    try:
+        with open(path) as fh:
+            section = SHIP_SECTION.search(fh.read())
+    except OSError:
+        return None
+    if section is None:
+        return None
+    claimed = REPAIR_CLAIM.findall(section.group(1))
+    if not claimed:
+        return None
+    named = REPAIR_LINE.findall(section.group(1))
+    if len(claimed) > 1 or len(named) != 1:
+        die(f"{path} does not record exactly one repair",
+            *[f"  {line.strip()}" for line in claimed],
+            "a repair record is one line of `repairs <ship-task> <branch>`, and",
+            "which request an accepted repair lands on is not something a script",
+            "may choose between; fix the brief")
+    target, branch = named[0]
+    if not TASK_ID.fullmatch(target) or not BRANCH_NAME.fullmatch(branch):
+        die(f"{path} records the repair as {target!r} {branch!r}",
+            "it names the ship task whose work this repairs and the branch that",
+            "work was published from; nothing here may guess at what was meant")
+    return target, branch
+
+
+def publication_branch(home: str, task_id: str) -> str:
+    """The branch whose merge request this task's work is published on.
+
+    Its own branch, unless it is itself a repair: a repair of a repair belongs on the
+    same request as the work it descends from, and the record carries that branch
+    already, so the chain is one hop long however many repairs deep the work is."""
+    record = repair_record(home, task_id)
+    return record[1] if record else ship_branch(home, task_id)
 
 
 def git(path: str, *args, check=True):
@@ -276,6 +356,282 @@ def update(forge: str, path: str, branch: str, title: str, body: str):
             "there to read; it is carrying copy from an earlier run")
 
 
+# What each forge is asked for the requests on one branch, and what it calls the
+# three fields this needs. Every state is asked for rather than the open ones only:
+# a request that was closed or merged is a different answer from no request at all,
+# and advancing a branch nobody is reading is not something to do quietly.
+REQUESTS = {
+    "github": (["gh", "pr", "list", "--head", "{branch}", "--state", "all",
+                "--json", "url,state,headRefName,headRefOid"],
+               {"url": "url", "state": "state",
+                "head": "headRefOid", "source": "headRefName"}),
+    "gitlab": (["glab", "mr", "list", "--source-branch", "{branch}", "--all",
+                "--output", "json"],
+               {"url": "web_url", "state": "state",
+                "head": "sha", "source": "source_branch"}),
+}
+
+# github says OPEN, gitlab says opened. Both also have states this must not treat as
+# one: a merged request whose branch is advanced afterwards is work pushed at
+# something nobody will read again.
+OPEN = {"open", "opened"}
+
+
+def requests_for(forge: str, path: str, branch: str):
+    """Every merge request whose source is this branch, or why none could be asked.
+
+    The reason travels back instead of an empty list. A forge that could not answer
+    and a branch that has no request are the same shape and opposite facts: one is
+    work waiting for its first request, the other is a request this is about to push
+    into, and `existing` above conflates them on purpose because opening a second
+    request is recoverable. Advancing somebody's branch is not."""
+    argv, fields = REQUESTS[forge]
+    argv = [part.replace("{branch}", branch) for part in argv]
+    out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    if out.returncode != 0:
+        return None, ((out.stderr or out.stdout).strip()
+                      or f"{argv[0]} exited {out.returncode} and said nothing")
+    try:
+        found = json.loads(out.stdout or "[]")
+    except json.JSONDecodeError:
+        return None, f"{argv[0]} answered something that is not JSON"
+    if not isinstance(found, list) or any(not isinstance(r, dict) for r in found):
+        return None, f"{argv[0]} answered something that is not a list of requests"
+    listed = [{name: str(r.get(key) or "") for name, key in fields.items()}
+              for r in found]
+    # Filtered here as well as asked for. The source branch is the whole of what ties
+    # a request to this work, and a client that widened its own matching would hand
+    # back a request about somebody else's branch with nothing here to notice.
+    return [r for r in listed if r["source"] == branch], None
+
+
+def held(tasks_file: str, handle: str, branch: str):
+    """The live task whose minion is sitting on this branch, or None.
+
+    Asked of the queue and the worktree together, because neither answers alone: a
+    `doing` task says a minion is working, and the branch its worktree is on says
+    what it is working on. Scoped to this project, so a branch of the same name in
+    another repository is somebody else's.
+
+    Pushing at a branch a minion is committing to leaves that minion diverged from
+    the request it is meant to be repairing, and it finds out at its own publish."""
+    for task_id, task in sorted(fold(tasks_file, "id").items()):
+        if task.get("status") != "doing" or task.get("project") != handle:
+            continue
+        cwd = task.get("cwd")
+        if not cwd or not os.path.isdir(cwd):
+            continue
+        on = git(cwd, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+        if on.returncode == 0 and on.stdout.strip() == branch:
+            return task_id, task
+    return None
+
+
+def repair_publish(args, home: str, tasks_file: str, handle: str, path: str,
+                   forge: str, branch: str, repair, qa_id: str, accepted: str,
+                   title: str, body: str) -> None:
+    """Advance the request this repair belongs on, and open nothing.
+
+    A repair is cut from the branch a rejected or failing request was published from,
+    and validated and judged on a branch of its own, because a minion may not work in
+    a tree a live run or a live reviewer is reading. That isolation ends here: the
+    accepted head is pushed to the request's own source branch, so the repair arrives
+    on the thread the captain is already reading rather than as a second request
+    holding the same commits.
+
+    The request's copy is rewritten from the repair's own handoff afterwards, which
+    the caller has already validated against `accepted`. What a reviewer reads has to
+    describe the commits under it, and after this push those are the repair's; leaving
+    the old copy standing would make the one run that changed the work the one run
+    whose description never arrived.
+
+    Everything below refuses before the push, which is the first thing here that
+    leaves the machine. The push itself is an ordinary fast-forward: no force, no
+    lease, no second request, and nothing about the request's number or target moves.
+
+    Nothing here asks the advisory gate. `main` asks it above every check about this
+    machine, so a gated run never reaches either publication path and this one has no
+    second copy of that decision to keep right.
+    """
+    target_task, publication = repair
+    cli = "glab" if forge == "gitlab" else "gh"
+    missing = shutil.which(cli) is None
+
+    # The head QA judged, and not merely the branch it was told to judge. A QA
+    # worktree is cut from the repair branch when it is dispatched, so `siana/<qa-id>`
+    # stands where that branch was when a second minion started reading it, and QA
+    # lands nothing, so it is still there afterwards. Without this, a repair branch
+    # that moved after the verdict would reach the captain's own request wearing a
+    # green nobody gave that head.
+    judged_at = ship_branch(home, qa_id)
+    if git(path, "rev-parse", "--verify", judged_at, check=False).returncode != 0:
+        die(f"{path} has no branch {judged_at}",
+            f"it is where {qa_id} was cut from {branch}, and the only record of",
+            "which head that verdict is about",
+            "without it nothing here can say the branch has not moved since, and",
+            "this pushes into a request the captain is already reading")
+    judged = git(path, "rev-parse", judged_at).stdout.strip()
+    if judged != accepted:
+        die(f"{branch} is at {accepted[:12]}, and {qa_id} judged {judged[:12]}",
+            "one of them moved after the verdict, so publishing this would put a",
+            "head no independent minion has read on an open request",
+            "look at both branches, then queue the repair again over what is there")
+
+    live = held(tasks_file, handle, publication)
+    if live:
+        die(f"{publication} is checked out by {live[0]}, which is still running",
+            f"held by {live[1].get('owner') or 'a minion'} at {live[1].get('cwd')}",
+            "a push at a branch somebody is committing to leaves that minion",
+            "diverged from the request it is working on, and it finds out at its",
+            "own publish; wait for it, or reclaim the task first")
+
+    plan = [f"branch:  {branch}",
+            f"repairs: {target_task}, published from {publication}",
+            f"head:    {accepted[:12]}, accepted by {qa_id}",
+            f"forge:   {forge}",
+            f"title:   {title}"]
+
+    if args.dry_run and missing:
+        for line in plan:
+            print(line)
+        print(f"would fast-forward {publication} to that head, on the request "
+              f"already open from it")
+        print(f"warning: {cli} is not installed here, so a real run would refuse",
+              file=sys.stderr)
+        return
+
+    if missing:
+        die(f"{cli} is not installed, and this needs it",
+            "it is what says whether the request on that branch is still open, and",
+            "advancing a branch whose request was closed or merged pushes work at",
+            f"something nobody will read again; install {cli}")
+
+    found, problem = requests_for(forge, path, publication)
+    if problem is not None:
+        die(f"{forge} could not say what is open from {publication}",
+            problem,
+            "this fast-forwards a request that exists, so a forge that cannot be",
+            "asked is a refusal and never an assumption that there is none")
+    open_now = [r for r in found if r["state"].lower() in OPEN]
+    if not found:
+        die(f"no merge request has ever been opened from {publication}",
+            f"a repair of {target_task} lands on the request that work was",
+            "published on, and there is none to land on",
+            "publish the work it repairs first, or brief this as ordinary ship work")
+    if not open_now:
+        die(f"the request from {publication} is not open",
+            *[f"  {r['state']}: {r['url']}" for r in found],
+            "a closed or merged request is not a review thread any more, and its",
+            "branch is not somewhere to push work nobody will read")
+    if len(open_now) > 1:
+        die(f"{publication} is the source of more than one open request",
+            *[f"  {r['url']}" for r in open_now],
+            "which one an accepted repair belongs on is the captain's to say, and",
+            "not something a script may choose between")
+    request = open_now[0]
+
+    ls = git(path, "ls-remote", "origin", f"refs/heads/{publication}", check=False)
+    if ls.returncode != 0:
+        die(f"origin could not be read for {publication}",
+            (ls.stderr or ls.stdout).strip(),
+            "the remote head is what this proves a fast-forward against, so nothing",
+            "is pushed until it can be read")
+    if not ls.stdout.strip():
+        die(f"origin has no {publication}",
+            f"{request['url']} is open from it, so the branch it reads was deleted",
+            "or renamed; there is nothing here to fast-forward")
+    remote_head = ls.stdout.split()[0]
+
+    # Asked before anything else about that head, because it is the answer that makes
+    # re-running safe. Publishing happens outside the store, so a SIANA that restarts
+    # between a verdict and this call cannot know whether it already ran; a branch
+    # that is already at the accepted head is the end state either way, whatever the
+    # forge's own record of it has caught up to yet.
+    #
+    # The copy is still put on, because the push and the update are two calls and a
+    # run can end between them. Rewriting a description that already says this is
+    # what it says again, so the recovery converges instead of needing to know how
+    # far the interrupted run got.
+    if remote_head == accepted:
+        if args.dry_run:
+            for line in plan:
+                print(line)
+            print(f"request: {request['url']}")
+            print(f"remote:  {publication} is already at {accepted[:12]}")
+            print("  nothing would be pushed, and the copy would be put on again")
+            return
+        update(forge, path, publication, title, body)
+        print(f"already advanced: {request['url']}")
+        print(f"  {publication} is at {accepted[:12]}, which is the accepted head")
+        print(f"  copy   updated to what {qa_id} accepted")
+        return
+
+    if request["head"] and request["head"] != remote_head:
+        die(f"{publication} has moved since {request['url']} was read",
+            f"the request is at {request['head'][:12]} and origin is at "
+            f"{remote_head[:12]}",
+            "somebody pushed to it, so what QA accepted was judged against a branch",
+            "that is not the one this would advance; look before publishing again")
+
+    # Fetched only when the commit is not here. It usually is: the repair was cut
+    # from this branch, so the head it is being fast-forwarded from is an ancestor
+    # of the work. A fetch is a read either way, and reading is what this is allowed
+    # to do before the one push.
+    if git(path, "cat-file", "-e", f"{remote_head}^{{commit}}",
+           check=False).returncode != 0:
+        git(path, "fetch", "--quiet", "origin", f"refs/heads/{publication}",
+            check=False)
+    if git(path, "cat-file", "-e", f"{remote_head}^{{commit}}",
+           check=False).returncode != 0:
+        die(f"{remote_head[:12]} is not here, and origin would not send it",
+            f"it is what {publication} is at, and a fast-forward cannot be proved",
+            "against a commit this repository does not have")
+
+    ancestry = git(path, "merge-base", "--is-ancestor", remote_head, accepted,
+                   check=False)
+    if ancestry.returncode == 1:
+        die(f"{accepted[:12]} is not a fast-forward of {publication}",
+            f"origin is at {remote_head[:12]}, which the accepted head does not",
+            "contain, so this would drop commits that are on the request already",
+            "the repair has to be rebuilt over what the request holds now")
+    if ancestry.returncode != 0:
+        die(f"git could not compare {remote_head[:12]} and {accepted[:12]}",
+            (ancestry.stderr or ancestry.stdout).strip())
+
+    if args.dry_run:
+        for line in plan:
+            print(line)
+        print(f"request: {request['url']}")
+        print(f"remote:  {publication} at {remote_head[:12]}")
+        print(f"would push {accepted[:12]} to refs/heads/{publication} "
+              f"(fast-forward, no force)")
+        print("  no second request is opened, and its number and target do not move")
+        return
+
+    # The accepted commit by name, at the request's own source ref. The local
+    # `publication` branch is deliberately not moved and not read: it is where the
+    # work it repairs was left, and this is about what the request holds.
+    push = subprocess.run(
+        ["git", "-C", path, "push", "origin", f"{accepted}:refs/heads/{publication}"],
+        capture_output=True, text=True)
+    if push.returncode != 0:
+        die(f"pushing {accepted[:12]} to {publication} failed",
+            (push.stderr or push.stdout).strip(),
+            "nothing else was done, so fixing this and running again is safe")
+
+    # After the push and not before it. The two are separate calls either way, so one
+    # of the orders leaves a description of commits that are not there yet and the
+    # other leaves commits under a description that has not caught up. The second is
+    # the safer half-done state, and it is the one a re-run repairs above.
+    update(forge, path, publication, title, body)
+
+    print(f"advanced {publication} to {accepted[:12]}")
+    print(f"  on     {request['url']}")
+    print(f"  from   {branch}, accepted by {qa_id}")
+    print(f"  copy   updated to what {qa_id} accepted")
+    print("  no second merge request was opened, and merging is still the captain's")
+
+
 def propose(task_id: str, record: str) -> int:
     """Ask `siana-gate` whether this may happen, and let it say so in its own words.
 
@@ -298,10 +654,11 @@ def propose(task_id: str, record: str) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Push and open the merge request for the branch a QA task accepted.")
+        description="Publish the branch a QA task accepted: a merge request of its "
+                    "own, or a fast-forward of the one it repairs.")
     ap.add_argument("task_id", help="the QA task whose verdict authorises this")
     ap.add_argument("--dry-run", action="store_true",
-                    help="print the branch, target, title and body, and change nothing")
+                    help="print what would be published, and change nothing")
     ap.add_argument("--record", metavar="FILE",
                     help="the decision SIANA wrote, as JSON; required while an "
                          "advisory session is in force, and a request to be gated "
@@ -437,6 +794,17 @@ def main() -> None:
     if fold(tasks_file, "id").get(ship_id) is None:
         die(f"{args.task_id} depends on {ship_id}, which is not in the queue")
 
+    # Whether this is a repair of published work, stated by SIANA when it briefed the
+    # fix and read here off that brief's own record. Nothing infers it: a branch cut
+    # from another one is the ordinary shape of every fix, so ancestry, a title, a
+    # commit message or a request that happens to be open over there are all things
+    # that would make ordinary work land on somebody else's review thread.
+    #
+    # Read with the rest of the queue's refusals, before anything about this machine
+    # is asked, because a record nothing can read one repair out of is a brief to fix
+    # rather than a publish to attempt.
+    repair = repair_record(home, ship_id)
+
     # The queue's refusals are all above: they say this verdict does not authorise a
     # publish, and that is true whoever is asking. This asks who is asking, and it
     # comes before everything below because all of that is about whether this machine
@@ -497,6 +865,19 @@ def main() -> None:
     # record of a publish SIANA was ready to carry out, and one whose copy does not
     # assemble was never that.
     title, body = copy(ship_id, head, args.task_id)
+
+    # Two publications, and the record on the brief is what says which. Ordinary ship
+    # work pushes its own branch and opens a request from it; a repair advances the
+    # request the work it repairs is already being reviewed on, and opens nothing.
+    #
+    # Read here rather than earlier so that everything above - the verdict, the
+    # branch, the project, the forge, the copy - has already been checked the same
+    # way for both. A repair is not a different authorisation, only a different
+    # destination.
+    if repair is not None:
+        repair_publish(args, home, tasks_file, handle, path, forge, branch, repair,
+                       args.task_id, head, title, body)
+        return
 
     if args.dry_run:
         print(f"branch:  {branch}")
