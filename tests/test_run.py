@@ -291,6 +291,44 @@ class SoloDispatch(Fixture):
                             for a in busy for b in busy if a is not b),
                         "the ordinary tests did not overlap either")
 
+    def test_a_worker_dying_last_does_not_strand_the_solo_lane(self):
+        """The deadlock this arrangement is one missing call away from.
+
+        Solo work waits for every other worker to fall quiet, and the workers that
+        have nothing left park instead of shutting down while it waits. So the last
+        busy worker is the one that releases the run - and if it dies rather than
+        reporting, the pump that would notice has to happen anyway. Without it the
+        parked workers sit on their stdin forever, nothing has `running` set so the
+        stall watchdog never fires, and a crash becomes a silent hang that ends at
+        CI's fifteen-minute guard with no summary at all.
+
+        The other worker-death tests cannot reach this: their fixtures match no
+        solo prefix, so the pool shuts down immediately and the parking never
+        happens.
+        """
+        where = self.suite(test_dies="""
+            import os, unittest
+
+            class Crashes(unittest.TestCase):
+                def test_takes_the_worker_with_it(self): os._exit(7)
+
+            class Quiet(unittest.TestCase):
+                def test_needs_the_machine(self): pass
+        """)
+        # A real subprocess with a bound on it, because the regression is a hang
+        # rather than a wrong answer: `timeout` is what turns it into a failure
+        # this suite reports in ninety seconds instead of a worker stalling out
+        # its full watchdog to say the same thing.
+        out = self.go(where, workers=2, timeout=90,
+                      env={"SIANA_TEST_SOLO": "test_dies.Quiet."})
+        self.assertIn("Ran 2 tests", out.stdout)
+        self.assertIn("ERROR: test_dies.Crashes.test_takes_the_worker_with_it",
+                      out.stdout)
+        self.assertIn("died while running this test (exit 7)", out.stdout)
+        # And the solo test still ran, rather than being stranded with the worker.
+        self.assertIn("test_dies.Quiet.test_needs_the_machine", out.stdout)
+        self.assertIn("FAILED (errors=1)", out.stdout)
+
     def test_the_solo_test_still_runs_when_it_is_the_only_work(self):
         where = self.suite(test_solo="""
             import unittest

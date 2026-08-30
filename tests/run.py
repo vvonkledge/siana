@@ -246,7 +246,14 @@ def discover(argv):
 # changes: no assertion is touched, no test is skipped, and the wait is the wait it
 # always had. It runs last, alone, after every other chunk has drained. That costs
 # the couple of seconds the test itself takes.
-SOLO = ("test_wake.Watching.",)
+# Overridable only so that this runner's own tests can drive the lane against a
+# fixture in a real subprocess, which is the one way a regression here fails fast
+# instead of hanging: a stranded pool never returns, and a test that proved that in
+# this process would sit out the eight-minute watchdog to say so. Nothing in this
+# suite, this justfile or CI sets it.
+_SOLO = os.environ.get("SIANA_TEST_SOLO")
+SOLO = (tuple(n for n in _SOLO.split(",") if n) if _SOLO is not None
+        else ("test_wake.Watching.",))
 
 
 def chunks(ids):
@@ -907,8 +914,17 @@ def coordinate(ids, pool, verbosity, failfast, stream):
                                 else event["o"]) + "\n")
                     elif event["e"] == "idle":
                         hand_out(worker)
-                pump()
                 stream.flush()
+
+            # After every batch of readable workers rather than after each one, so
+            # that a worker which simply died is followed by a pump too. The arm
+            # above `continue`s, and a death is exactly the transition that can
+            # leave the pool with parked workers, nothing running, and solo work
+            # still waiting for a machine that is already quiet. Missing it turned
+            # a crash into a silent hang: the parked workers stay blocked on their
+            # stdin, no worker has `running` set so the stall check below never
+            # fires, and the run reaches CI's guard having printed nothing more.
+            pump()
 
             # The stall, and the coordinator is what ends one. A worker dumps every
             # thread's stack at STALL_S and keeps running, because a worker that
