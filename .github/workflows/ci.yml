@@ -28,16 +28,26 @@ jobs:
     # Named for the command it runs, so a red check tells you what to run locally.
     name: just test
     runs-on: ubuntu-latest
-    # The suite takes six or seven minutes. This is a hang guard, not a budget.
-    timeout-minutes: 15
+    # This is a hang guard, not a budget, and it has to stay one: a guard the
+    # passing suite runs into is a budget, and it fails a run that was going to be
+    # green. `just test` on this runner took twelve minutes on the trunk before
+    # this branch, and this branch adds 289 tests to 856. Measured side by side on
+    # one machine the whole suite is 1.35x the trunk's, which puts it past fifteen
+    # minutes here with nothing wrong.
+    timeout-minutes: 30
 
     env:
       # Pinned rather than tracked, so a red run stays reproducible tomorrow. The
       # suite drives a real `tasks` and `datafile` on purpose, so these are the
       # stores under test and not incidental tooling: bump them deliberately, in a
       # commit that says which siana change needed a newer one.
+      #
+      # `datafile` is here for `bin/siana-read`, which reads every store through
+      # `datafile list --json`. That flag landed in 47b9d3c; the ref before this one
+      # predated it, so on a clean runner every store command answered with a usage
+      # error instead of a store.
       TASKS_REF: d1925ba462896d00bb75de2800d33b5b1c0cdb33 # vvonkledge/tasks main
-      DATAFILE_REF: f6e6cf8124700cfc09eef26138e5cafb2cf9367e # vvonkledge/datafile main
+      DATAFILE_REF: 710aca6c356be0068851c18db57aa438b51265d5 # vvonkledge/datafile main
       # `just init` refuses outright without `pi`, so five tests covering install,
       # upgrade and uninstall skip themselves when it is absent. Nothing in the
       # suite executes it; the recipe only checks that it is there.

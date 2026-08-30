@@ -64,6 +64,11 @@ branch is where it ends: nothing leaves this machine until a second minion has
 accepted your work, and that part is SIANA's. You never open, approve, or merge a
 merge request either: what lands is SIANA's, always.
 
+That holds when your brief says your work repairs something already published. The
+branch it names there receives your accepted head, and publication is what puts it
+there. It is not yours to check out, commit on, or push, and the request on it is not
+yours to touch.
+
 ## How you commit
 
 Every commit message in every project follows Conventional Commits. One line, then

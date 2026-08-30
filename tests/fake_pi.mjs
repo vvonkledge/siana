@@ -1,6 +1,6 @@
 /**
- * A pi session, scripted: the extension host reduced to the four things `wake.ts`
- * is allowed to touch, driven a step at a time from `tests/test_wake.py`.
+ * A pi session, scripted: the extension host reduced to what `wake.ts` is allowed to
+ * touch, driven a step at a time from `tests/test_wake.py`.
  *
  * Pi is the second boundary in this distro a test cannot drive for real, and it is
  * a harder one than herdr. A live pi wants a terminal, a model, and the captain's
@@ -13,8 +13,20 @@
  * So pi's extension API is scripted and nothing else is. The extension is loaded as
  * itself, from `template/wake.ts`, and it runs on the real node event loop against
  * a real filesystem: its atomic writes, its directory watch and its interval are
- * the ones that ship. What is faked is the six calls it makes back into pi, and
- * each of those records what it was given rather than answering from a script.
+ * the ones that ship. What is faked is the calls it makes back into pi and the
+ * events pi hands it, and each of those records what it was given rather than
+ * answering from a script.
+ *
+ * The one thing modelled here rather than recorded is how a send is answered, and
+ * it is modelled because the truthful answer is what the extension has to be held
+ * to. `sendUserMessage` is `void`: it hands the prompt to `prompt()`, whose
+ * rejection pi catches into an error channel with no extension event behind it. So
+ * a refused send throws nothing back, returns exactly like an accepted one, and
+ * reaches the captain's chat rather than the extension. What does come back is a
+ * pair of events in a fixed order - `input`, carrying the source, from inside the
+ * send call; then `before_agent_start`, carrying the text, a task later and only
+ * for a prompt pi kept. `prompt()` below is that order, and it is the whole of what
+ * an extension can tell about whether its wake landed.
  *
  * Three of the recordings are the point rather than a convenience:
  *
@@ -72,6 +84,19 @@ fs.unlinkSync = (path, ...rest) => {
   removed.push(String(path));
   return realUnlinkSync(path, ...rest);
 };
+// The clock the extension reads, which is deliberately not the one the event loop
+// runs on. Two of its rules are ages - how long a send pi never took is left alone,
+// and how long one pi took and never started is waited for - and the second is
+// minutes, because the legitimate gap it must not cut short is an automatic
+// compaction's round trip. Sleeping through that would put minutes into a suite
+// that has to stay in seconds, and would still be a race rather than a rule. So a
+// test moves this offset and leaves the timers alone: the poll goes on firing at
+// its real cadence and reads an age that has really passed as far as the extension
+// can tell.
+const realNow = Date.now;
+let clockOffset = 0;
+Date.now = () => realNow() + clockOffset;
+
 // A disk that will not take the write. Wrapped at the rename because that is where
 // a staged write becomes the file, so a failure here is the one that leaves the
 // counter on disk behind what has actually been delivered.
@@ -82,11 +107,46 @@ fs.renameSync = (from, to, ...rest) => {
 };
 
 const sent = [];
-// Sends the session refused, which pi does for real when a message cannot be
-// delivered. They are kept apart from `sent` so a test can say the extension tried
-// and still did not record the wake as taken.
+// Sends pi's `prompt()` threw on before it reached its input gate, which is what a
+// manual compaction does for the whole of its duration while `isIdle()` is still
+// true. They are kept apart from `sent` so a test can say the extension tried and
+// still did not record the wake as taken.
+//
+// Nothing is thrown back at the extension here, because nothing is thrown back at
+// it there. `ExtensionAPI.sendUserMessage` is declared `void` and implemented as
+// `this.sendUserMessage(...).catch(err => runner.emitError(...))`, and there is no
+// `extension_error` event to subscribe to: the rejection reaches the captain's
+// chat transcript as a red line and reaches the extension not at all. A fake that
+// threw would let an extension pass here by catching something the real host never
+// gives it.
 const refused = [];
-let sendThrows = false;
+let sendRejects = false;
+// A prompt pi took past its input gate and then threw on: no model selected,
+// credentials that expired, a run that began between the gate and the streaming
+// check, an automatic compaction that failed. The extension has seen its own send
+// go in and will never be told what became of it, which is a different shape from
+// `sendRejects` and not covered by it.
+let startRejects = false;
+// Every `before_agent_start` pi emitted, which is the first moment a prompt is
+// known to have been accepted: `prompt()` emits it after all four of its throw
+// paths and immediately before it starts the run.
+const starts = [];
+// The start of a prompt this extension sent, held rather than emitted, so a test
+// can stand inside the window between an accepted send and its confirmation and
+// drive what else the session does there. Only this extension's own sends are
+// held: a session where nothing else could start a turn would make every question
+// about telling turns apart unanswerable.
+let holdStarts = false;
+const heldStarts = [];
+// How long pi takes to come back with that start. A task by default, which is the
+// shortest the real gap can be. A test widens it to hold the window between an
+// accepted send and its confirmation open for as long as it needs, which is the
+// only way to drive that window on purpose: at a task wide, whether anything else
+// lands inside it is the scheduler's to decide, and a test that depended on it
+// would pass on one machine and fail on the next. Unlike `holdStarts` the
+// confirmation still arrives on its own, so a test can wait for the mark rather
+// than having to release it.
+let startDelay = 0;
 // Pi's follow-up buffer: a message handed to a turn in flight waits here rather
 // than being appended. It is a real queue here and not a counter because
 // `interrupt` empties it back into the editor, which is what pi does.
@@ -103,9 +163,13 @@ const pi = {
     pi.handlers.set(event, handler);
   },
   sendUserMessage(content, options) {
-    if (sendThrows) {
-      refused.push({ content, options: options ?? null });
-      throw new Error("this session took no message");
+    if (sendRejects) {
+      // `prompt()` throws here, before its input gate, and the throw goes nowhere
+      // the extension can see. The call still returns normally, which is the whole
+      // reason a void send cannot be read as an acceptance. Recorded apart from
+      // `sent`, so that `sent` stays what pi took rather than what it was handed.
+      refused.push({ content, options: options ?? null, sameTick });
+      return;
     }
     sent.push({
       content,
@@ -114,9 +178,8 @@ const pi = {
       editorAtSend: editor,
       idleAtSend: idle,
     });
-    // A follow-up is queued, not appended. Recorded in `sent` as well, so a test
-    // can still see that the extension tried to send something.
-    if (options?.deliverAs === "followUp") queued.push(content);
+    prompt(typeof content === "string" ? content : "", "extension",
+           options?.deliverAs, holdStarts);
   },
   // Present so that reaching for either is a recorded failure rather than a
   // TypeError that reads like a harness bug. The wake must never arrive as a
@@ -156,9 +219,52 @@ const ctx = {
   },
 };
 
+/**
+ * One trip through pi's `prompt()`, reduced to the two events an extension can see
+ * and to the order it really sees them in.
+ *
+ * `input` comes first and carries where the prompt came from: "extension" for a
+ * send like the one above, "interactive" for the captain typing. It is emitted
+ * from inside the send call, because `prompt()` calls `emitInput` before it awaits
+ * anything and the runner calls the first handler synchronously.
+ *
+ * `before_agent_start` comes after every one of `prompt()`'s throw paths - model,
+ * auth, streaming, the compaction re-check - and immediately before the run starts,
+ * so it is the first evidence a prompt was accepted. It carries no source, which is
+ * why an extension needs both events and not this one. It is emitted a task later
+ * because that gap is real: the auth check and the compaction re-check between the
+ * two are awaited, and one of them is a round trip.
+ *
+ * A streaming send with a `deliverAs` is queued after the input event and never
+ * reaches a start, which is pi's order too.
+ */
+function prompt(text, source, deliverAs, holdable) {
+  const input = pi.handlers.get("input");
+  if (input) input({ type: "input", text, source, streamingBehavior: deliverAs },
+                   ctx);
+  if (deliverAs) {
+    queued.push(text);
+    return;
+  }
+  if (startRejects) return;
+  // Asked when the start would fire and not when the prompt was made: a test
+  // reaches for the hold after seeing the send, which is already a task late.
+  setTimeout(() => {
+    if (holdable && holdStarts) heldStarts.push(text);
+    else start(text);
+  }, startDelay);
+}
+
+function start(text) {
+  starts.push(text);
+  const handler = pi.handlers.get("before_agent_start");
+  if (handler) handler({ type: "before_agent_start", prompt: text, systemPrompt: "" },
+                       ctx);
+}
+
 function state(extra = {}) {
-  return { pid: process.pid, sent, refused, queued, editor, editorWrites, reads,
-           writes, removed, ...extra };
+  return { pid: process.pid, sent, refused, starts, queued, editor, editorWrites,
+           reads, writes, removed, ...extra };
 }
 
 async function fire(event, payload) {
@@ -211,7 +317,48 @@ async function run(command) {
       renameThrows = command.value;
       return {};
     case "refuse-sends":
-      sendThrows = command.value;
+      // A session that reports idle and refuses the prompt anyway. Manual
+      // compaction is the shape that matters: `isIdle()` is `!_isAgentRunActive`
+      // and `compact()` settles the run before it starts, so the whole of a
+      // `/compact` is a stable window where the gate says yes and the send is
+      // thrown away.
+      sendRejects = command.value;
+      return {};
+    case "refuse-starts":
+      // Refused after the input gate rather than before it. Every throw path in
+      // `prompt()` except the compaction one is this shape, and from the
+      // extension's side it is a send that went in and never came out.
+      startRejects = command.value;
+      return {};
+    case "advance":
+      clockOffset += command.ms;
+      return {};
+    case "delay-starts":
+      // Widen the gap between an accepted send and pi confirming it. Not a sleep
+      // standing in for correctness: what a test waits on is still the mark the
+      // extension writes, and this only decides when that mark can be written.
+      startDelay = command.ms;
+      return {};
+    case "hold-starts":
+      // Stand inside the window between an accepted send and its confirmation.
+      // Releasing emits what was held, in the order pi would have.
+      holdStarts = command.value;
+      if (!holdStarts) {
+        const release = heldStarts.splice(0);
+        for (const text of release) start(text);
+      }
+      return {};
+    case "prompt":
+      // A prompt from somewhere that is not this extension's wake: the captain
+      // typing, or another extension sending. Same two events in the same order,
+      // which is the point - nothing about the shape of a turn says whose it is.
+      prompt(command.text, command.source ?? "interactive");
+      return {};
+    case "agent-start":
+      // A run starting with no input event of its own in front of it. Nothing in
+      // pi does this, and that is why it is here: `before_agent_start` alone must
+      // never be read as an acceptance.
+      start(command.text ?? "");
       return {};
     case "editor":
       editor = command.text;

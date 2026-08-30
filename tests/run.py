@@ -39,8 +39,8 @@ TESTS = os.path.dirname(os.path.abspath(__file__))
 # --script` program resolving its dependencies from the network the first time
 # anything reaches for them. A watchdog under that turns one slow-but-passing test
 # into a red run, and `exit=True` means `_exit`, so it would take every `addCleanup`
-# with it and strand the children they remove. Eight minutes leaves seven of CI's
-# fifteen-minute guard, so the stack always beats the kill.
+# with it and strand the children they remove. Eight minutes is well inside CI's own
+# guard, so the stack always beats the kill.
 STALL_S = 480
 
 # The suite's size, for the progress line. Set by the runner below, which is the

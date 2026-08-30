@@ -26,7 +26,7 @@ this file is how you drive it. The first thing a run of it executes is the suite
 
     just test
 
-Six or seven minutes. It drives the pure mechanics in-process and drives the
+Fifteen to twenty minutes. It drives the pure mechanics in-process and drives the
 commands as real processes against a real `tasks` and `datafile`, because a stubbed
 store would only ever agree with the suite.
 

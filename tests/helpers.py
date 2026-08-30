@@ -107,7 +107,7 @@ class HomeTest(unittest.TestCase):
         out = self.run_cmd(["tasks", "init"], cwd=self.home)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
-    def distro_path(self, *first):
+    def distro_path(self, *first, without=()):
         """A PATH on which this checkout's `bin/` is the only SIANA there is.
 
         `run_bin` reaches a command by the path this suite already knows, so most
@@ -124,9 +124,21 @@ class HomeTest(unittest.TestCase):
         until CI found it. A directory holding one is mirrored without it rather
         than dropped: `~/.local/bin` holds `tasks` too, and losing that would fail
         the suite on a store it needs instead of on the SIANA it is hiding.
+
+        `without` names further commands to hide the same way, for a test whose
+        scenario is that one of them is not installed on this machine at all. See
+        `path_with_no_forge_client` for why hiding by name rather than by directory
+        is the only version of that which holds off this machine.
         """
-        owned = {n for n in os.listdir(BIN)
-                 if os.path.isfile(os.path.join(BIN, n))}
+        hidden = {n for n in os.listdir(BIN)
+                  if os.path.isfile(os.path.join(BIN, n))}
+        hidden.update(without)
+        # A fresh root per call. Two PATHs built in one test hide different names,
+        # and a mirror keyed by the entry's position alone would be reused across
+        # both - handing the second one whatever the first had left out.
+        # `test_repair.TwoPathsFromOneTest` is that test, and it is the only thing
+        # that fails if this goes back to a key the two calls share.
+        root = tempfile.mkdtemp(prefix="path-", dir=self.home)
         out = []
         for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
             try:
@@ -136,14 +148,14 @@ class HomeTest(unittest.TestCase):
                 # it is passed through rather than made this fixture's problem.
                 out.append(d)
                 continue
-            if not owned.intersection(entries):
+            if not hidden.intersection(entries):
                 out.append(d)
                 continue
-            mirror = self.at(f"path-{i}")
+            mirror = os.path.join(root, str(i))
             os.makedirs(mirror, exist_ok=True)
             for entry in entries:
                 link = os.path.join(mirror, entry)
-                if entry not in owned and not os.path.lexists(link):
+                if entry not in hidden and not os.path.lexists(link):
                     os.symlink(os.path.join(d, entry), link)
             out.append(mirror)
         return os.pathsep.join([*first, BIN, *out])
@@ -172,6 +184,29 @@ class HomeTest(unittest.TestCase):
                     os.symlink(os.path.join(d, entry), link)
             out.append(mirror)
         return os.pathsep.join(out)
+
+    def path_with_no_forge_client(self, *first):
+        """A PATH on which neither forge client can be found, wherever this machine
+        keeps one.
+
+        A test that hides a command by naming the directories it believes are clean
+        is asserting this machine's package layout instead of building the world it
+        claims. Three tests here passed `PATH=/usr/bin:/bin` to mean "no `gh`". A
+        GitHub Actions runner installs `gh` in `/usr/bin`, so what they exercised
+        was the real client with no `GH_TOKEN`, and its login error read as the
+        refusal they were looking for on the machine that wrote them and as a
+        different refusal on the one that ran them (Actions run 33301560920).
+
+        Hiding by name leaves that nowhere to happen: every entry of the real PATH
+        is still reachable, so `git`, `env` and `python3` answer as they always
+        did, and the two names do not answer from anywhere.
+
+        The names come from `siana-publish`, which is the command that shells out
+        to them, so a third forge added there is hidden here without anyone having
+        to remember this.
+        """
+        clients = {argv[0] for argv, _ in script("siana-publish").REQUESTS.values()}
+        return self.distro_path(*first, without=sorted(clients))
 
     def command_env(self, extra=None):
         """The environment a command under test runs in.

@@ -15,10 +15,14 @@ import unittest
 
 from helpers import HomeTest, script
 
-# The branch reader, through one of the five commands that carry it.
-# `tests/test_ship_branch.py::OneReader` compares the five copies as
-# text, so what this one answers is what all five answer.
+# The branch reader, through one of the commands that carry it.
+# `tests/test_ship_branch.py::OneReader` compares the copies as
+# text, so what this one answers is what all of them answer.
 d = script("siana-dispatch")
+
+# The repair record, through the command that reads it back at publication. What
+# `siana-brief` writes is only worth what that reader answers about it.
+publish = script("siana-publish")
 
 
 class Brief(HomeTest):
@@ -472,6 +476,296 @@ class QaPairing(Brief):
         self.assertAccepted(self.brief(tid, "--ship", "--type", "feat"))
         qa_id = [i for i in self.ids() if i != tid][0]
         self.assertIn('pytest -k "a: b"', self.record(qa_id)["verify"])
+
+
+class Repairs(Brief):
+    """A ship task that repairs work already published.
+
+    The record it writes is the whole of what keeps a second merge request from being
+    opened for one piece of work, and nothing downstream infers it: a fix is cut from
+    the branch it repairs, so ancestry, a title and a commit message all describe an
+    ordinary fix exactly as well as they describe a repair.
+    """
+
+    def published(self, title="Ship the thing", type_="feat", qa=None):
+        """Work that has been briefed and shipped, as a repair target."""
+        self.project("proj", **({"qa": qa} if qa else {}))
+        target = self.add(title)
+        self.assertAccepted(self.brief(target, "--ship", "--type", type_))
+        return target, f"siana/{type_}/{target}"
+
+    def repair(self, target, base, title="Repair the thing", type_="fix"):
+        tid = self.add(title, base=base)
+        return tid, self.brief(tid, "--ship", "--type", type_, "--repairs", target)
+
+    def test_a_repair_records_its_own_branch_and_the_one_it_lands_on(self):
+        target, branch = self.published()
+        tid, out = self.repair(target, branch)
+        said = self.assertAccepted(out)
+        text = self.brief_text(tid)
+        # Its own branch, unchanged: the minion and its QA stay isolated on it.
+        self.assertIn(f"    branch  siana/fix/{tid}", text)
+        self.assertIn(f"    repairs {target} {branch}", text)
+        self.assertEqual(d.ship_branch(self.home, tid), f"siana/fix/{tid}")
+        self.assertIn(f"repairs {target}", said)
+
+    def test_the_record_is_what_publication_reads(self):
+        target, branch = self.published()
+        tid, out = self.repair(target, branch)
+        self.assertAccepted(out)
+        self.assertEqual(publish.repair_record(self.home, tid), (target, branch))
+        self.assertEqual(publish.publication_branch(self.home, tid), branch)
+
+    def test_ordinary_ship_work_records_no_repair_at_all(self):
+        # The compatibility that matters most: everything not briefed this way keeps
+        # opening a merge request of its own.
+        target, branch = self.published()
+        self.assertIsNone(publish.repair_record(self.home, target))
+        self.assertEqual(publish.publication_branch(self.home, target), branch)
+
+    def test_a_repair_of_a_repair_lands_where_the_first_one_did(self):
+        # The chain is resolved here, while the briefs are in front of us, so
+        # publication has one branch to advance however many repairs deep this is.
+        target, branch = self.published()
+        first, out = self.repair(target, branch)
+        self.assertAccepted(out)
+        second = self.add("Repair it again", base=f"siana/fix/{first}")
+        self.assertAccepted(self.brief(second, "--ship", "--type", "fix",
+                                       "--repairs", first))
+        self.assertEqual(publish.repair_record(self.home, second), (first, branch))
+
+    def test_a_repair_keeps_a_qa_task_of_its_own_on_its_own_branch(self):
+        # The isolation the record does not change: a repair is judged by a second
+        # minion before anything of it reaches the request it repairs.
+        target, branch = self.published(qa="just qa")
+        tid, out = self.repair(target, branch)
+        self.assertAccepted(out)
+        self.assertEqual(self.record(f"qa-{tid}")["base"], f"siana/fix/{tid}")
+
+    def test_scout_work_is_refused_a_repair(self):
+        self.project("proj")
+        tid = self.add("Learn a thing")
+        self.assertRefused(self.brief(tid, "--scout", "--repairs", "something"),
+                           "--repairs is for ship work")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_repair_briefed_as_anything_but_a_fix_is_refused(self):
+        # The branch it lands on already carries whatever the work it repairs is,
+        # and a commit type that disagrees with its branch is what the naming
+        # convention exists to remove.
+        target, branch = self.published()
+        for type_ in ("feat", "chore", "refactor"):
+            with self.subTest(type=type_):
+                tid, out = self.repair(target, branch, title=f"Repair by {type_}",
+                                       type_=type_)
+                self.assertRefused(out, "repairs are briefed --type fix")
+                self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_repair_of_a_task_the_queue_does_not_have(self):
+        self.project("proj")
+        tid = self.add("Repair the thing", base="siana/feat/ghost")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "fix",
+                                      "--repairs", "ghost"),
+                           "no such task to repair: ghost")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_repair_of_a_task_that_was_never_briefed(self):
+        # Its brief is where the branch its work was published from is recorded, and
+        # the fallback for a task without one is a name only legacy work carries.
+        self.project("proj")
+        target = self.add("Ship the thing")
+        tid = self.add("Repair the thing", base=f"siana/{target}")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "fix",
+                                      "--repairs", target), "no brief at")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_base_that_is_not_the_branch_it_repairs(self):
+        # A minion cut from anywhere else starts without the commits it is meant to
+        # be fixing, and its accepted head would not be a fast-forward of the branch
+        # this records - which publication refuses, after the work is done.
+        target, branch = self.published()
+        tid, out = self.repair(target, "main")
+        self.assertRefused(out, "was cut from main", f"built {branch}")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_repair_queued_with_no_base_at_all(self):
+        target, branch = self.published()
+        tid = self.add("Repair the thing")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "fix",
+                                      "--repairs", target), "was cut from nothing")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_task_cannot_repair_itself(self):
+        self.project("proj")
+        tid = self.add("Repair the thing")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "fix",
+                                      "--repairs", tid), "cannot repair itself")
+
+    def test_two_repair_targets_are_refused(self):
+        self.project("proj")
+        tid = self.add("Repair the thing")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "fix",
+                                      "--repairs", "a", "--repairs", "b"),
+                           "one repair target at a time")
+
+    def test_a_repair_target_with_no_value_is_refused(self):
+        self.project("proj")
+        tid = self.add("Repair the thing")
+        self.assertRefused(self.brief(tid, "--ship", "--type", "fix", "--repairs"),
+                           "--repairs needs the ship task")
+
+    def test_an_empty_repair_target_is_refused_and_never_silently_dropped(self):
+        """The one answer this flag may never give is silence.
+
+        An empty string is falsy to every `[ -n "$repairs" ]` guard, so it once
+        walked past the --type check, the self-reference check and the resolution,
+        and wrote a brief with the record deleted. SIANA states the repair, the brief
+        records nothing, and the second merge request arrives on the captain's forge
+        rather than as an error here."""
+        target, branch = self.published()
+        for argv in (("--repairs", ""), ("--repairs=",)):
+            with self.subTest(argv=argv):
+                tid = self.add(f"Repair by {len(argv)}", base=branch)
+                out = self.brief(tid, "--ship", "--type", "fix", *argv)
+                self.assertRefused(out, "--repairs was given an empty name")
+                self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_repair_of_work_in_another_project_is_refused(self):
+        # A merge request lives in one repository and on one forge. Publication looks
+        # in this project's repository and asks this project's forge, so a branch
+        # recorded from another one refuses only after the fix has been accepted.
+        self.project("alpha")
+        self.project("beta")
+        target = self.add("Ship the thing", project="alpha")
+        self.assertAccepted(self.brief(target, "--ship", "--type", "feat"))
+        tid = self.add("Repair the thing", project="beta",
+                       base=f"siana/feat/{target}")
+        out = self.brief(tid, "--ship", "--type", "fix", "--repairs", target)
+        self.assertRefused(out, "is in beta", "is in alpha")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_repair_of_scout_or_qa_work_is_refused(self):
+        """Neither lands anything, so no merge request was ever opened from either.
+
+        The branch reader answers `siana/<task-id>` for a brief with no ship section,
+        which is its legacy fallback and right for the question it is usually asked.
+        Here it would record a scout's own branch as the branch an accepted repair
+        gets published on, and the refusal would arrive from publication after the
+        repair had been built and independently accepted."""
+        self.project("proj", qa="just qa")
+        scout = self.add("Learn the thing")
+        self.assertAccepted(self.brief(scout, "--scout"))
+        shipped = self.add("Ship with qa")
+        self.assertAccepted(self.brief(shipped, "--ship", "--type", "feat"))
+
+        for wrong in (scout, f"qa-{shipped}"):
+            with self.subTest(target=wrong):
+                before = self.ids()
+                tid = self.add(f"Repair {wrong}", base=f"siana/{wrong}")
+                out = self.brief(tid, "--ship", "--type", "fix", "--repairs", wrong)
+                self.assertRefused(out, f"{wrong} is not ship work")
+                self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+                # Nothing half-made: the repair's own QA pair is queued after this
+                # point, and one of these once reached it before anything refused.
+                self.assertEqual(self.ids(), before + [tid])
+
+    def test_work_briefed_before_commit_types_is_still_repairable(self):
+        # A legacy ship brief has the delivery heading and no branch line under it.
+        # The kind check reads the heading, so it must not refuse this as scout work.
+        self.project("proj")
+        target = self.add("Ship the thing")
+        os.makedirs(self.at("briefs"), exist_ok=True)
+        with open(self.at("briefs", f"{target}.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\nYour branch is the "
+                     "deliverable.\n")
+        tid = self.add("Repair the thing", base=f"siana/{target}")
+        self.assertAccepted(self.brief(tid, "--ship", "--type", "fix",
+                                       "--repairs", target))
+        self.assertEqual(publish.repair_record(self.home, tid),
+                         (target, f"siana/{target}"))
+
+    def test_a_chain_is_one_hop_however_it_was_written(self):
+        """Resolution reads the record on the repaired brief and stops there.
+
+        A cycle cannot be built through this command - each link needs the brief of
+        the task it names, so the second of two mutual repairs cannot be briefed
+        before the first - and a hand-edited one still terminates, because nothing
+        here follows a record more than once."""
+        target, branch = self.published()
+        first, out = self.repair(target, branch)
+        self.assertAccepted(out)
+        second = self.add("Repair it again", base=f"siana/fix/{first}")
+        self.assertAccepted(self.brief(second, "--ship", "--type", "fix",
+                                       "--repairs", first))
+        # Hand-written back-reference: the first brief now points at the second.
+        path = self.at("briefs", f"{first}.md")
+        with open(path) as fh:
+            text = fh.read()
+        with open(path, "w") as fh:
+            fh.write(text.replace(f"    repairs {target} {branch}",
+                                  f"    repairs {second} siana/fix/{second}"))
+        self.assertEqual(publish.publication_branch(self.home, first),
+                         f"siana/fix/{second}")
+        self.assertEqual(publish.publication_branch(self.home, second), branch)
+
+    def test_the_joined_spelling_is_accepted_too(self):
+        target, branch = self.published()
+        tid = self.add("Repair the thing", base=branch)
+        self.assertAccepted(self.brief(tid, "--ship", "--type", "fix",
+                                       f"--repairs={target}"))
+        self.assertEqual(publish.repair_record(self.home, tid), (target, branch))
+
+    def test_a_template_that_does_not_keep_the_record_is_refused(self):
+        """The captain's copy of this template is theirs to evolve, and `just init`
+        keeps a diverged one on purpose. One that has lost the marker writes a brief
+        publication reads as ordinary ship work - which opens the second merge
+        request this whole record exists to prevent, on the captain's forge rather
+        than here."""
+        target, branch = self.published(qa="just qa")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\n    branch  {SHIP_BRANCH}\n")
+        before = self.ids()
+        tid = self.add("Repair the thing", base=branch)
+        out = self.brief(tid, "--ship", "--type", "fix", "--repairs", target)
+        self.assertRefused(out, "does not record this repair where publication looks")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+        self.assertEqual(self.ids(), before + [tid])
+
+    def test_a_template_recording_it_twice_is_refused(self):
+        # Which of two records an accepted repair lands on is not a thing a script
+        # may choose between, and `siana-publish` refuses a brief it cannot read one
+        # out of.
+        target, branch = self.published()
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\n    branch  {SHIP_BRANCH}\n"
+                     "{REPAIR}\n{REPAIR}\n")
+        tid = self.add("Repair the thing", base=branch)
+        out = self.brief(tid, "--ship", "--type", "fix", "--repairs", target)
+        self.assertRefused(out, "does not record this repair where publication looks")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_the_marker_under_another_heading_is_refused(self):
+        # The readers only look inside `## Delivery: ship`, so a template keeping the
+        # marker but moving it elsewhere writes prose no command reads.
+        target, branch = self.published()
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\n    branch  {SHIP_BRANCH}\n"
+                     "\n## What this repairs\n\n{REPAIR}\n")
+        tid = self.add("Repair the thing", base=branch)
+        out = self.brief(tid, "--ship", "--type", "fix", "--repairs", target)
+        self.assertRefused(out, "under no other heading")
+        self.assertFalse(os.path.exists(self.at("briefs", f"{tid}.md")))
+
+    def test_a_template_written_before_repairs_existed_still_briefs_ship_work(self):
+        # Nothing already in flight is migrated to keep working: a template with no
+        # marker at all is only refused for the one thing it cannot record.
+        self.project("proj")
+        with open(self.at("brief-ship.md"), "w") as fh:
+            fh.write("# Brief\n\n## Delivery: ship\n\n    branch  {SHIP_BRANCH}\n")
+        tid = self.add("Ship the thing")
+        self.assertAccepted(self.brief(tid, "--ship", "--type", "feat"))
+        self.assertEqual(d.ship_branch(self.home, tid), f"siana/feat/{tid}")
+        self.assertIsNone(publish.repair_record(self.home, tid))
 
 
 if __name__ == "__main__":

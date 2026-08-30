@@ -230,6 +230,46 @@ class Doctor(Recipe):
         self.assertNotEqual(out.returncode, 0, out.stdout)
         self.assertIn("missing .pi/settings.json", out.stdout)
 
+    @unittest.skipUnless(has("pi") and has("tasks"),
+                         "the queue package is reported for pi only")
+    def test_a_home_carrying_two_queue_packages_is_not_called_complete(self):
+        # The one state this report used to miss entirely. Pi loads the first and
+        # skips the rest, saying so at startup and nowhere else, so a home read its
+        # queue skill from a package the captain had stopped configuring while
+        # doctor called it complete. Nothing is repaired here - `init` owns the
+        # list - so what has to hold is that the state is sayable.
+        self.assertEqual(self.just("init").returncode, 0)
+        checkout = self.package("checkout", "pi-agent-tasks")
+        # Installed rather than written into the settings by hand, because
+        # appending beside what is already there is how this really arose.
+        add = subprocess.run(["pi", "install", "-l", "-a", checkout],
+                             cwd=self.home, text=True, capture_output=True,
+                             timeout=60)
+        self.assertEqual(add.returncode, 0, add.stdout + add.stderr)
+        doctor = self.just("doctor")
+        self.assertIn("configures 2 queue packages", doctor.stderr)
+        # Both named, because "there are two" without saying which leaves the
+        # captain opening the settings file to find out what to do.
+        self.assertIn(checkout, doctor.stderr)
+        self.assertIn(self.at("pi-agent-tasks"), doctor.stderr)
+        self.assertIn("just init", doctor.stderr)
+
+    @unittest.skipUnless(has("pi") and has("tasks"),
+                         "the queue package is reported for pi only")
+    def test_a_settings_file_that_cannot_be_read_is_said_so_and_not_counted_as_none(self):
+        # Doctor reports and never repairs, so the one thing it must not do is
+        # report the same "no queue package" it would for an empty list: that
+        # sends the captain to `init`, which refuses this file rather than
+        # rewriting it.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json"), "w") as fh:
+            fh.write("{ not json\n")
+        doctor = self.just("doctor")
+        self.assertIn("cannot be read as pi's settings", doctor.stderr)
+        self.assertIn("Expecting property name", doctor.stderr)
+        self.assertNotIn("Traceback", doctor.stderr)
+        self.assertNotIn("missing a queue package", doctor.stdout)
+
     @unittest.skipUnless(has("pi"), "the wake extension is reported for pi only")
     def test_a_pi_home_without_the_wake_extension_is_named_as_missing(self):
         # The watcher refuses to start without it, so a home missing it is one where
@@ -311,7 +351,8 @@ class Init(Recipe):
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
                   "siana-owe", "siana-retire", "siana-close-workspace",
                   "siana-handoff", "siana-publish", "siana-reap", "siana-pipeline",
-                  "siana-afk", "siana-gate", "siana-clean", "siana-report"):
+                  "siana-afk", "siana-gate", "siana-read", "siana-clean",
+                  "siana-report"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this
@@ -608,6 +649,45 @@ class Init(Recipe):
             with open(self.at(".pi", "settings.json")) as fh:
                 self.assertIn("own-package", fh.read())
             self.assertFalse(os.path.exists(self.at("pi-agent-tasks")))
+
+    def test_changing_which_pi_package_is_configured_leaves_only_the_new_one(self):
+        # `pi install` only appends, so this used to leave both, and pi resolved
+        # the skill collision first-wins - which meant the package the captain had
+        # just stopped configuring was the one SIANA read its queue skill from. It
+        # showed as a startup warning and nowhere else: `doctor` does not read the
+        # packages list, so the home reported complete.
+        checkout = self.package("checkout", "pi-agent-tasks")
+        first = self.just("init", pi_package=checkout)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        again = self.just("init")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        with open(self.at(".pi", "settings.json")) as fh:
+            packages = json.load(fh)["packages"]
+        # Resolved rather than compared as written: pi records the source relative
+        # to `.pi/`, and what has to hold is which directory it lands on.
+        landed = [os.path.realpath(os.path.join(self.at(".pi"), p))
+                  for p in packages]
+        # The distro's own package is configured here too and is not a queue
+        # package, so what has to hold is that the queue skill still has exactly one
+        # source. Named rather than filtered out, so an init that stopped installing
+        # pi-siana fails here rather than passing quietly.
+        self.assertEqual(landed, [os.path.realpath(self.at("pi-agent-tasks")),
+                                  os.path.realpath(
+                                      os.path.join(DISTRO, "template", "pi-siana"))],
+                         f"init left {packages} behind")
+
+    def test_a_settings_file_that_cannot_be_read_is_refused_and_never_read_as_empty(self):
+        # Read as empty, init would append beside whatever is in there and rebuild
+        # the collision the removal above exists to prevent. Refused with the one
+        # line json gives for why, because a traceback is what every other read in
+        # this recipe is written to keep off the captain's screen.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json"), "w") as fh:
+            fh.write("{ not json\n")
+        out = self.assertRefused(self.just("init"), "is not readable as pi's settings",
+                                 "repair or delete it")
+        self.assertIn("Expecting property name", out)
+        self.assertNotIn("Traceback", out)
 
     def test_a_configured_pi_package_that_is_absent_is_refused(self):
         # Never a fallback: generating a different package behind the captain's

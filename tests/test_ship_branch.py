@@ -2,14 +2,18 @@
 
 A ship task's branch carries the Conventional Commit type SIANA stated when it
 briefed the work. Nothing infers that type afterwards, so the brief is the fleet's
-only record of it, and five commands read that one line: dispatch to make the
+only record of it, and six commands read that one line: dispatch to make the
 worktree, the pipeline to know which branch it is validating, publish to tell a QA
-verdict from a ship task, retire to find the tree, reap to know what is live.
+verdict from a ship task, retire to find the tree, reap to know what is live, and
+brief itself to say where a repair of that work will land.
 
 Two things are defended here. That the reader answers correctly - including for work
 briefed before this convention, which must stay dispatchable without being migrated.
-And that the five copies of it have not drifted apart, because a reader that
-disagreed with its callers would put a second minion on a branch nobody named.
+And that the copies of it have not drifted apart, because a reader that disagreed
+with its callers would put a second minion on a branch nobody named. `siana-brief`
+carries its copy inside a python heredoc, and it is the writer: one that read a brief
+differently from the command reading it back would record a repair against a branch
+nobody publishes.
 """
 
 import os
@@ -24,7 +28,12 @@ d = script("siana-dispatch")
 # discovered: a new one that forgot to read the brief is exactly what this cannot
 # see, and naming them is how the next agent finds out the set exists.
 READERS = ("siana-dispatch", "siana-pipeline", "siana-publish", "siana-retire",
-           "siana-reap")
+           "siana-reap", "siana-brief")
+
+# The two commands either side of a repair record: `siana-brief` writes it and
+# `siana-publish` reads it back at publication. Their copy of the reader for it is
+# compared the same way and for the same reason.
+REPAIR_READERS = ("siana-brief", "siana-publish")
 
 SHIP = """# Brief
 
@@ -71,16 +80,25 @@ def reader_source(name):
     """The shared reader as it stands in one command, from its first constant to the
     end of `ship_branch`. Taken as text because these are commands rather than a
     package: there is nowhere for one copy to live, so the copies are compared."""
+    return between(name, "# The one line in a ship brief", "def ship_branch")
+
+
+def repair_source(name):
+    """The same, for the record that says where a repair lands."""
+    return between(name, "# The second line a repair's ship brief records",
+                   "def publication_branch")
+
+
+def between(name, first, last):
     with open(os.path.join(BIN, name)) as fh:
         text = fh.read()
-    start = text.index("# The one line in a ship brief")
-    end = text.index("\n\n\n", text.index("def ship_branch", start))
-    return text[start:end]
+    start = text.index(first)
+    return text[start:text.index("\n\n\n", text.index(last, start))]
 
 
 class OneReader(unittest.TestCase):
     """`fold` is duplicated across these commands for the same reason, and nothing
-    was comparing the copies. A rule that lives in five files drifts in one of
+    was comparing the copies. A rule that lives in six files drifts in one of
     them first."""
 
     def test_every_command_reads_a_branch_the_same_way(self):
@@ -90,16 +108,31 @@ class OneReader(unittest.TestCase):
                              f"{name}'s copy of ship_branch has drifted from "
                              f"{READERS[0]}'s; they answer the same question")
 
+    def test_the_writer_and_the_reader_of_a_repair_record_agree(self):
+        # `siana-brief` writes the record and `siana-publish` acts on it. A writer
+        # that read a repair target's brief differently would record a repair
+        # against a branch publication does not answer, and the first thing to
+        # notice would be a second merge request on the captain's forge.
+        first = repair_source(REPAIR_READERS[0])
+        for name in REPAIR_READERS[1:]:
+            self.assertEqual(repair_source(name), first,
+                             f"{name}'s copy of repair_record has drifted from "
+                             f"{REPAIR_READERS[0]}'s")
+
+    def test_the_repair_reader_is_not_matched_by_something_trivial(self):
+        self.assertIn("def repair_record", repair_source(REPAIR_READERS[0]))
+        self.assertIn("REPAIR_LINE", repair_source(REPAIR_READERS[0]))
+
     def test_the_reader_is_not_matched_by_something_trivial(self):
         # A parser that found an empty string would pass the comparison above
-        # forever, saying nothing about any of the five.
+        # forever, saying nothing about any of the copies.
         self.assertIn("def ship_branch", reader_source(READERS[0]))
         self.assertIn("BRANCH_LINE", reader_source(READERS[0]))
 
 
 class ShipBranch(HomeTest):
     """Read through `siana-dispatch`'s copy. The comparison above is what makes one
-    copy answer for all five."""
+    copy answer for all of them."""
 
     def brief(self, task_id, text):
         os.makedirs(self.at("briefs"), exist_ok=True)

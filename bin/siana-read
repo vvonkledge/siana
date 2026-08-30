@@ -1,0 +1,793 @@
+#!/usr/bin/env python3
+"""Expose fleet state as JSON, so something other than a terminal can read it.
+
+Everything the captain can see about the fleet today is rendered for a terminal:
+`tasks`, `siana-owe` and `just doctor` all print for a human at a keyboard. A
+console on a phone needs the same facts as data, and the one thing it must never
+do is invent them. So this is the read half, and only the read half: no HTTP, no
+listener, no browser, no write path, and nothing here decides anything about the
+fleet.
+
+    siana-read tasks       [--fields a,b,c] [--status S] [--limit N]
+    siana-read projects
+    siana-read obligations [--closed]
+    siana-read decisions   [--since ISO]
+    siana-read fleet
+    siana-read health
+
+**The stores are read through `datafile`, never around it.** The fold that turns
+an append-only log into live records - last write wins, tombstones removed,
+contract defaults materialised, all of it under the store's own lock - belongs to
+`datafile` and is not reproduced here. Neither is TOON: `list --json` is a public
+output mode on that command, and it is the whole boundary. A hand-rolled fold or a
+hand-written TOON parser would be a second implementation of the store's contract,
+free to drift from it in exactly the cases that matter least often and cost most.
+
+Three refusals hold this, all of them the same shape: **never answer a question
+this could not read.**
+
+  - A store that cannot be read is a stop, not an empty store. Returning `[]` for
+    an unreadable `obligations.jsonl` would tell the captain SIANA owes them
+    nothing, which is the one wrong answer that store must never give.
+  - Herdr being unreachable is a fact about herdr and not an answer about any
+    pane. `fleet` says `unknown` and exits nonzero, so a console renders "minion
+    health unknown" and never "no minions".
+  - `bad_lines` is never hidden. An unreadable record in the captain's queue is a
+    fact to show, and a store `datafile` can still read is a success with its
+    corruption attached, never a refusal.
+
+Every command writes exactly one JSON document to stdout, whether it succeeded or
+refused, so a consumer parses one thing and reads the exit code for the verdict:
+
+    0   the document answers the question
+    1   the source could not be read, or could not be trusted; `error` says which
+    2   the request itself was wrong: an unknown field, an unparseable timestamp
+
+**This is not literally read-only on disk, and saying otherwise would be a lie the
+security model later rests on.** A `datafile` read may rewrite the store's `.idx`
+cache beside it. That write is atomic, it is a cache, and `siana` already causes
+one every session. What holds is narrower and is what matters: nothing here
+changes an authoritative record, and nothing here invokes an operation that could.
+"""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+
+OK, REFUSED, USAGE = 0, 1, 2
+
+# What `datafile list --json` must have said for its answer to be usable. Checked
+# rather than assumed: a reply missing one of these is a boundary that has changed
+# shape, and reading it half-way would publish whichever half survived.
+ENVELOPE = ("revision", "records", "bad_lines")
+
+# Asking for everything, because the filters below run on the records themselves.
+# `datafile list` defaults to 100, and inheriting that default would mean filtering
+# the first hundred records and calling the result the answer - a silent cap, and
+# the one this whole command exists not to have. Its `--limit` clips the fold, so
+# the caller's own `--limit` is applied here afterwards instead.
+ALL = str(sys.maxsize)
+
+# Long enough that a slow disk is not mistaken for a broken store, short enough
+# that a console asking for the queue never hangs on it.
+STORE_TIMEOUT_S = 120.0
+WATCH_TIMEOUT_S = 60.0
+
+
+class Refusal(SystemExit):
+    """A refusal that is still a document.
+
+    The caller is a program, so a refusal has to be readable the same way an answer
+    is: one JSON object on stdout, and the exit code for whether it answered. The
+    shape mirrors `datafile`'s own refusals - `error`, `code`, `help` - so a console
+    never has to learn two ways of being told no.
+    """
+
+    def __init__(self, source, message, code, help_lines=(), status=REFUSED, **extra):
+        self.doc = {"source": source, "error": message, "code": code}
+        if help_lines:
+            self.doc["help"] = list(help_lines)
+        self.doc.update(extra)
+        super().__init__(status)
+
+    def __str__(self):
+        return self.doc["error"]
+
+
+def emit(doc):
+    """The one document this command writes. Indented because a captain reads this
+    by hand too, and JSON does not care."""
+    json.dump(doc, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def stamp():
+    """The clock, in the format `siana-watch` records one in. A live reading is only
+    worth what its age says, so nothing here answers about a process or a server
+    without saying when it asked."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def home_dir():
+    return os.environ.get("SIANA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".siana")
+
+
+# ----------------------------------------------------------------- the stores
+
+def datafile_json(source, argv, store):
+    """One `datafile` call, and its answer parsed or refused.
+
+    Nothing between the two: a nonzero exit, a reply that is not JSON, and a reply
+    missing an envelope key are all the same failure - the store did not answer -
+    and all three have to reach the caller as a refusal rather than as an answer
+    with pieces missing.
+    """
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=STORE_TIMEOUT_S)
+    except FileNotFoundError:
+        raise Refusal(source, "datafile is not on PATH", "NO_DATAFILE",
+                      ["every store here is read through it; install `datafile` "
+                       "and run `just init` in the distro"])
+    except subprocess.TimeoutExpired:
+        raise Refusal(source, f"datafile did not answer for {store} within "
+                              f"{int(STORE_TIMEOUT_S)}s", "TIMEOUT",
+                      ["the store may be held by a writer that stopped; check for "
+                       "a stale lock beside it"])
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Refusal(source, f"datafile could not be run for {store}: {e}",
+                      "NO_DATAFILE")
+
+    # `list --json` refuses in JSON too, so its own words about what is wrong with
+    # the store are relayed rather than replaced by a summary of them. Its exit code
+    # travels with them: 2 is a request this command built wrongly, and flattening
+    # that into 1 would tell a console the store is unreadable when the store is
+    # fine.
+    if out.returncode != 0:
+        try:
+            said = json.loads(out.stdout)
+        except ValueError:
+            said = None
+        if isinstance(said, dict) and "error" in said:
+            raise Refusal(source, said["error"],
+                          said.get("code", "DATAFILE_ERROR"),
+                          said.get("help", ()),
+                          status=USAGE if out.returncode == USAGE else REFUSED,
+                          store=store)
+        raise Refusal(source,
+                      f"datafile exited {out.returncode} reading {store}: "
+                      f"{(out.stderr or out.stdout).strip()[:400]}",
+                      "DATAFILE_ERROR", store=store)
+
+    try:
+        doc = json.loads(out.stdout)
+    except ValueError as e:
+        raise Refusal(source, f"datafile did not answer {store} with JSON: {e}",
+                      "BAD_JSON", store=store)
+    if not isinstance(doc, dict) or any(k not in doc for k in ENVELOPE):
+        raise Refusal(source,
+                      f"datafile's answer for {store} is missing "
+                      f"{[k for k in ENVELOPE if not isinstance(doc, dict) or k not in doc]}",
+                      "BAD_ENVELOPE",
+                      ["`datafile list --json` has changed shape; this adapter "
+                       "reads revision, records and bad_lines"],
+                      store=store)
+    return doc
+
+
+def store_paths(source, home):
+    """Where a store lives, and the contract beside it.
+
+    `tasks` is the one that moves. `SIANA_TASKS_FILE` is how a minion is pointed at
+    the fleet queue from outside the home, and `siana-dispatch:529` exports it into
+    every minion's environment - so every other command in `bin/` resolves the queue
+    through it, and one that did not would answer about a different file than the
+    rest of the fleet. The quiet shape is the dangerous one: an initialised home
+    always has `schema-tasks.yaml`, so the contract check below would pass, and a
+    home whose own `tasks.jsonl` happens not to exist would answer a full queue with
+    an empty one.
+
+    The contract is looked for beside the store and named after it, which is
+    `datafile`'s own first rule (`find_contract`, `datafile.py:807-819`) and what
+    both `just init` and `tasks init` write. A store somewhere else therefore
+    carries its own contract, rather than being read against the home's.
+    """
+    if source == "tasks":
+        path = (os.environ.get("SIANA_TASKS_FILE")
+                or os.path.join(home, "tasks.jsonl"))
+    else:
+        path = os.path.join(home, f"{source}.jsonl")
+    path = os.path.abspath(os.path.expanduser(path))
+    stem = os.path.basename(path)
+    stem = stem[:-len(".jsonl")] if stem.endswith(".jsonl") else stem
+    return path, os.path.join(os.path.dirname(path), f"schema-{stem}.yaml")
+
+
+def read_store(source, home, fields=None):
+    """A store's live records, from `datafile` and from nowhere else.
+
+    `fields` is passed on rather than applied here so the projection is the store's
+    own: it validates the names against the contract, which is the check that turns
+    a typo into a refusal instead of into a column of nulls.
+    """
+    store, schema = store_paths(source, home)
+    # The contract, and not the log. A missing log is a store nothing has written
+    # to yet; a missing contract is a directory that is not a SIANA home, and
+    # answering that with an empty list is how a mistyped `$SIANA_HOME` would read
+    # as a fleet with no work, no projects and nothing owed.
+    if not os.path.isfile(schema):
+        raise Refusal(source, f"no contract for {source} at {schema}", "NO_CONTRACT",
+                      [f"{os.path.dirname(schema)} is not an initialised SIANA "
+                       f"home, or this store predates its contract",
+                       "run `just init` in the distro against that home"],
+                      store=store)
+    argv = ["datafile", "-f", store, "-c", schema, "list", "--json", "--limit", ALL]
+    if fields:
+        argv += ["--fields", ",".join(fields)]
+    return datafile_json(source, argv, store)
+
+
+def store_answer(source, doc, records, total, filters, limit=None):
+    """One store's answer, in the shape every store answers in.
+
+    `total` and `matched` are here because an empty `records` has two meanings and
+    a console has to be able to tell them apart: a fleet with nothing in it, and a
+    filter that matched nothing in a fleet that is full. `matched` above
+    `len(records)` says the caller's own `--limit` clipped the answer, so a cap is
+    never silent either.
+    """
+    answer = {"source": source, "revision": doc["revision"], "filter": filters,
+              "total": total, "matched": len(records)}
+    if limit is not None and limit < len(records):
+        records = records[:limit]
+    answer["records"] = records
+    answer["bad_lines"] = doc["bad_lines"]
+    return answer
+
+
+def project(records, fields):
+    """The caller's fields, in the caller's order.
+
+    `datafile` was asked for these plus whatever a filter needed, so this drops the
+    extra rather than narrowing anything: every value here came out of the store
+    already materialised, and none of them is read twice.
+    """
+    return [{f: rec.get(f) for f in fields} for rec in records]
+
+
+def parse_iso(source, flag, text):
+    """A timestamp from the command line, or a refusal naming it.
+
+    Naive input is read as UTC, the way `bin/siana-owe:70-72` reads a hand-edited
+    stamp: the stores are stamped in UTC, and comparing an aware record against a
+    naive bound raises instead of answering.
+    """
+    try:
+        when = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        raise Refusal(source, f"{flag} is not an ISO 8601 timestamp: {text!r}",
+                      "BAD_TIMESTAMP",
+                      ["write it as 2026-08-30 or 2026-08-30T11:54:38Z"],
+                      status=USAGE)
+    return when.replace(tzinfo=UTC) if when.tzinfo is None else when
+
+
+def at_least(field, records, since):
+    """Records stamped at or after `since`.
+
+    A record whose stamp will not parse is kept rather than dropped. It is a live
+    record that `datafile` accepted against a contract that types this field, so an
+    unparseable one is a store that has been edited by hand - and dropping it would
+    delete history from an audit trail on the strength of a guess about its clock.
+    """
+    kept = []
+    for rec in records:
+        raw = rec.get(field)
+        try:
+            when = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            kept.append(rec)
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        if when >= since:
+            kept.append(rec)
+    return kept
+
+
+def cmd_tasks(args, home):
+    source = "tasks"
+    fields = [f.strip() for f in (args.fields or "").split(",") if f.strip()]
+    # The filter reads a field, so the field has to be in what the store was asked
+    # for. Requested alongside the caller's own and dropped again below, so
+    # `--fields id --status doing` filters on the record and not on the projection:
+    # a filter over a narrowed view would silently match nothing.
+    asked = fields + (["status"] if args.status and fields and
+                      "status" not in fields else [])
+    doc = read_store(source, home, asked or None)
+    records = doc["records"]
+    total = len(records)
+    filters = {}
+    if args.status:
+        filters["status"] = args.status
+        records = [r for r in records if r.get("status") == args.status]
+    if fields:
+        filters["fields"] = fields
+        records = project(records, fields)
+    if args.limit is not None:
+        filters["limit"] = args.limit
+    return store_answer(source, doc, records, total, filters, args.limit), OK
+
+
+def cmd_projects(args, home):
+    doc = read_store("projects", home)
+    return store_answer("projects", doc, doc["records"],
+                        len(doc["records"]), {}), OK
+
+
+def cmd_obligations(args, home):
+    source = "obligations"
+    doc = read_store(source, home)
+    records = doc["records"]
+    total = len(records)
+    # Open is what an obligation is for, so open is what this answers with unless
+    # asked otherwise. `--closed` is the other half of the store and never both:
+    # `siana-owe` draws the same line, and a list mixing them reads as a fleet
+    # owing everything it has ever owed.
+    want = "closed" if args.closed else "open"
+    filters = {"status": want}
+    records = [r for r in records if r.get("status") == want]
+    return store_answer(source, doc, records, total, filters), OK
+
+
+def cmd_decisions(args, home):
+    source = "decisions"
+    doc = read_store(source, home)
+    records = doc["records"]
+    total = len(records)
+    filters = {}
+    if args.since:
+        since = parse_iso(source, "--since", args.since)
+        filters["since"] = since.isoformat()
+        records = at_least("at", records, since)
+    return store_answer(source, doc, records, total, filters), OK
+
+
+# ------------------------------------------------------------------ the fleet
+
+class Unreachable(Exception):
+    """Herdr never answered, which is a fact about herdr and about nothing else.
+
+    Separate from a refusal because the caller does something different with it:
+    a console renders "unknown" over the fleet, and must never render the same
+    silence as a fleet with no minions in it.
+    """
+
+
+class Herdr:
+    """One request, one connection: the same framing `siana-watch` and
+    `siana-dispatch` speak, kept here rather than shared because `bin/` holds
+    commands and not a package.
+
+    The timeout is the point. A herdr that accepts the connection and then says
+    nothing would otherwise park a console's read inside `recv` for as long as the
+    socket stays open, and a read that never returns is indistinguishable from a
+    fleet with nothing to report.
+    """
+
+    def __init__(self, path, timeout=10.0):
+        self.path, self.timeout = os.path.expanduser(path), timeout
+
+    def call(self, method, **params):
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        except OSError as e:
+            raise Unreachable(f"herdr is not reachable at {self.path}: {e}")
+        with sock as s:
+            try:
+                s.settimeout(self.timeout)
+                s.connect(self.path)
+            except OSError as e:
+                raise Unreachable(f"herdr is not reachable at {self.path}: {e}")
+            try:
+                s.sendall((json.dumps({"id": "siana-read", "method": method,
+                                       "params": params}) + "\n").encode())
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        raise Unreachable(
+                            f"herdr closed the connection during {method}")
+                    buf += chunk
+            except OSError as e:
+                raise Unreachable(f"herdr stopped answering during {method}: {e}")
+        # Past here herdr did answer, so anything wrong with what it said is a
+        # refusal and not silence: a reply this cannot read is a herdr whose
+        # protocol has moved, and guessing at half of it would put invented panes
+        # in front of the captain.
+        try:
+            reply = json.loads(buf)
+        except ValueError as e:
+            raise Refusal("fleet", f"herdr's answer to {method} is not JSON: {e}",
+                          "HERDR_MALFORMED")
+        if not isinstance(reply, dict):
+            raise Refusal("fleet", f"herdr answered {method} with "
+                                   f"{type(reply).__name__}, not a record",
+                          "HERDR_MALFORMED")
+        if "error" in reply:
+            err = reply["error"]
+            raise Refusal("fleet", f"herdr refused {method}: "
+                                   f"{err.get('message', err) if isinstance(err, dict) else err}",
+                          "HERDR_REFUSED")
+        result = reply.get("result", {})
+        if not isinstance(result, dict):
+            raise Refusal("fleet", f"herdr's result for {method} is "
+                                   f"{type(result).__name__}, not a record",
+                          "HERDR_MALFORMED")
+        return result
+
+
+def herdr_socket():
+    return os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock")
+
+
+def cmd_fleet(args, home):
+    """What herdr says is running, timestamped, and never summarised.
+
+    Agents are passed through as herdr described them, minus nothing. What a pane
+    is doing is meaning, and a console that wants to render it needs the machine
+    fields to do it from; judging here which of them matter would decide that for
+    every future consumer, and be wrong for the first one that wants a field this
+    dropped. The durable ids are named in the docs for the same reason: a label is
+    not unique and a pane id is.
+    """
+    at = stamp()
+    path = herdr_socket()
+    try:
+        result = Herdr(path).call("agent.list")
+    except Unreachable as e:
+        # Not an empty fleet, and the exit code says so. A console reading this
+        # renders "minion health unknown" over whatever it last knew, which is the
+        # one rendering that is true: nothing here learned anything about any pane.
+        return {"source": "fleet", "at": at, "state": "unknown", "agents": None,
+                "error": str(e), "code": "HERDR_UNREACHABLE",
+                "help": ["the fleet runs in herdr; start it, then ask again"]}, REFUSED
+    agents = result.get("agents")
+    if not isinstance(agents, list):
+        raise Refusal("fleet",
+                      f"herdr's agent.list has no agents array, it has "
+                      f"{type(agents).__name__}", "HERDR_MALFORMED",
+                      ["this adapter reads `result.agents`; herdr's protocol has "
+                       "moved and reading it half-way would invent panes"])
+    if any(not isinstance(a, dict) for a in agents):
+        raise Refusal("fleet", "herdr listed an agent that is not a record",
+                      "HERDR_MALFORMED",
+                      ["a partial list is not a shorter fleet, so this refuses "
+                       "rather than reporting the agents it could read"])
+    return {"source": "fleet", "at": at, "state": "ok", "agents": agents}, OK
+
+
+# ----------------------------------------------------------------- the health
+
+def process_command(pid):
+    """What `ps` says that pid is running, or "" when it says nothing.
+
+    Identity, not liveness. Pids are reused, so a live pid is not a live session:
+    the process wearing it has to still be the thing that recorded it. `bin/siana`
+    asks this of its own session pid and asks it the same way.
+    """
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip()
+
+
+def read_session(home):
+    """SIANA's own session record, and whether the process it names is still it.
+
+    Both halves, never one. `bin/siana:158-168` claims the home on a pid and checks
+    that pid's command before believing a record it finds, because a file that
+    outlived its session names a pid that something else now wears. Reporting that
+    as a live SIANA is how a captain is told the fleet is being led by a process
+    that exited hours ago.
+    """
+    path = os.path.join(home, "session")
+    block = {"path": path, "present": False, "alive": False, "pid": None,
+             "pane": None, "harness": None, "command": None, "why": None,
+             "error": None}
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        # The ordinary state between sessions, and not a fault. `just doctor` says
+        # the same thing the same way.
+        block["why"] = "no SIANA session is recorded"
+        return block
+    except OSError as e:
+        # Reported rather than raised, so the rest of the document still arrives.
+        # This is a diagnostic: a captain looking at a fleet that has gone quiet
+        # needs the watcher and the counters even when the session file is the part
+        # that will not open. `error` beside `alive: false` is what stops it reading
+        # as a SIANA that is simply not running, and the nonzero exit is what stops
+        # a console rendering it as a clean answer.
+        block["error"] = f"{path} cannot be read: {e}"
+        block["why"] = "nothing here can say whether SIANA is running"
+        return block
+    block["present"] = True
+    fields = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            fields[k.strip()] = v.strip()
+    block["pane"] = fields.get("SIANA_PANE") or None
+    # A record written before SIANA could start in anything else. Its writer
+    # started pi, so this is the only thing the file could have meant.
+    block["harness"] = fields.get("SIANA_HARNESS") or "pi"
+    raw = fields.get("SIANA_PID")
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        block["why"] = f"the record names no pid, only {raw!r}"
+        return block
+    block["pid"] = pid
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        block["why"] = f"pid {pid} is gone"
+        return block
+    except PermissionError:
+        pass                # Alive and someone else's; the command settles it.
+    except OSError as e:
+        block["why"] = f"pid {pid} cannot be asked about: {e}"
+        return block
+    seen = process_command(pid)
+    block["command"] = seen or None
+    # The same identity test `bin/siana:167` makes of this record: a siana is what
+    # may hold it, and anything else on that pid is a leftover file.
+    if "siana" not in seen:
+        block["why"] = (f"pid {pid} is now "
+                        f"{seen or 'a process ps will not name'}, not a siana")
+        return block
+    block["alive"] = True
+    return block
+
+
+def read_counter(path):
+    """The number in a counter file, and what stopped it being one.
+
+    An absent file is the zero: no wake has been raised yet, or none taken yet.
+    Anything else that will not read is `None` and says why, never zero. A wake
+    counter that reads as zero when it could not be read is a fleet reported as
+    fully caught up at the moment it has stopped waking at all.
+    """
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return 0, None
+    except OSError as e:
+        return None, f"{path} cannot be read: {e}"
+    try:
+        n = int(text.strip())
+    except ValueError:
+        return None, f"{path} does not hold a number"
+    if n < 0:
+        return None, f"{path} holds {n}, which is not a count"
+    return n, None
+
+
+def consumer_alive(rec):
+    """Whether the pi session recorded as reading the wakes is still that process.
+
+    The pid answers whether something is there and the command answers whether it
+    is the thing that recorded this, and `siana-watch:283-315` asks both for the
+    same reason: a consumer record naming a reused pid is a session that was killed
+    before it could withdraw, and every wake raised since has been counted and
+    delivered to nobody.
+    """
+    pid = rec.get("pid")
+    if not isinstance(pid, int):
+        return False, f"the record names no pid, only {pid!r}"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, f"pid {pid} is gone"
+    except PermissionError:
+        pass                # Alive and someone else's; the command settles it.
+    except OSError as e:
+        return False, f"pid {pid} cannot be asked about: {e}"
+    was, seen = rec.get("command") or "", process_command(pid)
+    if not was:
+        # Only a hand-edited record reaches this. With nothing to separate the
+        # session from whatever else landed on that pid, unverifiable is never
+        # reported as reading anything.
+        return False, f"the record cannot say what pid {pid} was, so nothing can"
+    if seen != was:
+        return False, (f"pid {pid} is now "
+                       f"{seen or 'a process ps will not name'}, not the process "
+                       f"that recorded it")
+    return True, None
+
+
+def read_wake(home):
+    """The wake counters, read and never touched.
+
+    Read only. `siana-watch` is the only writer of `pending` and the pi extension
+    the only writer of `consumed` and `consumer`, and a third process writing any
+    of them - even to tidy one up - is how a wake gets counted twice or lost.
+    """
+    wake = os.path.join(home, "wake")
+    block = {"dir": wake, "pending": None, "consumed": None, "consumer": None,
+             "errors": []}
+    for name in ("pending", "consumed"):
+        value, why = read_counter(os.path.join(wake, name))
+        block[name] = value
+        if why:
+            block["errors"].append(why)
+    path = os.path.join(wake, "consumer")
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+    except FileNotFoundError:
+        rec = None
+    except (OSError, ValueError) as e:
+        block["errors"].append(f"{path} cannot be read: {e}")
+        rec = None
+    if rec is not None and not isinstance(rec, dict):
+        block["errors"].append(f"{path} is not a record pi wrote")
+        rec = None
+    if rec is not None:
+        # Whether something is still reading the wakes, asked the same two ways the
+        # session is: a consumer record naming a dead pid is a session that was
+        # killed before it could withdraw, and every wake raised since has been
+        # counted and delivered to nobody.
+        rec = dict(rec)
+        rec["alive"], rec["why"] = consumer_alive(rec)
+    block["consumer"] = rec
+    return block
+
+
+def read_watch(home):
+    """What `siana-watch --status` said, in three parts and never collapsed.
+
+    It writes faults to stderr and ok lines to stdout, so a reader that takes
+    either stream as the verdict gets it backwards: a healthy watcher can print to
+    stderr, and only the exit code says whether it found a fault. All three are
+    reported, and nothing here decides between them.
+    """
+    watch = os.path.join(os.path.dirname(os.path.abspath(__file__)), "siana-watch")
+    block = {"command": [watch, "--status"], "exit": None,
+             "stdout": None, "stderr": None, "error": None}
+    env = dict(os.environ, SIANA_HOME=home)
+    try:
+        out = subprocess.run([watch, "--status"], capture_output=True, text=True,
+                             timeout=WATCH_TIMEOUT_S, env=env)
+    except FileNotFoundError:
+        block["error"] = f"{watch} is not there"
+        return block
+    except subprocess.TimeoutExpired:
+        block["error"] = (f"siana-watch --status did not answer within "
+                          f"{int(WATCH_TIMEOUT_S)}s")
+        return block
+    except (OSError, subprocess.SubprocessError) as e:
+        block["error"] = f"siana-watch --status could not be run: {e}"
+        return block
+    block["exit"], block["stdout"], block["stderr"] = (
+        out.returncode, out.stdout, out.stderr)
+    return block
+
+
+def cmd_health(args, home):
+    """The three things that say whether anyone is at the helm, and no verdict.
+
+    Session, wakes and watcher are reported as themselves, each with the evidence
+    it was decided on. They are not folded into one word, because which
+    combinations are healthy is a judgement about the fleet and this is mechanics:
+    "no SIANA running" is the ordinary state between sessions, and a command that
+    called it unhealthy would cry wolf every night the captain went to bed.
+
+    What it will not do is report a process it could not verify as running. An
+    absent session, a dead pid and a pid now wearing something else all read
+    `alive: false` with `why` saying which.
+
+    It reads and reports. It starts nothing, stops nothing, clears no stale record
+    and acknowledges no wake: every one of those is the captain's, and a diagnostic
+    that repaired what it found would destroy the evidence of what went wrong.
+    """
+    session = read_session(home)
+    wake = read_wake(home)
+    watch = read_watch(home)
+    doc = {"source": "health", "at": stamp(), "home": home,
+           "session": session, "wake": wake, "watch": watch}
+    # Nonzero when a part could not be read at all, never for what it found: an
+    # idle fleet is a true answer and exits 0, and a watcher that reported a fault
+    # answered the question it was asked.
+    unread = (session["error"] is not None or watch["error"] is not None
+              or bool(wake["errors"]))
+    return doc, REFUSED if unread else OK
+
+
+# -------------------------------------------------------------------- the CLI
+
+class Parser(argparse.ArgumentParser):
+    """argparse, refusing in the one shape everything else here refuses in.
+
+    Its own `error` writes usage prose to stderr and leaves stdout empty, which
+    breaks the single-document contract on the failure a console is most likely to
+    cause itself: a subcommand or a flag this version does not have. A consumer
+    would have nothing to parse exactly where it most needs to be told what it got
+    wrong.
+
+    `--help` is left alone. It is a person asking to read the usage, not a program
+    asking a question, and it is the one exit here that is neither an answer nor a
+    refusal.
+    """
+
+    def error(self, message):
+        # The subcommand when there is one: argparse names a subparser
+        # "siana-read tasks", so the last word is the source the caller was asking
+        # about, and the bare prog when it never got that far.
+        raise Refusal(self.prog.split()[-1], message, "USAGE_ERROR",
+                      [f"run `{self.prog} --help` for the full reference"],
+                      status=USAGE)
+
+
+def build_parser():
+    ap = Parser(prog="siana-read",
+                description="fleet state as JSON: one document on stdout, always")
+    # Subparsers inherit this class from `ap`, so a bad flag on a subcommand refuses
+    # the same way a bad subcommand does.
+    sub = ap.add_subparsers(dest="what", required=True)
+
+    p = sub.add_parser("tasks", help="the fleet queue")
+    p.add_argument("--fields", help="comma-separated fields to return")
+    p.add_argument("--status", help="only tasks in this status")
+    p.add_argument("--limit", type=int, help="at most this many, after filtering")
+    p.set_defaults(run=cmd_tasks)
+
+    p = sub.add_parser("projects", help="the captain's registry")
+    p.set_defaults(run=cmd_projects)
+
+    p = sub.add_parser("obligations", help="what SIANA owes, open by default")
+    p.add_argument("--closed", action="store_true", help="what was answered")
+    p.set_defaults(run=cmd_obligations)
+
+    p = sub.add_parser("decisions", help="the advisory audit trail")
+    p.add_argument("--since", help="only decisions at or after this ISO timestamp")
+    p.set_defaults(run=cmd_decisions)
+
+    p = sub.add_parser("fleet", help="what herdr says is running")
+    p.set_defaults(run=cmd_fleet)
+
+    p = sub.add_parser("health", help="session, wakes and watcher")
+    p.set_defaults(run=cmd_health)
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
+    home = home_dir()
+    if getattr(args, "limit", None) is not None and args.limit < 0:
+        raise Refusal(args.what, f"--limit cannot be negative: {args.limit}",
+                      "BAD_LIMIT", status=USAGE)
+    # Every command answers the same way: the document, and the verdict on it.
+    # A store that answered has nothing to add to the verdict and says OK.
+    doc, status = args.run(args, home)
+    emit(doc)
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Refusal as r:
+        emit(r.doc)
+        sys.exit(r.code)

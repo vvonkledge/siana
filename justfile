@@ -191,6 +191,45 @@ init: _contract-drift
             }
             echo "wrote    $pkg"
         fi
+        # Every queue package already configured here is removed before the one
+        # this init installs is added, because `pi install` only appends a source
+        # and never drops another package that carries the same skill from a
+        # different path. So a home inited once with SIANA_PI_PACKAGE pointing at a
+        # tasks checkout and again without it kept both entries, pi resolved the
+        # resulting skill collision first-wins, and the stale one won - leaving
+        # SIANA reading its queue skill from the package the captain had stopped
+        # configuring, whose every documented command named a `tasks` that was not
+        # on PATH. It surfaced as a startup warning and nowhere else: `doctor` does
+        # not read the packages list, so that home reported complete. Init owns
+        # this list rather than adding to it.
+        #
+        # Only packages carrying the queue skill, and that skill is what is looked
+        # for rather than a name or a path: it is the thing that actually collides,
+        # and a package directory can be called anything. Anything else the captain
+        # installed locally in this home is theirs and is never touched.
+        #
+        # Handed to `pi remove` resolved, because it matches a source by the path
+        # it resolves to and not by package name: the string as stored is relative
+        # to `.pi/`, and a bare name resolves against $PWD, so both quietly match
+        # nothing. Its exit code is not trusted either - nothing to remove is exit
+        # 1, which is the ordinary state of a first install.
+        #
+        # A settings.json pi cannot be read from is a stop and never an empty list:
+        # taken as empty, init would append beside whatever is in there and rebuild
+        # the collision it is here to remove.
+        settings="$home/.pi/settings.json"
+        if ! configured="$(just _pi-packages "$settings" 2>&1)"; then
+            echo "$settings is not readable as pi's settings" >&2
+            echo "$configured" >&2
+            echo "  pi wrote it and pi reads it; repair or delete it, then run" >&2
+            echo "  init again" >&2
+            exit 1
+        fi
+        printf '%s\n' "$configured" | while IFS= read -r source; do
+            [ -n "$source" ] \
+                && [ -f "$source/skills/agent-tasks/SKILL.md" ] || continue
+            (cd "$home" && pi remove -l -a "$source" >/dev/null 2>&1 || true)
+        done
         # -a because pi refuses to rewrite an existing project-local config in an
         # untrusted directory, and re-running init must not be a first-run-only path.
         (cd "$home" && pi install -l -a "$(cd "$pkg" && pwd)" >/dev/null)
@@ -288,7 +327,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-clean siana-report; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -383,6 +422,51 @@ upgrade: _initialized init
         echo "Re-apply anything you still want, then delete that directory."
     fi
 
+# The pi packages a home has configured, one resolved absolute path per line.
+#
+# Shared by `init`, which removes the queue ones before installing the package it
+# was asked for, and by `doctor`, which counts them. One reader rather than two
+# that have to agree: a doctor reporting on a different list than init writes is
+# worse than no report at all.
+#
+# Resolved, because a source as stored is relative to `.pi/` and both callers need
+# a path they can test from somewhere else. No settings file is no packages and
+# exits 0, which is the ordinary state of a home before its first install. One
+# that cannot be read exits nonzero with the one line json gives for why, for the
+# caller to refuse on rather than read as empty. A traceback is what every other
+# read in this file is written to keep off the captain's screen.
+#
+# `if 1:` so the reader can be indented as a recipe line without python calling
+# that an indentation error: just ends a recipe at the first unindented line, and
+# a heredoc terminator cannot be indented with spaces.
+#
+# `[no-exit-message]` because both callers report the failure themselves, and
+# just's own "recipe failed" line arrives inside the text they are quoting.
+[private]
+[no-exit-message]
+_pi-packages settings:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f '{{settings}}' ] || exit 0
+    python3 -c 'if 1:
+        import json, os, sys
+        try:
+            with open(sys.argv[1]) as fh:
+                settings = json.load(fh)
+        except (OSError, ValueError) as why:
+            sys.exit(str(why))
+        # The shape is checked and not just the parse. `null` parses without error
+        # and is not a mapping, and `.get` on it printed an AttributeError traceback
+        # where the reason and the repair belong - the one thing every read in
+        # these recipes is written to keep off the screen the captain reads.
+        if not isinstance(settings, dict):
+            sys.exit(os.path.basename(sys.argv[1]) + " does not hold a JSON object")
+        sources = settings.get("packages", [])
+        base = os.path.dirname(os.path.abspath(sys.argv[1]))
+        for source in sources:
+            print(os.path.abspath(os.path.join(base, source)))
+        ' '{{settings}}'
+
 # Warn when the home's task contract predates the installed `tasks`. A field the
 # CLI writes but the contract lacks is rejected by `extra: forbid` as a raw
 # traceback, so this has to be caught here rather than discovered at `add`.
@@ -446,7 +530,7 @@ test *args:
     # directly never writes its own, and the `bin/` commands import stdlib only. What
     # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
     # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner, against a suite that already takes six or seven minutes.
+    # on a cold runner, against a suite that already takes a quarter of an hour.
     # Invisible locally, where the captain's uv cache is already warm.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
@@ -610,6 +694,45 @@ doctor: _contract-drift
     print("          `just init` installs it", file=sys.stderr)
     raise SystemExit(1)
     PACKAGE
+            # The queue package the settings file actually configures, counted
+            # rather than taken on trust from the file being there. `pi install`
+            # only appends, so a home can end up carrying two; pi loads the first
+            # and skips the rest, and says so at startup and nowhere else. This
+            # report used to call such a home complete, which is how one ran for
+            # days reading its queue skill from a package the captain had stopped
+            # configuring. Nothing is repaired here - `just init` is what owns the
+            # list - so this only has to make the state sayable.
+            if ! sources="$(just _pi-packages "$home/.pi/settings.json" 2>&1)"; then
+                echo "  stale   .pi/settings.json cannot be read as pi's" \
+                     "settings" >&2
+                echo "$sources" | sed 's/^/          /' >&2
+            else
+                # A here-string and not a pipeline, so `queue` survives the loop,
+                # and not `for` over the words, so a package path with a space in
+                # it is one path.
+                queue=""
+                while IFS= read -r source; do
+                    [ -n "$source" ] \
+                        && [ -f "$source/skills/agent-tasks/SKILL.md" ] || continue
+                    queue="$queue$source"$'\n'
+                done <<< "$sources"
+                queue="${queue%$'\n'}"
+                count="$(printf '%s' "$queue" | grep -c . || true)"
+                if [ "$count" = 1 ]; then
+                    echo "  ok      .pi/settings.json queue package"
+                elif [ "$count" = 0 ]; then
+                    echo "  missing a queue package in .pi/settings.json" \
+                         "(\`just init\` installs one; without it a pi" \
+                         "session opens with no queue in front of it)"
+                else
+                    echo "  stale   .pi/settings.json configures $count queue" \
+                         "packages, and pi loads only the first" >&2
+                    echo "$queue" | sed 's/^/          /' >&2
+                    echo "          \`just init\` installs one instead of adding" \
+                         "to the list; run it to" >&2
+                    echo "          keep the package it is configured for" >&2
+                fi
+            fi
         fi
     done
     if [ -n "$starts" ]; then
@@ -674,7 +797,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-clean siana-report; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

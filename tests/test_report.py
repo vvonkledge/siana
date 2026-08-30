@@ -184,11 +184,14 @@ class Report(HomeTest):
 
     def test_it_never_writes_anything(self):
         self.contract("obligations")
-        # The PATH fixture mirrors directories into the home, so it has to be built
-        # before the snapshot or it is what this catches.
-        self.distro_path()
+        # The PATH fixture mirrors directories into the home, so it is built once
+        # here and handed to the run. Built again inside `report` it would put a
+        # second mirror root there between the snapshot and the check, and this
+        # would fail on the fixture's own litter rather than on the command.
+        path = self.distro_path()
         before = sorted(os.listdir(self.home))
-        self.report("--json")
+        self.run_cmd([os.path.join(BIN, "siana-report"), "--json"],
+                     env={"PATH": path})
         self.assertEqual(sorted(os.listdir(self.home)), before)
 
     def test_no_home_at_all_is_a_refusal_and_not_an_empty_report(self):

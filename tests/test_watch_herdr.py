@@ -458,12 +458,16 @@ class Waking(WatchTest):
         self.assertEqual(self.herdr_methods(), ["agent.get"])
 
     def test_the_held_warning_names_every_cause_and_diagnoses_none(self):
-        # All this can see is that the two counters disagree. Three states look like
-        # this: a session that is gone, a session mid-turn, and one holding every
-        # wake behind a draft the captain left in the editor. They want different
-        # things, and naming only the first would send the captain to restart SIANA
-        # - which throws away the draft the extension is holding the wake to protect
-        # and kills the turn the other two are waiting to finish.
+        # All this can see is that the two counters disagree. Five states look like
+        # this: a session that is gone, a session mid-turn, one holding every wake
+        # behind a draft the captain left in the editor, one compacting - pi
+        # refuses every message for the whole of a `/compact` while still reporting
+        # itself idle - and one where pi took the wake in and could not start a turn
+        # on it, because no model is selected or the credentials have expired. They
+        # want different things, and naming only the first would send the captain to
+        # restart SIANA - which throws away the draft the extension is holding the
+        # wake to protect and kills the turn or the compaction two of the others are
+        # waiting to finish.
         self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA), SIANA,
                          SIANA, TAKEOVER)
 
@@ -472,9 +476,20 @@ class Waking(WatchTest):
 
         self.assertIn("a wake waits for an idle session with an empty editor",
                       result.err)
-        self.assertIn("a long turn or a", result.err)
-        self.assertIn("draft left there holds it", result.err)
-        self.assertIn("`just doctor` says whether that session is", result.err)
+        self.assertIn("a long turn, a", result.err)
+        self.assertIn("draft left there or a running `/compact` holds it",
+                      result.err)
+        self.assertIn("`just doctor` says", result.err)
+        self.assertIn("whether that session is there at all", result.err)
+        # The fifth, and the two recoveries for it. It is the one with no signal
+        # anywhere else - it never clears on its own and `just doctor` calls that
+        # session healthy - so the warning has to carry both what to look at and
+        # what to do, and has to say that a restart is not it.
+        self.assertIn("an error in SIANA's own", result.err)
+        self.assertIn("transcript says pi took the wake and could not start the "
+                      "turn", result.err)
+        self.assertIn("a model or `/login` for that one, which no restart repairs",
+                      result.err)
 
     def test_a_wake_that_is_taken_is_said_out_loud_and_the_warning_stops(self):
         self.herdr.reply("agent.get", SIANA, once(self.reported(), SIANA),

@@ -117,9 +117,9 @@ so a contract with no `.jsonl` beside it is an empty store and not a broken inst
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
 `siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
-`siana-gate`, `siana-clean`, `siana-report`. They are links, so a `git pull` here
-updates the commands with no reinstall. It does not update the home; `just upgrade`
-does that.
+`siana-gate`, `siana-read`, `siana-clean`, `siana-report`. They are links, so a `git
+pull` here updates the commands with no reinstall. It does not update the home; `just
+upgrade` does that.
 
 ### The distro's own pi package
 
@@ -295,6 +295,32 @@ judgment about the work.
 
 `siana-publish --dry-run` prints the exact title and body, and changes nothing.
 
+### A repair of something already published
+
+A merge request that comes back red - a failing check, a review you want answered -
+is repaired the way everything else is: SIANA queues a fix task, and a minion works
+it on a branch of its own with its own independent QA behind it. What it does not do
+is open a second merge request holding the same commits. Tell SIANA the fix repairs
+published work, and it briefs it with:
+
+    siana-brief <fix-id> --ship --type fix --repairs <the published ship task>
+
+The brief then records the branch that work was published from, and once QA accepts
+the fix, `siana-publish` fast-forwards that branch to exactly the head QA accepted.
+Your merge request keeps its number and its review, and gains the commits that fix
+it. Its description is rewritten from the repair minion's own handoff, because after
+that push it is describing that minion's work. Nothing merges: that is still yours,
+in person.
+
+It refuses rather than guesses. No open request from that branch, more than one, a
+closed or merged one, a branch that has moved under the request, a head that is not a
+fast-forward of what the request holds, or a minion still working on that branch all
+stop before anything is pushed. So does a repair branch that moved after its verdict,
+because the head that goes out is the one a second minion actually read.
+
+The push and the description are two calls, so an interrupted run can leave the new
+commits under the old copy. Running it again pushes nothing and puts the copy on.
+
 ### Leave it running
 
     siana-watch
@@ -322,8 +348,12 @@ delivery into a turn in flight: pi's only way to hand one a message is to queue 
 and pressing Escape to interrupt empties that queue into the input editor - your
 draft with the wake pasted in front of it, which is the same bug from the other end.
 So a wake raised while SIANA is working is held, not queued, and goes out when the
-turn ends. Nothing is lost by waiting: the count is on disk and nothing records it as
-taken until it has actually been sent.
+turn ends. Nothing is lost by waiting: the count is on disk, and it is recorded as
+taken only once pi has said it accepted the message and is starting the turn on it.
+Handing pi a message tells you nothing on its own - the call reports no result, and
+a session can report itself idle and still refuse the prompt - so the extension
+waits to be told rather than assuming, and a wake pi would not take is sent again
+rather than counted.
 
 So the watcher checks that SIANA's session is reading before it starts, and refuses
 with what to do about it when it is not:
@@ -343,7 +373,7 @@ session drains it as it starts.
 
 If wakes stop being taken while the watcher runs, it says so on its stderr every
 five minutes and keeps counting. It cannot say why, and it does not guess. There are
-three reasons and they want different things from you:
+five reasons and they want different things from you:
 
 - **SIANA is mid-turn.** A long turn holds every wake raised during it. Nothing to
   do: the wake goes out within half a second of the turn ending.
@@ -352,12 +382,25 @@ three reasons and they want different things from you:
   half way through typing. Send that message or clear it, and the held wake goes out
   within half a second. Nothing else is needed, and restarting SIANA here would
   throw the draft away.
+- **SIANA is compacting.** A `/compact` you asked for refuses every message for as
+  long as it runs, while the session still reports itself idle. The extension is
+  told nothing about the refusal, so it waits and sends the wake again: it goes out
+  within five seconds of the compaction finishing. Nothing to do.
+- **SIANA cannot start a turn on it.** Pi took the message past its input gate and
+  then refused to run it: no model is selected, or the credentials have expired. The
+  extension is told nothing, so it sends the wake again every two minutes and nothing
+  ever accepts it. This is the only one of the five that never clears on its own, and
+  the only one `just doctor` is no help with - it reports that session present and
+  healthy throughout. What says so is pi's own error, printed into SIANA's transcript
+  on every retry. Select a model, or run `/login`, and the held wake goes out on the
+  next retry.
 - **The session is gone.** `just doctor` says whether one is running. Start SIANA
   again and it drains everything counted while it was away.
 
 Only the last of those is a reason to restart anything, which is why the warning
-names all three and diagnoses none: restarting SIANA over one of the first two
-discards the draft, or the turn, that the wake was waiting on.
+names all five and diagnoses none: restarting SIANA over any of the first four
+discards the draft, the turn, or the compaction that the wake was waiting on, and
+leaves a missing model or expired credentials exactly where they were.
 
 ### Leave it advisory
 
@@ -621,7 +664,7 @@ done while you were away, where nobody was asked and no answer exists.
 
     just test
 
-Six or seven minutes. Standard-library `unittest`, no dependencies to install. It
+Fifteen to twenty minutes. Standard-library `unittest`, no dependencies to install. It
 drives the pure mechanics in-process and drives the commands as real processes
 against a real `tasks` and `datafile`, into throwaway homes, because a stubbed store
 would only ever agree with the suite. Unittest arguments pass through, so `just test
@@ -706,6 +749,80 @@ Things it says that are:
   file does not name it, names it twice, names it somewhere it is not, or is not
   there at all. `just init` installs it and collapses a duplicate back to one. This
   and an unreadable queue are what make `doctor` exit nonzero.
+
+## Read the fleet as JSON
+
+    siana-read tasks       [--fields a,b,c] [--status S] [--limit N]
+    siana-read projects
+    siana-read obligations [--closed]
+    siana-read decisions   [--since ISO]
+    siana-read fleet
+    siana-read health
+
+Everything else here prints for a person at a terminal. This prints for a program,
+so something other than a terminal can show you the fleet. It reads and only reads:
+no listener, no port, nothing served, and no path in it that writes to a store.
+
+Every run writes exactly one JSON document to standard output, whether it answered
+or refused, and the exit code is the verdict:
+
+    0   the document answers the question
+    1   the source could not be read, or could not be trusted
+    2   the request was wrong: an unknown subcommand, flag, field or timestamp
+
+`--help` is the one exception, and it is the one that is neither an answer nor a
+refusal: it prints the usage for a person to read.
+
+The four stores answer in one shape:
+
+    {"source": "tasks",
+     "revision": {"inode": 3876394, "size": 488283, "mtime_ns": 1788090878060132363},
+     "filter": {"status": "doing"},
+     "total": 123, "matched": 4,
+     "records": [...],
+     "bad_lines": []}
+
+- `revision` is the store's own snapshot, for a reader caching against it. Compare
+  `inode` as well as `size`: `datafile compact` and `roll` rewrite the file in
+  place, so a size that has not moved is not a store that has not moved.
+- `total` is the live records before filtering and `matched` is after it, so an
+  empty `records` is never ambiguous. `matched` above the number returned means
+  your `--limit` clipped the answer.
+- `bad_lines` is every line of the store `datafile` could not read, with its line
+  number and the text. A damaged store is still a successful read, and the damage
+  arrives with it rather than being smoothed over.
+
+`fleet` asks herdr what is running and answers `state: "ok"` with the agent records
+verbatim. When herdr cannot be reached it answers `state: "unknown"` with
+`agents: null` and exits nonzero. It never answers an unreachable herdr with an
+empty list: that would be a claim about every pane, and "no minions" is not
+something a silent herdr said.
+
+`health` reports three things and judges none of them: the session record with
+whether that pid is still a `siana`, the wake counters, and the exit code, stdout
+and stderr of `siana-watch --status` kept apart. `no SIANA running` is the ordinary
+state between sessions, so nothing here calls it a fault. What it will not do is
+report a process it could not verify: a dead pid and a pid now wearing something
+else both read `alive: false` with `why` saying which.
+
+Two refusals are worth knowing about, because they look like answers:
+
+- A store that cannot be read is a refusal, never `records: []`. An unreadable
+  `obligations.jsonl` reported as empty would tell you SIANA owes you nothing.
+- The contract is what says a store exists, not the log. `decisions.jsonl` does not
+  exist until the first decision is written, and that is an honest empty answer with
+  a null `inode`. A directory holding no contracts is refused on all four stores,
+  which is what a mistyped `SIANA_HOME` gets instead of a fleet with nothing in it.
+
+Three of the stores live in the home. The queue is read through `SIANA_TASKS_FILE`
+when that is set, the same way every other command here resolves it, so a minion
+pointed at a queue outside its home reads the one the rest of the fleet is using.
+Each store's contract is looked for beside it, named `schema-<store>.yaml`.
+
+It is not literally read-only on disk, and it is worth saying so plainly before
+anything is built on top of it: a `datafile` read may rewrite the `.idx` cache
+beside a store. That write is atomic and it is a cache. No authoritative record is
+ever changed.
 
 ## Uninstall
 

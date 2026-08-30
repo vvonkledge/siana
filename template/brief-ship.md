@@ -13,10 +13,18 @@ prevent.
 Your work lands. This branch is the deliverable, and it is already checked out:
 
     branch  {SHIP_BRANCH}
+{REPAIR}
 
 Commit there and nowhere else. Never push by hand, never open a merge request, never
 merge, and never touch the default branch. SIANA lands your work once it is accepted;
 a branch is never thrown away while it holds work.
+
+A `repairs` line beside that one means this work repairs work that is already
+published. Your branch is still yours and still the whole deliverable; what that line
+records is the branch whose open merge request receives your accepted head, once a QA
+minion has accepted it. Publication does that and nothing else does, so you never
+commit on that branch, never push it, and never open a second request for the same
+work.
 
 The middle segment of that name is the Conventional Commit type your commits carry.
 SIANA stated it when it briefed you, so it is not yours to reconsider: a commit whose
@@ -59,6 +67,13 @@ malformed or stale, so a branch nobody can describe is a branch that does not la
 Write it for someone who has not read this brief, was not told what this fleet is,
 and is deciding whether to merge. Nothing else about your work travels with it: not
 this brief, not your task, and not the report of the minion that reviews you.
+
+**If this is a repair**, your handoff replaces the one on the request you are landing
+on, because after your push the commits under that description are yours. So write a
+whole one and not a postscript: what the work was for in the first place, and what
+the solution does now that yours is part of it. A reader arriving at that request has
+no memory of the round that failed, and nothing tells them which half of the copy is
+new.
 
 ## The task
 
