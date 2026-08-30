@@ -295,13 +295,30 @@ while [ $# -gt 0 ]; do
         # retype here costs SIANA a whole turn.
         --type=*) [ -z "$type" ] || die "one type at a time; got '$type' and '${1#--type=}'"
                  type="${1#--type=}" ;;
+        # The empty value is refused here rather than left to the guards below, and
+        # that is the whole of why this is not `[ -n "$repairs" ]` all the way down.
+        # An empty string is falsy to every one of those guards, so `--repairs ""`
+        # skipped the --type fix check, the self-reference check and the resolution,
+        # and wrote a brief with the marker deleted: the fix was then dispatched,
+        # judged and published as ordinary ship work, and the second merge request
+        # this record exists to prevent arrived on the captain's forge instead of as
+        # an error here. SIANA asking for a repair and getting silence is the one
+        # answer this flag may never give.
         --repairs) [ $# -ge 2 ] || die "--repairs needs the ship task whose published" \
                        "work this repairs"
                  [ -z "$repairs" ] || die "one repair target at a time; got" \
                      "'$repairs' and '$2'"
+                 [ -n "$2" ] || die "--repairs was given an empty name" \
+                     "it names the ship task whose published work this repairs, and" \
+                     "an empty one would brief this as ordinary ship work, which" \
+                     "opens a second merge request for commits that already have one"
                  repairs="$2"; shift ;;
         --repairs=*) [ -z "$repairs" ] || die "one repair target at a time; got" \
                      "'$repairs' and '${1#--repairs=}'"
+                 [ -n "${1#--repairs=}" ] || die "--repairs was given an empty name" \
+                     "it names the ship task whose published work this repairs, and" \
+                     "an empty one would brief this as ordinary ship work, which" \
+                     "opens a second merge request for commits that already have one"
                  repairs="${1#--repairs=}" ;;
         -*) die "unknown option: $1" "run \`siana-brief --help\`" ;;
         *)  [ -z "$id" ] || die "one task at a time; got '$id' and '$1'"
@@ -427,12 +444,50 @@ if [ -n "$repairs" ]; then
             "--repairs names the ship task whose published work this repairs, and a" \
             "task the queue does not have published nothing"
     fi
+    # The same project, because a merge request lives in one repository and on one
+    # forge. A repair that named work in another project would record a branch that
+    # exists somewhere else entirely, and publication - which looks in this project's
+    # repository and asks this project's forge - would refuse only after the fix had
+    # been built, judged and accepted. Compared rather than assumed: both handles are
+    # read off the queue, and a briefed task with no project at all cannot be shown to
+    # be in the same one, so it is refused too.
+    repaired_project="$(printf '%s\n' "$repaired_show" | sed -n 's/^  project: //p')"
+    [ "$repaired_project" = null ] && repaired_project=""
+    mine="$handle"
+    [ "$mine" = null ] && mine=""
+    if [ -z "$mine" ] || [ "$repaired_project" != "$mine" ]; then
+        die "a repair and the work it repairs are in different projects" \
+            "$id is in ${mine:-no project}" \
+            "$repairs is in ${repaired_project:-no project}" \
+            "a repair lands on the merge request the work it repairs was published" \
+            "on, and that request is in that project's own repository and forge" \
+            "nothing here can publish across two of them, and the refusal would" \
+            "otherwise arrive after the fix has been built, judged and accepted"
+    fi
+
     [ -f "$home/briefs/$repairs.md" ] || \
         die "no brief at $home/briefs/$repairs.md" \
             "it is where the branch that work was published from is recorded, and" \
             "the fallback for a task with no brief is a name only legacy work has" \
             "a repair recorded against a branch nobody published is a repair that" \
             "cannot land, and it would open the second request this exists to stop"
+
+    # Ship work, and nothing else. The reader below answers `siana/<task-id>` for a
+    # brief with no ship section, which is its legacy fallback and is right for the
+    # question it is usually asked - but here that fallback would record a scout's or
+    # a QA minion's branch as the branch an accepted repair gets published on. Neither
+    # of those lands anything, so no merge request has ever been opened from either,
+    # and the refusal would come from `siana-publish` after the repair was accepted.
+    #
+    # The heading is what is checked, because it is exactly what the reader searches
+    # for. A brief written before commit types has it and no `branch` line under it,
+    # and that is still ship work and still repairable.
+    grep -q '^## Delivery: ship[[:space:]]*$' "$home/briefs/$repairs.md" || \
+        die "$repairs is not ship work" \
+            "its brief has no '## Delivery: ship' section, so it is scout or QA work" \
+            "--repairs names the ship task whose published work this repairs, and" \
+            "work that lands nothing has no merge request for a repair to land on"
+
     resolved="$(repair_branches "$repairs")" || exit 1
     repaired_branch="$(printf '%s\n' "$resolved" | sed -n 1p)"
     publication="$(printf '%s\n' "$resolved" | sed -n 2p)"
