@@ -23,7 +23,8 @@ The script is a JSON file named by `SIANA_FAKE_PI`:
                {"say": "the round's report"},
                {"run": ["siana-retire", "some-task"]},
                {"raw": "not json at all"},
-               {"sleep": 30}],
+               {"sleep": 30},
+               {"waitfor": "/a/path/the/test/creates"}],
      "exit": 0}
 
 Every invocation appends what it was given to `$SIANA_FAKE_PI.calls`, one JSON object
@@ -80,6 +81,15 @@ def main() -> int:
             sys.stdout.flush()
         elif "sleep" in step:
             time.sleep(step["sleep"])
+        elif "waitfor" in step:
+            # A barrier rather than a sleep. A test that needs the command to be
+            # provably inside its critical section - holding the lock, with a second
+            # caller about to arrive - cannot get there by waiting a fixed time: too
+            # short is flaky and too long is the whole suite. This parks the round
+            # until the test says otherwise, so the interleaving is decided rather
+            # than raced for.
+            while not os.path.exists(step["waitfor"]):
+                time.sleep(0.02)
         elif "ask" in step:
             ask = step["ask"]
             argv = ["siana-clean", "ask",

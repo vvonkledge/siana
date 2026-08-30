@@ -269,6 +269,24 @@ def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def duration(seconds: int) -> str:
+    """A span in the units it actually has.
+
+    The watchdog used to print `ROUND_S // 60` minutes. That reads correctly at the
+    half-hour a round really gets and reads "0 minutes" at every value the suite
+    drives it with, which is the one place the message is ever read closely. A
+    watchdog naming a bound it did not enforce is the same defect as a refusal
+    naming a mechanism that is not there.
+    """
+    minutes, rest = divmod(int(seconds), 60)
+    parts = []
+    if minutes:
+        parts.append(f"{minutes} minute{'' if minutes == 1 else 's'}")
+    if rest or not minutes:
+        parts.append(f"{rest} second{'' if rest == 1 else 's'}")
+    return " ".join(parts)
+
+
 def process_command(pid: int) -> str:
     """What `ps` says this process is running, or "" when it says nothing.
 
@@ -385,58 +403,105 @@ def run_id_for(paths: Home) -> str:
 # The lock. One cleanup run at a time, and the refusal says which one.
 # ---------------------------------------------------------------------------
 
-def take_lock(paths: Home, what: str) -> None:
-    """Exclusive, and reclaimed only from a process that is provably gone.
+def read_lock(path: str):
+    """Who holds the lock: a record, `{}` when the file names nobody, None when there
+    is no file.
 
-    `O_EXCL` is the whole of the exclusion: two `start`s racing reach the same `open`
-    and exactly one of them creates the file. What the file holds is for the loser to
-    read, and for the next caller to decide whether the holder is still alive. A lock
-    left by a killed process must not wedge the fleet forever, and a lock removed
-    because a pid was reused would let two runs mutate one fleet, so liveness is the
-    pid *and* what `ps` says it is running - the check `siana-watch` makes of its own
-    grant, for the same reason.
+    Deliberately not `read_json`. That refusal is written for the records this
+    command lands by atomic rename, and the lock is not one of them - it is the one
+    file two racing processes are guaranteed to read at the same instant. An earlier
+    version created it empty with `O_EXCL` and wrote the payload afterwards, so the
+    loser of an ordinary race read the winner's empty file, was told the store was
+    corrupt, and was advised to move a live run's lock aside. `take_lock` below
+    creates it whole instead, so that window is gone; a lock that still will not
+    parse was left by that older version or edited by hand, which is neither
+    corruption to report nor a holder to overwrite.
+    """
+    try:
+        with open(path) as fh:
+            held = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return held if isinstance(held, dict) else {}
+
+
+def take_lock(paths: Home, what: str) -> None:
+    """Exclusive, visible only whole, and reclaimed only from a process that is
+    provably gone.
+
+    `os.link` is both halves at once, which is why the payload is written to a
+    temporary file first and linked into place after. The link is the exclusion -
+    two `start`s racing reach it and exactly one of them creates the name - and it
+    is also what makes the record and the file arrive together, so no observer can
+    read a lock that does not yet say who holds it. A creator killed before the
+    link leaves no lock at all rather than an empty one, so the next caller takes it
+    without anything having to be deleted on a guess.
+
+    A lock left by a killed process must not wedge the fleet forever, and a lock
+    removed because a pid was reused would let two runs mutate one fleet, so
+    liveness is the pid *and* what `ps` says it is running - the check `siana-watch`
+    makes of its own grant, for the same reason.
     """
     os.makedirs(paths.root, exist_ok=True)
     record = {"pid": os.getpid(), "command": process_command(os.getpid()),
               "what": what, "taken": now()}
-    for attempt in (1, 2):
-        try:
-            fd = os.open(paths.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            held = read_json(paths.lock, "cleanup lock") or {}
-            pid, command = held.get("pid"), held.get("command") or ""
-            alive = bool(pid) and bool(command) \
-                and process_command(pid) == command
-            if alive:
-                die(f"a cleanup run is already starting or resuming (pid {pid})",
-                    f"it took the lock at {held.get('taken', '?')}"
-                    f" to {held.get('what', '?')}",
-                    "one at a time, so that two cleaners never mutate one fleet",
-                    "`siana-clean status` says what it is doing")
-            if attempt == 2:
-                die("cannot take the cleanup lock",
-                    f"{paths.lock} keeps coming back; look at it by hand")
-            # The holder is gone, so this is a leftover from a process killed before
-            # its own release ran. Removed and retried once rather than forced: a
-            # second racer that took it in between must win the retry.
+    tmp = f"{paths.lock}.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        json.dump(record, fh)
+    try:
+        for attempt in (1, 2):
             try:
-                os.unlink(paths.lock)
-            except FileNotFoundError:
-                pass
-            continue
-        with os.fdopen(fd, "w") as fh:
-            json.dump(record, fh)
-        return
+                os.link(tmp, paths.lock)
+            except FileExistsError:
+                held = read_lock(paths.lock)
+                if held == {}:
+                    # Nothing here can tell a live run from a leftover, because the
+                    # file says nothing about either. Refused rather than reclaimed:
+                    # deleting it on a guess is what the old corruption message
+                    # advised, and it was advising the deletion of a live run's lock.
+                    die(f"the cleanup lock at {paths.lock} does not name a holder",
+                        "a lock is created whole, so this one was left by a version",
+                        "that created it empty, or edited by hand",
+                        "`siana-clean status` says whether a run is live; remove",
+                        "the lock only if none is")
+                if held is not None:
+                    pid, command = held.get("pid"), held.get("command") or ""
+                    if pid and command and process_command(pid) == command:
+                        die("a cleanup run is already starting or resuming"
+                            f" (pid {pid})",
+                            f"it took the lock at {held.get('taken', '?')}"
+                            f" to {held.get('what', '?')}",
+                            "one at a time, so that two cleaners never mutate one"
+                            " fleet",
+                            "`siana-clean status` says what it is doing")
+                if attempt == 2:
+                    die("cannot take the cleanup lock",
+                        f"{paths.lock} keeps coming back; look at it by hand")
+                # Either the holder is gone - a leftover from a process killed
+                # before its own release ran - or the lock was released between the
+                # link and the read, and there is nothing left to remove. Removed
+                # and retried once rather than forced: a second racer that took it
+                # in between must win the retry.
+                if held is not None:
+                    try:
+                        os.unlink(paths.lock)
+                    except FileNotFoundError:
+                        pass
+                continue
+            return
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def drop_lock(paths: Home) -> None:
     """Only ours. A lock reclaimed by a later run while this one was dying belongs to
     that run, and removing it here would leave that run unprotected."""
-    try:
-        with open(paths.lock) as fh:
-            held = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return
+    held = read_lock(paths.lock) or {}
     if held.get("pid") == os.getpid():
         try:
             os.unlink(paths.lock)
@@ -791,6 +856,26 @@ def state(paths: Home, run_id: str) -> dict:
         if not (pid and run_id in process_command(pid)):
             rec = dict(rec, status="failed",
                        detail="the process running it is gone; it was interrupted")
+    elif rec.get("status") == "starting":
+        # The same lie by one step earlier. `starting` is written before the cleaner
+        # is spawned, and a `start` that dies in between - no `pi` on PATH, a signal,
+        # a killed terminal - never wrote anything again, so the record said a run
+        # was about to begin for as long as the home existed. It blocked nothing, but
+        # it accumulated in `status` and in the captain's report as work in flight
+        # that no process was doing.
+        #
+        # Identity is the exact command rather than the run id in it: the creating
+        # process is `siana-clean start`, which does not name the run it is about to
+        # make, and it has finished exec'ing before the record is written. This is
+        # the comparison `take_lock` makes of a lock holder, for the same reason.
+        #
+        # Terminal and never resumed. Nothing is started here on the strength of a
+        # record: a run whose creator died before spawning has no cleaner to adopt,
+        # and `start` is what begins one.
+        pid, command = rec.get("pid"), rec.get("command") or ""
+        if not (pid and command and process_command(pid) == command):
+            rec = dict(rec, status="failed",
+                       detail="the process starting it is gone; no cleaner ran")
     return rec
 
 
@@ -1072,7 +1157,7 @@ def spawn(paths: Home, rec: dict, resolved) -> dict:
     killed = []
 
     def on_deadline():
-        killed.append(f"the round passed {ROUND_S // 60} minutes")
+        killed.append(f"the round passed {duration(ROUND_S)}")
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
@@ -1260,9 +1345,12 @@ def cmd_start(paths: Home, args) -> int:
         run_id = run_id_for(paths)
         os.makedirs(paths.run_dir(run_id), exist_ok=True)
         runbook_init(paths.runbook)
+        # The creator's own pid and command go in, so that `state` can tell a run
+        # that is about to start from one whose starter died before it could.
         rec = {"id": run_id, "started": now(), "updated": now(),
                "status": "starting", "grants": grants, "project": args.project,
-               "round": 0, "detail": "not started yet"}
+               "round": 0, "detail": "not started yet",
+               "pid": os.getpid(), "command": process_command(os.getpid())}
         write_json(paths.record(run_id), rec)
         print(f"started  {run_id}")
         return finish(paths, rec, spawn(paths, rec, None))

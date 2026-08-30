@@ -19,12 +19,37 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import unittest
 
 from helpers import BIN, TEMPLATE, HomeTest, gone_pid, script, until
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 c = script("siana-clean")
+
+# A creator parked in the one instruction that makes the lock visible, so that a test
+# can look at the filesystem in the state a process killed at that boundary leaves
+# behind. There is no other way to see it: the real window is a single syscall wide,
+# and a test that raced for it would be the probabilistic loop that let the defect
+# through in the first place.
+PARK_AT_THE_BOUNDARY = """\
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+from helpers import script
+clean = script("siana-clean")
+
+
+def park(src, dst):
+    open(sys.argv[3], "w").close()
+    while True:
+        time.sleep(0.05)
+
+
+os.link = park
+clean.take_lock(clean.Home(sys.argv[2]), "start")
+"""
 
 # The clauses `siana-reap` is guarded with, which is the one command needing two:
 # refused outright without the grant, and refused its `--yes` with it.
@@ -290,6 +315,29 @@ class AssistantText(unittest.TestCase):
             {"type": "message_end",
              "message": {"role": "assistant",
                          "content": [{"type": "toolCall", "name": "bash"}]}})))
+
+
+class Duration(unittest.TestCase):
+    """How long a round was given, as the watchdog says it out loud.
+
+    A pure function of one integer, so it belongs under a direct test rather than
+    behind a spawned round that has to actually wedge to print one.
+    """
+
+    def test_the_round_a_captain_actually_gets_reads_as_it_always_did(self):
+        self.assertEqual(c.duration(1800), "30 minutes")
+
+    def test_a_span_under_a_minute_is_said_in_seconds(self):
+        # `ROUND_S // 60` said "0 minutes" for every one of these, which is the only
+        # bound the suite ever drives and the only place the message is read closely.
+        self.assertEqual(c.duration(1), "1 second")
+        self.assertEqual(c.duration(3), "3 seconds")
+        self.assertEqual(c.duration(59), "59 seconds")
+
+    def test_a_span_that_is_not_whole_minutes_keeps_the_remainder(self):
+        self.assertEqual(c.duration(60), "1 minute")
+        self.assertEqual(c.duration(90), "1 minute 30 seconds")
+        self.assertEqual(c.duration(3661), "61 minutes 1 second")
 
 
 class Run(HomeTest):
@@ -676,6 +724,83 @@ class Run(HomeTest):
         self.assertAccepted(self.clean("start"))
         self.assertFalse(os.path.exists(self.at("cleanup", "lock")))
 
+    def test_two_real_callers_leave_one_run_and_one_contention_refusal(self):
+        # The race, decided rather than raced for. The first caller is parked inside
+        # its own round, so it provably holds the lock when the second one arrives,
+        # and the second one is an ordinary foreground call. Racing two `start`s and
+        # looking at what came out is the test this replaces: it agreed with the
+        # defect two times in five and with the fix the other three.
+        barrier = self.at("go")
+        self.write_script({"steps": [{"waitfor": barrier},
+                                     {"say": "Inventoried 3 worktrees."}],
+                           "exit": 0})
+        winner = subprocess.Popen(
+            [os.path.join(BIN, "siana-clean"), "start"], cwd=self.home,
+            env=self.command_env({"PATH": self.distro_path(self.fakebin),
+                                  "SIANA_FAKE_PI": self.script_path}),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True)
+        self.addCleanup(winner.kill)
+        self.assertTrue(until(lambda: self.calls()), "the winner never started")
+
+        loser = self.clean("start")
+        text = self.assertRefused(loser, "already starting or resuming",
+                                  str(winner.pid))
+        # The refusal this path exists to produce, and not the one it used to give:
+        # a healthy run was holding the lock, so nothing was corrupt and moving it
+        # aside would have unprotected a live run.
+        self.assertNotIn("edited or lost", text)
+        self.assertNotIn("move it aside", text)
+
+        open(barrier, "w").close()
+        self.assertEqual(winner.wait(timeout=60), 0)
+        self.assertEqual(len(self.runs()), 1)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_creator_killed_before_the_lock_is_visible_leaves_none(self):
+        # The window the corruption message came out of. The lock used to be created
+        # empty and filled afterwards, so a creator killed between the two left a
+        # file that named no holder - and every later caller read that as a corrupt
+        # store and was told to delete it. Created whole, there is nothing at the
+        # path until there is a whole record at it.
+        reached = self.at("reached")
+        program = self.at("park.py")
+        with open(program, "w") as fh:
+            fh.write(PARK_AT_THE_BOUNDARY)
+        parked = subprocess.Popen(
+            [sys.executable, program, HERE, self.home, reached],
+            env=self.command_env(), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(parked.kill)
+        self.assertTrue(until(lambda: os.path.exists(reached)),
+                        f"never reached the boundary: {parked.poll()}")
+        self.assertFalse(os.path.exists(self.at("cleanup", "lock")),
+                         "a lock naming nobody was visible at the boundary")
+
+        parked.kill()
+        parked.wait(timeout=30)
+        self.assertFalse(os.path.exists(self.at("cleanup", "lock")))
+        # Recovered by taking a lock that is simply not there, rather than by
+        # deleting one on a guess about who left it.
+        self.assertAccepted(self.clean("start"))
+
+    def test_a_lock_naming_no_holder_is_refused_and_never_called_corrupt(self):
+        # Exactly the state the old creator left mid-write, and the reproduction the
+        # review used. This version cannot produce it, so a lock like this predates
+        # it or was hand-edited - and neither is corruption to report nor a holder
+        # to overwrite.
+        os.makedirs(self.at("cleanup"), exist_ok=True)
+        open(self.at("cleanup", "lock"), "w").close()
+        for argv in (("start",), ("resume", "clean-20260101-000000")):
+            text = self.assertRefused(self.clean(*argv), "does not name a holder")
+            self.assertIn("`siana-clean status` says whether a run is live", text)
+            self.assertNotIn("atomic rename", text)
+            self.assertNotIn("edited or lost", text)
+            self.assertNotIn("move it aside", text)
+        # Refused, and never quietly removed: a live run may be behind it.
+        self.assertTrue(os.path.exists(self.at("cleanup", "lock")))
+        self.assertEqual(self.calls(), [])
+
     # -- failure, and what it leaves behind ---------------------------------
 
     def test_no_pi_is_a_refusal_that_names_the_manual_route(self):
@@ -688,6 +813,55 @@ class Run(HomeTest):
                            env={"PATH": self.path_without("pi"),
                                 "SIANA_FAKE_PI": self.script_path})
         self.assertRefused(out, "pi is not on PATH", "siana-retire")
+
+    def test_a_starter_that_died_before_spawning_stops_reading_as_starting(self):
+        # `start` writes the record before it looks for `pi`, so a start that never
+        # got a cleaner going left a run saying it was about to begin for as long as
+        # the home existed. It blocked nothing, which is why it survived review, but
+        # it accumulated in `status` and in the captain's report as work in flight
+        # that no process was doing.
+        out = self.run_cmd([os.path.join(BIN, "siana-clean"), "start"],
+                           env={"PATH": self.path_without("pi"),
+                                "SIANA_FAKE_PI": self.script_path})
+        self.assertRefused(out, "pi is not on PATH")
+        run_id = self.only_run()
+        # Nothing rewrote the record: the process that would have was the one that
+        # died. It is the reader that stops believing it.
+        self.assertEqual(self.record(run_id)["status"], "starting")
+        text = self.assertAccepted(self.clean("status"))
+        self.assertIn("failed", text)
+        self.assertIn("no cleaner ran", text)
+        self.assertNotIn("not started yet", text)
+        # Terminal, and never a run to adopt: no cleaner was spawned to pick up.
+        self.assertEqual(self.calls(), [])
+
+    def test_a_run_whose_starter_is_still_alive_is_left_alone(self):
+        # The half that makes the check above safe. A `start` in its own first
+        # moments is exactly this record, and a reader that called it dead would
+        # report a live run as failed.
+        run_id = "clean-20260101-000000"
+        os.makedirs(self.at("cleanup", "runs", run_id), exist_ok=True)
+        with open(self.at("cleanup", "runs", run_id, "run.json"), "w") as fh:
+            json.dump({"id": run_id, "status": "starting", "grants": ["inventory"],
+                       "project": None, "round": 0, "detail": "not started yet",
+                       "pid": os.getpid(),
+                       "command": c.process_command(os.getpid())}, fh)
+        text = self.assertAccepted(self.clean("status"))
+        self.assertIn("starting", text)
+        self.assertNotIn("no cleaner ran", text)
+
+    def test_a_starting_run_wearing_a_reused_pid_is_not_alive(self):
+        # Pids are reused, so the pid alone says nothing. This is the comparison the
+        # lock and `siana-watch` both make of their own holder.
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.kill)
+        run_id = "clean-20260101-000000"
+        os.makedirs(self.at("cleanup", "runs", run_id), exist_ok=True)
+        with open(self.at("cleanup", "runs", run_id, "run.json"), "w") as fh:
+            json.dump({"id": run_id, "status": "starting", "grants": ["inventory"],
+                       "project": None, "round": 0, "detail": "not started yet",
+                       "pid": other.pid, "command": "some other command"}, fh)
+        self.assertIn("no cleaner ran", self.assertAccepted(self.clean("status")))
 
     def test_a_child_that_exits_nonzero_leaves_the_run_failed_and_says_so(self):
         self.write_script({"steps": [{"say": "half a round"}], "exit": 7})
@@ -717,7 +891,10 @@ class Run(HomeTest):
         started = time.time()
         out = self.clean("start", extra={"SIANA_CLEAN_ROUND_S": "1"}, timeout=90)
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
-        self.assertIn("passed 0 minutes", out.stdout)
+        # The bound it actually enforced. `ROUND_S // 60` read "0 minutes" here, and
+        # a watchdog that names a bound it did not enforce is the same defect as a
+        # refusal that names a mechanism that is not there.
+        self.assertIn("passed 1 second", out.stdout)
         self.assertLess(time.time() - started, 60)
 
     def test_a_terminated_command_kills_the_cleaner_and_records_the_round(self):
