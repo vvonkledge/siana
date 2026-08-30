@@ -26,9 +26,21 @@ this file is how you drive it. The first thing a run of it executes is the suite
 
     just test
 
-Three or four minutes. It drives the pure mechanics in-process and drives the
-commands as real processes against a real `tasks` and `datafile`, because a stubbed
-store would only ever agree with the suite.
+It drives the pure mechanics in-process and drives the commands as real processes
+against a real `tasks` and `datafile`, because a stubbed store would only ever
+agree with the suite.
+
+That makes it latency-bound rather than CPU-bound - it spent 0.75 of one core for
+the whole of a ten-minute serial run - so `tests/run.py` runs it across a pool of
+worker processes sized from the machine. It prints the pool size on its first line.
+When a failure looks like it might be the pool's fault rather than the code's, take
+the pool out of the picture:
+
+    SIANA_TEST_WORKERS=1 just test
+
+That is `unittest`, serially, in one process, and it is the control every timing
+here is measured against. Expect it to take about as long as the whole suite used
+to.
 
 Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
 and answers when it answers, so the answers that matter most - herdr slow, wrong, or

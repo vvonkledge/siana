@@ -204,6 +204,13 @@ class HomeTest(unittest.TestCase):
         # one place a suite must not disagree with itself. The test of that refusal
         # sets the variable back, deliberately.
         e.pop("SIANA_TASK_ID", None)
+        # The suite's own tests run inside a worker of `tests/run.py`, which marks
+        # its workers with this. Left in, a command under test that is itself a run
+        # of the suite would start in worker mode and sit waiting on a coordinator
+        # that is never going to talk to it. `tests/test_run.py` is where that
+        # happens, and a hang there would be a hang in the runner's own tests.
+        e.pop("SIANA_TEST_WORKER", None)
+        e.pop("SIANA_TEST_SYSPATH", None)
         e.update(extra or {})
         return e
 
