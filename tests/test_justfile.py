@@ -148,6 +148,7 @@ class Doctor(Recipe):
         self.assertIn("missing AGENTS.md", out.stdout)
         self.assertIn("missing orders.md", out.stdout)
 
+    @unittest.skipUnless(has("node"), "this machine has no node")
     def test_the_console_runtime_is_reported_when_it_is_there(self):
         self.assertIn("ok      node -> ", self.just("doctor").stdout)
 
