@@ -497,7 +497,8 @@ class DryRun(Publishable):
 
     def test_a_dry_run_still_describes_the_plan_without_the_cli(self):
         # A dry run changes nothing, so it has to stay readable on a machine that
-        # could not carry it out - including CI, which has neither glab nor gh.
+        # could not carry it out. Which machines those are is not this test's to
+        # guess: the client is hidden by name, wherever the host keeps one.
         text = self.assertAccepted(self.run_bin(
             "siana-publish", "qa-add-json", "--dry-run",
             env={"PATH": self.path_with_no_forge_client()}))
@@ -740,8 +741,8 @@ class UnderAnAdvisorySession(Publishable):
 
     def test_the_push_does_not_happen_and_the_proposal_is_recorded(self):
         # The whole of what an advisory night produces. No PATH is restricted here:
-        # the gate is asked before the check for a forge CLI, so this is the same
-        # answer on a machine that has one and on CI, which has neither.
+        # the gate is asked before the check for a forge CLI, so the answer is the
+        # same whether or not the machine running this has a client installed.
         out = self.run_bin("siana-publish", "qa-add-json",
                            "--record", self.record())
         self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)

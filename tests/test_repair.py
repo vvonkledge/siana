@@ -421,7 +421,9 @@ class Advancing(Fleet):
         self.assertIn("## Hotspots", text)
 
     def test_a_dry_run_without_the_client_still_says_what_it_would_do(self):
-        # CI has neither client, and a dry run has to stay readable there.
+        # A dry run has to stay readable on a machine that could not carry it
+        # out. Which machines those are is not this test's to guess: the client
+        # is hidden by name, wherever the host keeps one.
         text = self.assertAccepted(
             self.publish("--dry-run", PATH=self.path_with_no_forge_client()))
         self.assertIn(self.ship_branch, text)
