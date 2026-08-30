@@ -395,11 +395,36 @@ class Routes(Console):
         # quietly normalised its way into serving one would pass every other test.
         for target in ("/api/state/../../../etc/passwd", "/api/../../etc/passwd",
                        "/api/state/..%2f..%2fetc%2fpasswd", "/%61pi/state",
-                       "/api/state%00", "//api/state", "/api/state/.."):
+                       "/api/state%00", "/api/state/.."):
             with self.subTest(target):
                 status, _, body = self.request(target)
                 self.assertEqual(status, 404, body)
                 self.assertNotIn("root:", body)
+
+    def test_a_target_carrying_its_own_authority_is_refused_before_routing(self):
+        """A request target that names a host is not a path.
+
+        `//evil.com/api/state`, its backslash spelling, and the absolute form a
+        proxy sends all resolve to the pathname `/api/state`, because the authority
+        in the target replaces the one the parser was given. Routed on that
+        pathname they would be served as if they had asked for the route, and the
+        route table would be keyed on a path that was never in the request.
+
+        Nothing here opens a file, so what that costs today is a snapshot answered
+        under a name nobody asked for. It is refused anyway, because this table is
+        what slice 3 serves a bundle from.
+        """
+        for target in ("//evil.com/api/state", "//api/state",
+                       "/\\evil.com/api/state", "http://evil.com/api/state",
+                       "https://evil.com/api/stream", "//evil.com/nope"):
+            with self.subTest(target):
+                # A short timeout, because the regression this guards against
+                # serves `/api/stream` for one of these, and a stream read waiting
+                # out the default would stall the suite instead of failing it.
+                status, _, body = self.request(target, timeout=15)
+                self.assertEqual(status, 400, body)
+                self.assertEqual(json.loads(body)["code"], "BAD_TARGET")
+                self.assertNotIn("sources", body)
 
     def test_a_query_string_reaches_no_other_route(self):
         for target in ("/api/state?rev=", "/api/state?rev=nothing",

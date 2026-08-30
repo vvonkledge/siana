@@ -671,11 +671,24 @@ async function poll(home) {
 }
 
 async function handle(req, res, home) {
+  // Origin-form only, and checked before anything is parsed. A request target that
+  // carries its own authority makes `URL` discard the base and read the authority
+  // out of the target instead, so `//evil.com/api/state`, `/\evil.com/api/state`
+  // and the absolute form a proxy sends all arrive with pathname `/api/state` and
+  // would be routed as if that is what had been asked for. Nothing here opens a
+  // file, so today that would only mean the same snapshot under a name nobody
+  // asked for - but this table is what a later slice serves a bundle from, and a
+  // route table keyed on a path that was never in the request is not one.
+  if (!req.url.startsWith('/') || req.url[1] === '/' || req.url[1] === '\\') {
+    refuse(res, 400, 'BAD_TARGET',
+           `${req.url} is not a path; this serves origin-form requests only`);
+    return;
+  }
   // Parsed by `URL` rather than split by hand: it resolves `.` and `..` segments
   // before anything is compared, and it leaves percent-encoding alone, so
   // `/%61pi/state` stays unequal to `/api/state` instead of being decoded into it.
-  // Nothing here opens a file for a path anyway - a path is one of two constants or
-  // it is a refusal - so traversal has nothing to reach even when it parses.
+  // A path is one of two constants or it is a refusal, so traversal has nothing to
+  // reach even when it parses.
   let url;
   try {
     url = new URL(req.url, `http://${HOST}`);
