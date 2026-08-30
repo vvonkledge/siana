@@ -221,13 +221,15 @@ The registry is yours, so SIANA writes it only when told to, with:
     datafile -f ~/.siana/projects.jsonl put \
         --set handle=<handle> --set path=<path> --set ship='<verify command>'
 
-`~/.siana/schema-projects.yaml` is the full field list. Three are worth knowing about
+`~/.siana/schema-projects.yaml` is the full field list. Four are worth knowing about
 when you ask: `qa` is an independent validation command, and setting it puts a QA
 task behind every ship task in that project; `orders` names a file of extra standing
 orders every minion there is started with, which is where a project's own conventions
 belong; `pipeline` says work there is validated by a pipeline the minion drives
 instead of by a command that runs once, and is described under "A rigor the minion
-drives" below.
+drives" below; `automerge` is standing permission for SIANA to arrange the merge of
+work that has been through all of that, and is described under "Letting accepted work
+merge" below.
 
 ### Branches the fleet leaves in your repository
 
@@ -297,6 +299,67 @@ closed or merged one, a branch that has moved under the request, a head that is 
 fast-forward of what the request holds, or a minion still working on that branch all
 stop before anything is pushed. So does a repair branch that moved after its verdict,
 because the head that goes out is the one a second minion actually read.
+
+### Letting accepted work merge
+
+Everything above stops at an open merge request, and merging it is yours. If you would
+rather it merged on its own once it has been through all of that, say so on the
+project's registry record:
+
+    datafile -f ~/.siana/projects.jsonl put \
+        --set handle=<handle> --set path=<path> --set ship='<test command>' \
+        --set qa='<qa command>' --set target=<branch> --set pipeline=true \
+        --set automerge=squash
+
+The value is `merge`, `squash` or `rebase`, and it is both the permission and the
+method. There is no default and nothing infers one: how your history reads is not a
+choice a script gets to make on your behalf, and the contract refuses anything else at
+the write.
+
+**It delegates arranging, not deciding.** What SIANA does with it is ask the forge to
+merge that one request, pinned to that one commit, once every check and review your
+branch protection requires has passed. Your protection rule is still the gate, and it
+is the thing that actually merges. SIANA never merges anything itself, with or without
+this field.
+
+**Nothing infers it.** Not a previous merge, not the repository's settings, not the
+shape of a branch, and not anything an agent read, wrote or was told. This record is
+the only place it exists, and the file is yours.
+
+**It adds a condition, it does not remove three.** A project with this field and
+without `pipeline`, `qa` or `target` refuses to publish at all rather than publishing
+under a weaker version of what you asked for. What has to hold before anything is
+arranged: a driven pipeline run that passed at the accepted head, a QA task that came
+back `done` on that same head, the branch on your remote still at it, an open
+non-draft request from that branch to `target`, and at least one required check on
+that head. A pending check may arm it; a failed one may not; no checks at all is never
+read as a green.
+
+**Arming is not merging, and it is not a promise.** All you have afterwards is a
+request the forge will merge if its own gate goes green. If a check fails, it sits
+there open exactly as it would have.
+
+`siana-publish --dry-run` prints the method, the accepted head, the required checks
+and whether it would arm, and changes nothing.
+
+**Turning it off has an order.** What is armed lives at the forge, so it outlives this
+fleet: taking the field off the record stops the next one being armed and retracts
+nothing already armed. Cancel first, check, then remove the field:
+
+    siana-publish <qa-task-id> --cancel-automerge
+
+That disarms the request and then asks the forge again to prove it is disarmed. It
+needs neither the field nor a `target`, precisely so it still works once you have
+removed either, and running it twice says `nothing armed` rather than doing anything
+a second time. A cancel the forge accepted but did not apply is a refusal that tells
+you to go and look, never a report that it worked.
+
+**Only GitHub.** GitLab is refused under this field, and publishes to it exactly as it
+did before. `glab` has no command that cancels an armed merge and none that says which
+checks a project requires - a merge request there has one pipeline, and whether it
+must be green is a project setting the client does not report. So on GitLab an arming
+could not be retracted, and "this branch requires nothing" and "I could not ask"
+arrive as the same empty answer. Neither is a thing to build a merge on.
 
 The push and the description are two calls, so an interrupted run can leave the new
 commits under the old copy. Running it again pushes nothing and puts the copy on.
@@ -460,8 +523,10 @@ Two things it will not do. A minion cannot start one: `siana-afk` refuses outrig
 report cannot talk a well-meaning minion into starting a session on your behalf. That
 is a guard rail and not a boundary, because minions run with permissions that let one
 unset the variable first; closing it properly means narrowing those permissions, which
-is a separate change. And it never merges. Merging is permanently yours, and so is
-skipping a QA pair and answering a pipeline finding marked `decide`.
+is a separate change. And it never merges, whatever a project's registry record says:
+a standing grant is permission for the ordinary attended path, and a session in force
+is you saying decisions are being written down rather than made. Skipping a QA pair
+and answering a pipeline finding marked `decide` are permanently yours either way.
 
 ### A rigor the minion drives
 

@@ -28,8 +28,15 @@ jobs:
     # Named for the command it runs, so a red check tells you what to run locally.
     name: just test
     runs-on: ubuntu-latest
-    # The suite takes three or four minutes. This is a hang guard, not a budget.
-    timeout-minutes: 15
+    # A hang guard, not a budget, and it has to keep being one. 15 was set when the
+    # suite took three or four minutes. It takes twelve here now (run 33327608649,
+    # `just test` 18:17:09 to 18:29:10), so the guard had become the budget without
+    # anybody choosing that, and the margin was down to the length of one feature's
+    # tests. Raised so it is a guard again. Moved with the suite rather than the
+    # suite trimmed to fit it: what fills those twelve minutes is commands driven as
+    # real processes against a real store, which is the guarantee this project is
+    # built on, and a budget here would be paid for by dropping it.
+    timeout-minutes: 25
 
     env:
       # Pinned rather than tracked, so a red run stays reproducible tomorrow. The

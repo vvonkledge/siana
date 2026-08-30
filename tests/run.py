@@ -39,8 +39,10 @@ TESTS = os.path.dirname(os.path.abspath(__file__))
 # --script` program resolving its dependencies from the network the first time
 # anything reaches for them. A watchdog under that turns one slow-but-passing test
 # into a red run, and `exit=True` means `_exit`, so it would take every `addCleanup`
-# with it and strand the children they remove. Eight minutes leaves seven of CI's
-# fifteen-minute guard, so the stack always beats the kill.
+# with it and strand the children they remove. Eight minutes is under CI's own guard
+# in `.github/workflows/ci.yml`, which is what makes the stack beat the kill: this
+# is per test and that one is for the whole job, so a single stalled test always
+# dumps its stack first however long the suite has grown.
 STALL_S = 480
 
 # The suite's size, for the progress line. Set by the runner below, which is the

@@ -90,9 +90,10 @@ command -v "$harness" >/dev/null || {
 # to the system prompt makes that a guarantee rather than a read SIANA might skip.
 #
 # The fields are pinned rather than left to the default view, because `list` shows
-# only the first few and would silently drop `worktree` and `pipeline` - and a
-# registry that looks complete while hiding a project's isolation policy, or the
-# fact that its ship tasks take a different verify, is worse than no registry.
+# only the first few and would silently drop `worktree`, `pipeline` and `automerge` -
+# and a registry that looks complete while hiding a project's isolation policy, the
+# fact that its ship tasks take a different verify, or that its accepted work merges
+# without the captain, is worse than no registry.
 #
 # A registry that cannot be read is a stop, not an empty registry. Injecting an
 # error message here would leave SIANA believing the captain has no projects.
@@ -104,7 +105,8 @@ command -v "$harness" >/dev/null || {
 context=""
 if [ -f "$home/schema-projects.yaml" ]; then
     if ! registry="$(datafile -f "$home/projects.jsonl" \
-            list --fields handle,path,ship,pipeline,orders,worktree 2>&1)"; then
+            list --fields handle,path,ship,pipeline,automerge,orders,worktree \
+            2>&1)"; then
         echo "the project registry at $home/projects.jsonl is not readable" >&2
         echo "$registry" >&2
         exit 1

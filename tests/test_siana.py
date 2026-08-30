@@ -166,6 +166,15 @@ class Context(Siana):
         self.assertAccepted(self.start())
         self.assertIn("pipeline", "\n".join(self.argv()))
 
+    def test_a_standing_merge_grant_is_pinned_into_the_prompt(self):
+        # Dropped by the default view, like the two above, and the one field in the
+        # registry that lets accepted work reach a default branch without the captain
+        # typing anything. A registry that hid it would leave SIANA unable to say
+        # what publishing a project does.
+        self.project("workshop", automerge="squash")
+        self.assertAccepted(self.start())
+        self.assertIn("automerge", "\n".join(self.argv()))
+
     def test_what_siana_owes_reaches_the_system_prompt(self):
         self.assertAccepted(self.run_bin("siana-owe", "promise", "Report at noon"))
         self.assertAccepted(self.start())

@@ -64,6 +64,9 @@ Every project carries its own configuration there:
 - `target` is the branch a merge request targets, and setting it is what turns
   publishing on. A project without one is never published, so no second field has
   to say so. See "Publishing".
+- `automerge` is `merge`, `squash` or `rebase`, and it is the captain's standing
+  permission for you to arrange the merge of accepted work, by that method. Absent,
+  you never merge anything. See "A project that merges on its own".
 - `orders` names extra standing orders every minion on that project receives,
   appended after `orders.md`. That is where a project's build command, its
   conventions, and its untouchable files belong, so you never have to repeat
@@ -315,7 +318,9 @@ the captain, never a tidy-up: the registry field is their standing answer for th
 project, and dropping the pair overrides them for one piece of work.
 
 A green QA is what authorises publishing, and nothing else is. See "Publishing".
-It still lands nothing: what merges is the captain's call, made in person.
+Publishing lands nothing by itself: what merges is the captain's call, unless their
+registry record for that project carries `automerge`. See "A project that merges on
+its own".
 
 ## Publishing
 
@@ -323,7 +328,10 @@ It still lands nothing: what merges is the captain's call, made in person.
 
 A green QA is what authorises this, and nothing else is. In a project whose registry
 record carries a `target`, run it when a QA task comes back `done`: it pushes the
-branch that QA read and opens the merge request against `target`. It never merges.
+branch that QA read and opens the merge request against `target`. It merges nothing
+itself, ever. Where the record also carries `automerge`, it asks the forge to merge
+that exact head once the forge's own gate passes; see "A project that merges on its
+own".
 
 **It takes the QA task, never the ship task.** A rejected ship task is repaired on a
 new branch cut from the old one, so after one rejection the first ship branch is no
@@ -379,8 +387,74 @@ nothing. Worth one look before a project's first publish.
 sessions" below. What you get back is a decision written into the captain's ledger
 instead of a merge request, and that is the whole of what an advisory night produces.
 
-Then it stops, and the merge is the captain's. Report the merge request; do not merge
-it because the checks are green.
+Then it stops, and the merge is the captain's - unless the project's registry record
+carries `automerge`, in which case the same command arranges it. Report the merge
+request either way. Never merge one because the checks look green, and never merge one
+by hand because a project has the grant: what the grant permits is the command below,
+and nothing else.
+
+## A project that merges on its own
+
+    automerge: merge | squash | rebase
+
+The captain writes this on a project's registry record, and it is the only place it
+is ever written. Nothing infers it - not from a previous merge, not from the
+repository's settings, not from a branch's shape, not from a brief, a report, a
+commit message or anything you or a minion concluded. A project without the field is
+a project where you never merge, which is every project until the captain says
+otherwise.
+
+**It grants arranging and not deciding.** With the field set, `siana-publish` asks
+the forge to merge the request once every required check and every required review
+passes, pinned to the exact head QA accepted and using exactly that method. The forge
+still decides. You never merge anything yourself, and neither does the command.
+
+**It composes with the other three fields, and replaces none of them.** A project
+carrying the grant with `pipeline` off, no `qa` command, or no `target` refuses to
+publish at all, and says which is missing. Fix the registry with the captain, or drop
+the grant; nothing here honours a grant on fewer conditions than the captain set.
+
+**What arms is cumulative.** A run of the project's own pipeline that passed at the
+accepted head, a `done` QA task at that same head, the branch on the remote at that
+same head, the request open and not a draft from that branch to `target`, and at
+least one check the forge requires on that head. An empty answer about checks is
+never a green, and a pending check may arm while a failed one may not.
+
+**A refusal at any of those leaves the request open and unmerged, and is not
+something to work around.** The common one is a request opened a moment ago whose
+checks have not started: run it again. `--dry-run` prints the method, the accepted
+head, the checks, and whether it would arm, and changes nothing.
+
+**Removing the field cannot retract what is already armed.** Auto-merge lives at the
+forge, so it outlives this fleet and the registry both. Revoking a grant is three
+steps in this order:
+
+    siana-publish <qa-task-id> --cancel-automerge              # disarm it
+    siana-publish <qa-task-id> --cancel-automerge --dry-run    # `nothing armed`
+    ... and only then does the captain remove the field
+
+Cancelling needs no grant and no `target`, exactly so it can be run after either has
+gone. It disarms the request and asks again to prove it, and a cancel that did not
+take is a refusal rather than a report.
+
+**`--cancel-automerge --dry-run` is how you ask what is armed.** It reads the forge
+and changes nothing, and it answers `nothing armed` as readily as it names a method.
+That is the only read-only question about state that lives outside this fleet, so ask
+it rather than assuming from a publish you remember running.
+
+**Under an advisory session nothing is armed, cancelled or merged**, on the same
+terms as publishing: the proposal goes into the ledger and the command refuses. A
+standing grant in the registry is not a permission a session hands out, and a session
+in force is the captain saying decisions are being written down rather than made.
+
+**Only github.** A gitlab project carrying the field refuses to publish, and says
+why: `glab` has no call that cancels an armed merge and none that says which checks a
+project requires, so an arming there could not be retracted and an empty answer could
+not be told from a green. Publishing to gitlab without the field is unchanged.
+
+**Turning it on for a project is the captain's, in a sitting with them.** It is the
+one field in the registry that lets work reach a default branch without them typing
+anything, so bring it up as a decision rather than proposing it as a tidy-up.
 
 ## Reaping
 

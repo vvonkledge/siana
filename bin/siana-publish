@@ -14,8 +14,30 @@ publish rather than travelling with work it does not describe. Nothing here asks
 model: publishing stays a deterministic assembly of prose an agent already wrote and
 a second minion already accepted.
 
-What is deliberately not here: merging. The boundary this script reaches is the push
-target. What lands is the captain's, in person, every time.
+Merging is the captain's, unless their registry record for the project says
+otherwise. `automerge` is that record: absent, this reaches the push target and stops,
+which is what every project did before the field existed. Set to `merge`, `squash` or
+`rebase`, it is standing permission to *arrange* the merge of exactly the head an
+independent minion accepted, by exactly that method - and arranging is all it is,
+because what decides whether the merge happens is still the forge's own required
+checks and required reviews.
+
+The grant is a fourth authority and replaces none of the other three. It composes:
+`pipeline` says a run validated a commit, `qa` says a second minion accepted that same
+commit, `target` says where it lands, and only then does this ask the forge whether
+its own gate is green on that same commit. A project carrying the grant without those
+three refuses to publish at all, because a grant honoured on fewer conditions than the
+captain set is not the grant they gave.
+
+Nothing is inferred into it. Not from a previous merge, not from the repository's
+settings, not from the shape of a branch, and not from anything an agent said. The
+field is the only place it is written, and the captain owns that file.
+
+What is armed outlives this process and the registry both. Removing the field stops
+the next publish from arming anything and cannot retract what a forge already holds,
+so `--cancel-automerge` exists and is exact: it disarms the open request and then asks
+again to prove it is disarmed. Revoking the grant safely is cancel first, check, then
+remove the field, in that order.
 
 It takes the QA task and never the ship task. A rejected ship task is repaired on a
 new branch cut from the old one, so after one rejection `siana/<ship-id>` is no
@@ -362,14 +384,51 @@ def update(forge: str, path: str, branch: str, title: str, body: str):
 # and advancing a branch nobody is reading is not something to do quietly.
 REQUESTS = {
     "github": (["gh", "pr", "list", "--head", "{branch}", "--state", "all",
-                "--json", "url,state,headRefName,headRefOid"],
+                "--json", "url,state,headRefName,headRefOid,baseRefName,isDraft,"
+                          "mergeable,autoMergeRequest"],
                {"url": "url", "state": "state",
-                "head": "headRefOid", "source": "headRefName"}),
+                "head": "headRefOid", "source": "headRefName",
+                "target": "baseRefName", "draft": "isDraft",
+                "mergeable": "mergeable", "armed": "autoMergeRequest"}),
     "gitlab": (["glab", "mr", "list", "--source-branch", "{branch}", "--all",
                 "--output", "json"],
                {"url": "web_url", "state": "state",
-                "head": "sha", "source": "source_branch"}),
+                "head": "sha", "source": "source_branch",
+                "target": "target_branch", "draft": "draft",
+                "mergeable": "detailed_merge_status",
+                "armed": "auto_merge_enabled"}),
 }
+
+def request_field(name, value):
+    """One field of a request as this reads it.
+
+    Three of them are not strings. `draft` is a bool on both clients, `armed` is an
+    object on one and a bool on the other, and `mergeable` is the one whose two
+    spellings mean genuinely different things - github answers MERGEABLE or
+    CONFLICTING, gitlab answers a much longer status with its own vocabulary. Nothing
+    compares `mergeable` across the two, because only github is ever asked to arrange
+    a merge; on gitlab it is carried for the same reason `armed` is, so that a report
+    can say what the forge holds without a second call."""
+    if name == "draft":
+        return bool(value)
+    if name == "armed":
+        return armed_with(value)
+    return str(value or "")
+
+
+def armed_with(value):
+    """The method an open request is already armed to merge with, or "" when it is
+    not armed at all.
+
+    github answers with the whole auto-merge record or with null, gitlab with a bool.
+    Reduced to one string here so nothing downstream has to know which, and so a
+    request armed with a method other than the configured one reads as different
+    rather than as done."""
+    if isinstance(value, dict):
+        return str(value.get("mergeMethod") or "armed").lower()
+    if value is True:
+        return "armed"
+    return ""
 
 # github says OPEN, gitlab says opened. Both also have states this must not treat as
 # one: a merged request whose branch is advanced afterwards is work pushed at
@@ -397,7 +456,8 @@ def requests_for(forge: str, path: str, branch: str):
         return None, f"{argv[0]} answered something that is not JSON"
     if not isinstance(found, list) or any(not isinstance(r, dict) for r in found):
         return None, f"{argv[0]} answered something that is not a list of requests"
-    listed = [{name: str(r.get(key) or "") for name, key in fields.items()}
+    listed = [{name: request_field(name, r.get(key))
+               for name, key in fields.items()}
               for r in found]
     # Filtered here as well as asked for. The source branch is the whole of what ties
     # a request to this work, and a client that widened its own matching would hand
@@ -427,9 +487,493 @@ def held(tasks_file: str, handle: str, branch: str):
     return None
 
 
+# The forges a standing `automerge` grant is honoured on, and the three calls each
+# one needs spelled as that forge's client spells them.
+#
+# Only github is here, and the absence of gitlab is the boundary rather than a gap
+# waiting to be filled. Two of the three have no `glab` spelling at all. There is no
+# subcommand that cancels an armed merge, so arming one would create external state
+# this fleet has no exact way to retract. And there is no list of the checks a gitlab
+# project requires: a merge request there has one pipeline, and whether it has to be
+# green is a project setting the client does not report, so "this branch has no
+# required check" and "this project requires nothing" arrive as the same empty
+# answer. Reading that as a green is the exact failure the grant is written to make
+# impossible, so gitlab is refused under it and publishes as it always did.
+AUTOMERGE = {
+    "github": {
+        "checks": ["gh", "pr", "checks", "{branch}", "--required",
+                   "--json", "name,state,bucket"],
+        "arm": ["gh", "pr", "merge", "{branch}", "--auto", "{method}",
+                "--match-head-commit", "{head}"],
+        "cancel": ["gh", "pr", "merge", "{branch}", "--disable-auto"],
+        # The client's word for each method the contract allows. Passed through and
+        # never defaulted: a script choosing between these would be choosing how the
+        # captain's history reads.
+        "methods": {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"},
+    },
+}
+
+# What `gh pr checks` calls a check that has already decided against the work. A
+# pending one may still arm - waiting for CI is the whole reason to arm at all - and
+# a skipped one is a check the forge itself is not holding the merge for.
+CHECK_FAILED = {"fail", "cancel"}
+
+
+def pipeline_run(home: str, task_id: str):
+    """The passing `siana-pipeline` run recorded for this task, or why there is none.
+
+    Read exactly as `siana-pipeline check` reads it and never re-run: a run validates
+    one commit and writes down which, and the whole use of it here is comparing that
+    commit against the head an independent minion accepted."""
+    path = os.path.join(home, "pipeline", f"{task_id}.json")
+    if not os.path.isfile(path):
+        return None, f"there is no run recorded at {path}"
+    try:
+        with open(path) as fh:
+            record = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"{path} cannot be read: {e}"
+    if record.get("verdict") != "passed":
+        return None, f"the run at {path} did not pass ({record.get('verdict')})"
+    return record, None
+
+
+def automerge_grant(home: str, registry: str, handle: str, project, forge: str,
+                    ship_id: str, branch: str, accepted: str) -> None:
+    """Refuse unless every standing condition for a delegated merge holds here.
+
+    All of it is about this registry and this machine, so all of it is known before
+    anything is pushed and all of it refuses there. A project carrying the grant with
+    a prerequisite missing refuses the publish outright rather than publishing and
+    quietly arming nothing: the captain set the field to say work here merges once
+    it is accepted, and a run that pushed the branch and left the merge unarranged
+    would read afterwards as the grant having been honoured.
+
+    The grant is a fourth authority and stands in for none of the other three. `qa`
+    is what makes a second minion's acceptance a condition rather than a habit;
+    `pipeline` is what makes a run's verdict bound to a commit rather than to a
+    branch; `target` is what makes publishing happen at all. Cumulative and never
+    substitutable: a local green says nothing about what QA will find, and a QA green
+    says nothing about what the forge's own checks will find on the published head.
+    """
+    if forge not in AUTOMERGE:
+        die(f"{handle} grants automerge, and this fleet does not arrange merges "
+            f"on {forge}",
+            "there is no client call there that cancels an armed merge, and none",
+            "that says which checks the project requires, so an armed merge could",
+            "not be retracted and an empty answer could not be told from a green",
+            f"  datafile -f {registry} get {handle}   # then put it back",
+            "  ... without --set automerge=...",
+            "then publish again and merge it in person")
+
+    if not project.get("pipeline"):
+        die(f"{handle} grants automerge and is not validated by a driven pipeline",
+            "the grant merges on the strength of a run bound to one commit, and a",
+            "verify that runs once at `done` records no commit to bind to",
+            f"set `pipeline` on {handle}, or drop `automerge` and merge in person")
+
+    if not project.get("qa"):
+        die(f"{handle} grants automerge and has no `qa` command",
+            "the grant delegates arranging a merge, not deciding one; what decides",
+            "is a second minion, and without `qa` no ship task here gets one",
+            f"set `qa` on {handle}, or drop `automerge` and merge in person")
+
+    record, why = pipeline_run(home, ship_id)
+    if record is None:
+        die(f"{ship_id} has no passing pipeline run to merge on", why,
+            "the grant is standing permission to merge work this project's own",
+            "rigor accepted, and nothing here says it did")
+    if record.get("branch") != branch:
+        die(f"the run recorded for {ship_id} validated "
+            f"{record.get('branch')}, not {branch}",
+            "it is a verdict about some other branch, so it says nothing about the",
+            "work an independent minion accepted here")
+    if record.get("head") != accepted:
+        die(f"the run recorded for {ship_id} validated "
+            f"{str(record.get('head'))[:12]}, and {branch} is at {accepted[:12]}",
+            "the branch moved after the run, so the head QA accepted is one this",
+            "project's own rigor never saw; run the pipeline again over what is",
+            "there, have it accepted again, then publish")
+
+
+def required_checks(forge: str, path: str, branch: str):
+    """The checks this branch's request has to pass before the forge will merge it,
+    or why nothing could be asked.
+
+    The exit code is deliberately not read. The client exits nonzero when a required
+    check has failed, when the branch has no check at all, and when it could not ask
+    at all, and it exits 8 while one is still running - so no exit code here is a
+    verdict about anything. What it printed is: a list of checks is an answer, and
+    everything else - a login page, an error object, the client's own "no checks
+    reported", silence - is not one.
+
+    Both of those refuse upstream, which is why this does not try to tell an empty
+    answer from an unreachable forge by reading the client's English. What it does
+    keep apart is the two things a list can say: an empty list is a request nothing
+    is required of, and that is a fact about a protection rule rather than about a
+    client. Neither is ever a green."""
+    argv = [part.replace("{branch}", branch) for part in AUTOMERGE[forge]["checks"]]
+    out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    try:
+        found = json.loads(out.stdout or "null")
+    except json.JSONDecodeError:
+        found = None
+    if not isinstance(found, list) or any(not isinstance(c, dict) for c in found):
+        return None, ((out.stderr or out.stdout).strip()
+                      or f"{argv[0]} exited {out.returncode} and said nothing")
+    return [{"name": str(c.get("name") or "?"),
+             "state": str(c.get("state") or ""),
+             "bucket": str(c.get("bucket") or "").lower()} for c in found], None
+
+
+def one_request(forge: str, path: str, branch: str, accepted: str):
+    """The open request from this branch, the merged one holding the accepted head,
+    or why there is neither.
+
+    Answers `(kind, request, refusal)`. A merged request at the accepted head is an
+    end state rather than a problem: the grant did what it was set to do, and a
+    re-run after the forge merged has to report that instead of hunting for
+    something to arm."""
+    found, problem = requests_for(forge, path, branch)
+    if problem is not None:
+        return None, None, (
+            f"{forge} could not say what is open from {branch}", problem,
+            "a merge is arranged against a request that exists, so a forge that",
+            "cannot be asked is a refusal and never an assumption about one")
+    merged = [r for r in found
+              if r["state"].lower() == "merged" and r["head"] == accepted]
+    if merged:
+        return "merged", merged[0], None
+    open_now = [r for r in found if r["state"].lower() in OPEN]
+    if not open_now:
+        return None, None, (
+            f"no request is open from {branch}",
+            *[f"  {r['state']}: {r['url']}" for r in found],
+            "there is nothing to arrange the merge of, and a closed or merged",
+            "request holding some other head is not this work")
+    if len(open_now) > 1:
+        return None, None, (
+            f"{branch} is the source of more than one open request",
+            *[f"  {r['url']}" for r in open_now],
+            "which one an accepted head merges on is the captain's to say, and not",
+            "something a script may choose between")
+    return "open", open_now[0], None
+
+
+def automerge_state(forge: str, path: str, branch: str, target: str, method: str,
+                    accepted: str, pushed: bool = True):
+    """Whether this request may be armed, and what it is carrying.
+
+    Answers `(verdict, request, checks, refusal)`, acts on nothing, and is the whole
+    of the decision - so the dry run explains what a real run would do by asking the
+    same question. `merged` and `armed` are end states, which is what makes a re-run
+    a report rather than a repetition.
+
+    The accepted head is asked for three separate times: the request's, the remote
+    branch's, and the request's again once the checks have been read. A branch that
+    moves anywhere in that window is work no independent minion accepted, and the
+    checks just read describe a commit that is no longer the one being merged. The
+    arming call carries the head a fourth time, so the forge refuses it too.
+
+    `pushed` is false for a dry run, which happens before the push and therefore
+    before any of that is true yet: the request is at whatever the last publish left
+    it at, and the remote may not have the branch at all. Comparing then would refuse
+    every dry run of work that has not been published, which is exactly the run a
+    captain does before a project's first publish. The three head comparisons are the
+    only thing it turns off, and what still holds without them is that a real run
+    makes all three and the forge makes a fourth."""
+    kind, request, refusal = one_request(forge, path, branch, accepted)
+    if refusal is not None:
+        return "refuse", None, None, refusal
+    if kind == "merged":
+        return "merged", request, None, None
+
+    if request["target"] and request["target"] != target:
+        return "refuse", request, None, (
+            f"{request['url']} targets {request['target']}, and {branch} publishes "
+            f"to {target}",
+            "the grant is permission to merge into the branch the registry names,",
+            "and this would merge somewhere else")
+    if request["draft"]:
+        return "refuse", request, None, (
+            f"{request['url']} is a draft",
+            "a draft is a request its author has said is not ready, and the grant",
+            "does not overrule that")
+    # github's word, and the only one compared here: gitlab is refused above, so
+    # its own longer status is never read as a verdict.
+    if request["mergeable"].lower() == "conflicting":
+        return "refuse", request, None, (
+            f"{request['url']} conflicts with {target}",
+            "resolving it changes the commits, so what merged would not be what an",
+            "independent minion accepted")
+    if pushed and request["head"] != accepted:
+        at = request["head"][:12] or "a head it would not name"
+        return "refuse", request, None, (
+            f"{request['url']} is at {at}, and the accepted head is "
+            f"{accepted[:12]}",
+            "a request whose head cannot be tied to the accepted commit is one",
+            "this cannot say it would be merging the work that was accepted")
+
+    if pushed:
+        ls = git(path, "ls-remote", "origin", f"refs/heads/{branch}", check=False)
+        if ls.returncode != 0 or not ls.stdout.strip():
+            return "refuse", request, None, (
+                f"origin could not be read for {branch}",
+                (ls.stderr or ls.stdout).strip() or f"origin has no {branch}",
+                "the remote head is the branch the forge would merge, so nothing is",
+                "armed until it can be read")
+        if ls.stdout.split()[0] != accepted:
+            return "refuse", request, None, (
+                f"origin has {branch} at {ls.stdout.split()[0][:12]}, and the "
+                f"accepted head is {accepted[:12]}",
+                "somebody pushed after the verdict, so arming this would merge work",
+                "no independent minion has read")
+
+    checks, problem = required_checks(forge, path, branch)
+    if problem is not None:
+        return "refuse", request, None, (
+            f"nothing said which checks {branch} requires on {accepted[:12]}",
+            f"{forge} said: {problem}",
+            "either this branch has no check at all, or the client could not be",
+            "asked; both refuse here, because an answer that is not a list of",
+            "checks is not an empty list of them and neither is ever a green",
+            "the request is open and holds the accepted head, so if it was opened",
+            "a moment ago its checks may not have started yet: run this again once",
+            "they have")
+    if not checks:
+        return "refuse", request, [], (
+            f"{branch} has no required check on {accepted[:12]}",
+            "the grant merges when the forge's own gate passes, and a branch with",
+            "no required check has no gate to wait for; an empty list is never a",
+            "green, it is a protection rule that requires nothing",
+            f"add a required check to the rule on {target}, or drop the grant and",
+            "merge this one in person")
+
+    # Asked again, after the checks and before anything is armed. A branch that moved
+    # while the checks were being read leaves an answer about a commit that is no
+    # longer the one this would merge, and that window is the only one the two reads
+    # above cannot cover.
+    kind, again, refusal = one_request(forge, path, branch, accepted)
+    if refusal is not None:
+        return "refuse", request, checks, refusal
+    if kind == "merged":
+        return "merged", again, checks, None
+    if pushed and again["head"] != accepted:
+        return "refuse", again, checks, (
+            f"{branch} moved to {again['head'][:12]} while its checks were being "
+            f"read",
+            f"the accepted head is {accepted[:12]}, so those checks describe a",
+            "commit that is not the one this would merge")
+
+    if again["armed"] == method:
+        return "armed", again, checks, None
+
+    failed = [c for c in checks if c["bucket"] in CHECK_FAILED]
+    if failed:
+        return "refuse", again, checks, (
+            f"{branch} has a required check that did not pass on {accepted[:12]}",
+            *[f"  {c['bucket']:8} {c['name']}" for c in failed],
+            "the forge would not merge it, and arming a request that cannot merge",
+            "records an intention nobody will see fail")
+    return "arm", again, checks, None
+
+
+def show_checks(checks) -> str:
+    """The required checks on one line, each with what it is doing.
+
+    Named rather than counted: "3 required checks" reads the same whether they are
+    green or three minutes from failing, and the whole reason a captain reads this
+    is to know which."""
+    if checks is None:
+        # Either the run stopped before asking, or the answer was not a list of
+        # checks. Both are said in the refusal printed under this line, so this says
+        # only that the line above it is not a green.
+        return "unreadable here (see below)"
+    if not checks:
+        return "none"
+    return ", ".join(f"{c['name']} ({c['bucket'] or c['state'] or '?'})"
+                     for c in checks)
+
+
+def arm(forge: str, path: str, branch: str, method: str, accepted: str) -> None:
+    """Arrange the merge, pinned to the accepted head and the configured method.
+
+    The forge holds it until every required check and every required review passes,
+    which is the reason this is a standing arrangement rather than something SIANA
+    waits for: a session that polled CI would have to stay alive across it, and the
+    thing that must not be lost when it does not is the binding to this commit."""
+    spec = AUTOMERGE[forge]
+    argv = [part.replace("{branch}", branch)
+                .replace("{method}", spec["methods"][method])
+                .replace("{head}", accepted)
+            for part in spec["arm"]]
+    out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    if out.returncode != 0:
+        die(f"{forge} refused to arrange the merge of {branch}",
+            (out.stderr or out.stdout).strip(),
+            "the request is open and holds the accepted head, so nothing is lost:",
+            "it is simply not armed, and merging it stays the captain's")
+
+
+def disarm(forge: str, path: str, branch: str) -> None:
+    spec = AUTOMERGE[forge]
+    argv = [part.replace("{branch}", branch) for part in spec["cancel"]]
+    out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    if out.returncode != 0:
+        die(f"{forge} refused to cancel the armed merge of {branch}",
+            (out.stderr or out.stdout).strip(),
+            "the request is still armed, so it may still merge; cancel it in the",
+            "forge's own interface before removing the grant")
+
+
+def automerge_step(args, path: str, forge: str, branch: str, target: str,
+                   method: str, accepted: str, qa_id: str, missing: bool) -> None:
+    """Arrange the merge of the request this publish just put the accepted head on.
+
+    Called after the push on both publication paths and never before one: what is
+    armed is a request that exists, at a head the remote already holds, and both of
+    those are things this run has only just made true.
+
+    A dry run asks every question and answers none of them with a call that changes
+    something. Reading the forge is not changing it, and reading is the only way to
+    say which checks are required and whether the request is already armed - which
+    is the half of the plan a captain would most want to look at before it happens.
+    """
+    if missing:
+        # Only ever a dry run: both publication paths refuse a missing client before
+        # they push. Reported and not refused, on the same terms the rest of a dry
+        # run is - it stays readable on a machine that could not carry it out, and
+        # says which half of the plan it could not read.
+        print(f"automerge: {method} (the standing grant on this project)")
+        print(f"  head    {accepted[:12]}, accepted by {qa_id}")
+        print("  the client that would arrange it is not installed here, so nothing")
+        print("  could be said about the request or the checks on it")
+        return
+
+    verdict, request, checks, refusal = automerge_state(
+        forge, path, branch, target, method, accepted, pushed=not args.dry_run)
+
+    if args.dry_run:
+        print(f"automerge: {method} (the standing grant on this project)")
+        print(f"  head    {accepted[:12]}, accepted by {qa_id}")
+        print(f"  request {request['url'] if request else 'none open from ' + branch}")
+        print(f"  checks  {show_checks(checks)}")
+        if verdict == "merged":
+            print("  it is merged already, so nothing would be armed")
+        elif verdict == "armed":
+            print(f"  it is armed already with {method}, so nothing would change")
+        elif verdict == "arm":
+            print(f"  would arm {method}, pinned to {accepted[:12]}, and the forge")
+            print("  would merge it once every required check and review passes")
+        else:
+            print(f"  would not arm: {refusal[0]}")
+            for hint in refusal[1:]:
+                print(f"    {hint}")
+        return
+
+    if verdict == "refuse":
+        # What the refusal is *not* about, said last because a nonzero exit here
+        # would otherwise read as a publish that did not happen. Everything above
+        # this line already landed: the branch is pushed and the request is carrying
+        # the copy QA accepted. Only the arrangement is missing, and running this
+        # again once the reason is gone is the whole of the recovery.
+        landed = []
+        if request is not None:
+            landed = [f"the publish itself stands: {request['url']} is open and",
+                      f"holds {accepted[:12]}; merging it is the captain's until",
+                      "this is run again and arms it"]
+        die(*refusal, *landed)
+    if verdict == "merged":
+        print(f"already merged: {request['url']}")
+        print(f"  it holds {accepted[:12]}, which is the head {qa_id} accepted")
+        return
+    if verdict == "armed":
+        print(f"already armed:  {request['url']}")
+        print(f"  method  {method}, at {accepted[:12]}")
+        print(f"  checks  {show_checks(checks)}")
+        return
+
+    arm(forge, path, branch, method, accepted)
+    print(f"armed    {method} on {request['url']}")
+    print(f"  head    {accepted[:12]}, accepted by {qa_id}")
+    print(f"  checks  {show_checks(checks)}")
+    print("  the forge merges it when every required check and review passes, and")
+    print("  not before; cancel it with `siana-publish <qa-id> --cancel-automerge`")
+
+
+def cancel_automerge(args, path: str, forge: str, branch: str, handle: str) -> int:
+    """Disarm the request on this branch, and prove it is disarmed.
+
+    Asks the registry nothing. Removing `automerge` stops the next publish from
+    arming anything and cannot retract what is already armed at the forge, so the
+    one sequence that revokes the grant safely is to cancel every armed request
+    first, check that it took, and only then drop the field. A cancellation that
+    needed the field still to be there would make that sequence impossible to
+    carry out in the only order that is safe.
+
+    Idempotent in both directions: no request, an open one that was never armed, and
+    one this run has just disarmed all exit zero, because the end state is the same
+    and a captain re-running this is asking about that state rather than about how
+    it got there."""
+    if forge not in AUTOMERGE:
+        die(f"this fleet arranges no merges on {forge}, so there is none to cancel",
+            f"nothing published from {handle} was ever armed here; if something is",
+            "armed on that request, it was armed somewhere else and is cancelled",
+            "there")
+
+    found, problem = requests_for(forge, path, branch)
+    if problem is not None:
+        die(f"{forge} could not say what is open from {branch}", problem,
+            "cancelling proves a request is no longer armed, and a forge that",
+            "cannot be asked proves nothing")
+    open_now = [r for r in found if r["state"].lower() in OPEN]
+    if not open_now:
+        print(f"nothing armed: no request is open from {branch}")
+        return 0
+    if len(open_now) > 1:
+        die(f"{branch} is the source of more than one open request",
+            *[f"  {r['url']}" for r in open_now],
+            "which one to disarm is the captain's to say")
+    request = open_now[0]
+
+    if not request["armed"]:
+        print(f"nothing armed: {request['url']}")
+        return 0
+
+    if args.dry_run:
+        print(f"would cancel the armed merge of {request['url']}")
+        print(f"  armed   {request['armed']}")
+        print("  the request stays open, and merging it goes back to being the")
+        print("  captain's, in person")
+        return 0
+
+    disarm(forge, path, branch)
+
+    # Asked again, because a cancel that reported success and left the request armed
+    # is the one outcome this command must never produce: the captain would then
+    # remove the grant believing nothing can merge, and something still can.
+    found, problem = requests_for(forge, path, branch)
+    if problem is not None:
+        die(f"{forge} would not say whether {branch} is still armed", problem,
+            "the cancel was accepted, and nothing here can confirm it took; look",
+            "at the request before removing the grant")
+    still = [r for r in found
+             if r["state"].lower() in OPEN and r["url"] == request["url"]]
+    if still and still[0]["armed"]:
+        die(f"{request['url']} is still armed with {still[0]['armed']}",
+            "the cancel was accepted and did not take, so this request may still",
+            "merge; cancel it in the forge's own interface before removing the",
+            "grant")
+
+    print(f"cancelled {request['url']}")
+    print(f"  it was armed {request['armed']}, and is not armed now")
+    print("  merging it is the captain's again, in person")
+    return 0
+
+
 def repair_publish(args, home: str, tasks_file: str, handle: str, path: str,
                    forge: str, branch: str, repair, qa_id: str, accepted: str,
-                   title: str, body: str) -> None:
+                   title: str, body: str, method) -> None:
     """Advance the request this repair belongs on, and open nothing.
 
     A repair is cut from the branch a rejected or failing request was published from,
@@ -638,7 +1182,14 @@ def repair_publish(args, home: str, tasks_file: str, handle: str, path: str,
     print(f"  on     {request['url']}")
     print(f"  from   {branch}, accepted by {qa_id}")
     print(f"  copy   updated to what {qa_id} accepted")
-    print("  no second merge request was opened, and merging is still the captain's")
+    # Under a grant the second half of this would be false, and the arming step the
+    # caller runs next says what is true instead. The first half holds either way,
+    # and is the guarantee a repair exists to make.
+    if method:
+        print("  no second merge request was opened")
+    else:
+        print("  no second merge request was opened, and merging is still the "
+              "captain's")
 
 
 def propose(task_id: str, record: str) -> int:
@@ -668,6 +1219,11 @@ def main() -> None:
     ap.add_argument("task_id", help="the QA task whose verdict authorises this")
     ap.add_argument("--dry-run", action="store_true",
                     help="print what would be published, and change nothing")
+    ap.add_argument("--cancel-automerge", action="store_true",
+                    help="disarm the merge arranged for this work, and prove it is "
+                         "disarmed; needs no `automerge` in the registry, because "
+                         "cancelling before the field is removed is the only safe "
+                         "order to revoke the grant in")
     ap.add_argument("--record", metavar="FILE",
                     help="the decision SIANA wrote, as JSON; required while an "
                          "advisory session is in force, and a request to be gated "
@@ -744,7 +1300,10 @@ def main() -> None:
     project = projects[handle]
 
     target = project.get("target")
-    if not target:
+    # Cancelling needs no target. It disarms a request that already exists, and the
+    # captain revoking this grant may well have taken `target` off the record in the
+    # same sitting - which must not be the thing that leaves an armed merge standing.
+    if not target and not args.cancel_automerge:
         die(f"publishing is off for {handle}",
             "`target` is the branch a merge request targets, and setting it is what",
             "turns publishing on:",
@@ -869,6 +1428,33 @@ def main() -> None:
     cli = "glab" if forge == "gitlab" else "gh"
     missing = shutil.which(cli) is None
 
+    # The branch whose request carries this work: its own, or the one it repairs.
+    # Both publication paths end on it, and it is the only branch anything is armed
+    # or disarmed on.
+    publication = publication_branch(home, ship_id)
+
+    # Cancelling stops here. It asks for no target, no handoff, no pipeline record
+    # and no grant, because every one of those is a condition for arming and none of
+    # them is a condition for taking an arming back. It reaches this line rather than
+    # an earlier one so that the queue's refusals and the advisory gate above have
+    # already had their say: a verdict that authorises no publish authorises no
+    # cancellation either, and a session that forbids arming forbids disarming.
+    if args.cancel_automerge:
+        if missing:
+            die(f"{cli} is not installed, and cancelling needs it",
+                "this proves the request is no longer armed rather than assuming",
+                f"it, and there is nothing here to ask; install {cli}")
+        raise SystemExit(cancel_automerge(args, path, forge, publication, handle))
+
+    # Whether the captain has granted this project a merge, and by which method. Read
+    # before the copy is assembled, so a grant this machine cannot honour refuses on
+    # what is wrong with the registry rather than on the first handoff rule the run
+    # happens to reach afterwards.
+    method = project.get("automerge")
+    if method:
+        automerge_grant(home, registry, handle, project, forge, ship_id, branch,
+                        head)
+
     # Before the dry run, because a dry run whose job is to show the exact title and
     # body cannot show them without this. Before the gate, because a proposal is a
     # record of a publish SIANA was ready to carry out, and one whose copy does not
@@ -885,7 +1471,15 @@ def main() -> None:
     # destination.
     if repair is not None:
         repair_publish(args, home, tasks_file, handle, path, forge, branch, repair,
-                       args.task_id, head, title, body)
+                       args.task_id, head, title, body, method)
+        # On the branch the request is open from, and not on the repair's own. A
+        # repair re-establishes every condition over there from scratch - the request
+        # is at a head it reached one call ago, and the checks on it are the checks
+        # of that head - so the round that fixed a red request arms the same way the
+        # round that opened it did.
+        if method:
+            automerge_step(args, path, forge, repair[1], target, method, head,
+                           args.task_id, missing)
         return
 
     if args.dry_run:
@@ -901,6 +1495,9 @@ def main() -> None:
         if missing:
             print(f"warning: {cli} is not installed here, so a real run would refuse",
                   file=sys.stderr)
+        if method:
+            automerge_step(args, path, forge, branch, target, method, head,
+                           args.task_id, missing)
         return
 
     # Checked before the push, not after it. A missing CLI discovered later leaves
@@ -909,6 +1506,20 @@ def main() -> None:
         die(f"{cli} is not installed, and {remote_url} needs it",
             "the branch would push and then have nowhere to open a merge request,",
             f"which is the half-done state this refuses to create; install {cli}")
+
+    # Asked before the push, and only where a merge was granted. Under the grant the
+    # request this publish opened can have merged since, which every step below reads
+    # as a branch with no open request and would answer by opening a second one for
+    # commits that have already landed. Nowhere else has this problem: without the
+    # grant nothing merges between two runs unless the captain merged it, and then
+    # they are not re-running this.
+    if method:
+        kind, request, _ = one_request(forge, path, branch, head)
+        if kind == "merged":
+            print(f"already merged: {request['url']}")
+            print(f"  it holds {head[:12]}, which is the head {args.task_id} "
+                  f"accepted")
+            return
 
     push = subprocess.run(["git", "-C", path, "push", "--set-upstream", "origin", branch],
                           capture_output=True, text=True)
@@ -923,12 +1534,22 @@ def main() -> None:
         print(f"already open: {open_mr}")
         print(f"  copy   updated to what {args.task_id} accepted")
         print(f"  branch {branch} pushed (no second merge request opened)")
-        return
+    else:
+        url = create(forge, path, branch, target, title, body)
+        print(f"opened   {url}")
+        print(f"  branch {branch} -> {target}")
+        # Without the grant this is the whole of what this command has ever said
+        # about merging, and under one it would be false, so the arming step below
+        # says what is true instead.
+        if not method:
+            print("  merging is the captain's, and still done by hand")
 
-    url = create(forge, path, branch, target, title, body)
-    print(f"opened   {url}")
-    print(f"  branch {branch} -> {target}")
-    print("  merging is the captain's, and still done by hand")
+    # Last, because everything it proves is about a request that exists at a head the
+    # remote already holds, and both of those are what the lines above have only just
+    # made true.
+    if method:
+        automerge_step(args, path, forge, branch, target, method, head,
+                       args.task_id, missing)
 
 
 if __name__ == "__main__":
