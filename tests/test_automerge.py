@@ -735,6 +735,19 @@ class DryRun(Granted):
         self.assertIn("would not arm: ", text)
         self.assertIn("has no required check", text)
 
+    def test_a_request_the_forge_already_merged_claims_nothing_about_checks(self):
+        """The state a dry run is most likely to be asked about, since this is where
+        SIANA is pointed to look at what the grant has done.
+
+        Nothing asked the forge about checks - the merge has happened - so a line
+        saying its answer was unreadable would be a complaint about a question that
+        was never put, with nothing under it to explain the claim."""
+        self.seed([self.request(state="merged", head=self.accepted, armed="squash")])
+        text = self.dry()
+        self.assertIn("it is merged already", text)
+        self.assertNotIn("checks", text.split("automerge:")[1])
+        self.assertNotIn("would not arm", text)
+
     def test_a_check_it_could_not_read_is_not_printed_as_a_green(self):
         self.seed([self.request(checks=[])])
         text = self.dry()

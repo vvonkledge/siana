@@ -785,9 +785,11 @@ def show_checks(checks) -> str:
     green or three minutes from failing, and the whole reason a captain reads this
     is to know which."""
     if checks is None:
-        # Either the run stopped before asking, or the answer was not a list of
-        # checks. Both are said in the refusal printed under this line, so this says
-        # only that the line above it is not a green.
+        # The run either stopped before asking or was answered with something that
+        # was not a list of checks. Every caller that can reach this prints a refusal
+        # under it saying which, so this says only that the line is not a green -
+        # and no caller may print it where there is no refusal to follow, because
+        # then it claims a forge answered badly when nothing asked it anything.
         return "unreadable here (see below)"
     if not checks:
         return "none"
@@ -857,10 +859,15 @@ def automerge_step(args, path: str, forge: str, branch: str, target: str,
         print(f"automerge: {method} (the standing grant on this project)")
         print(f"  head    {accepted[:12]}, accepted by {qa_id}")
         print(f"  request {request['url'] if request else 'none open from ' + branch}")
-        print(f"  checks  {show_checks(checks)}")
         if verdict == "merged":
+            # No checks line, because nothing asked for one: the merge has already
+            # happened, so what the forge required before it is not what a reader is
+            # looking at here, and the line `show_checks` would print for an answer
+            # that was never sought reads as one that could not be read.
             print("  it is merged already, so nothing would be armed")
-        elif verdict == "armed":
+            return
+        print(f"  checks  {show_checks(checks)}")
+        if verdict == "armed":
             print(f"  it is armed already with {method}, so nothing would change")
         elif verdict == "arm":
             print(f"  would arm {method}, pinned to {accepted[:12]}, and the forge")
