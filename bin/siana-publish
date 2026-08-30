@@ -1470,6 +1470,21 @@ def main() -> None:
     # way for both. A repair is not a different authorisation, only a different
     # destination.
     if repair is not None:
+        # The end state a re-run finds once the grant has done its work, asked before
+        # anything else about that branch. Re-running is the intended recovery from a
+        # SIANA that restarted between a verdict and this call, and after a merge
+        # `repair_publish` reads the request as closed and refuses - which is safe,
+        # and describes a request that landed as a review thread nobody will read
+        # again. The ordinary path asks the same question below.
+        if method:
+            kind, merged, _ = one_request(forge, path, repair[1], head)
+            if kind == "merged":
+                print(f"already merged: {merged['url']}")
+                print(f"  it holds {head[:12]}, which is the head {args.task_id} "
+                      f"accepted")
+                print(f"  the repair from {branch} is on it, and there is nothing")
+                print("  left to advance or to arrange")
+                return
         repair_publish(args, home, tasks_file, handle, path, forge, branch, repair,
                        args.task_id, head, title, body, method)
         # On the branch the request is open from, and not on the repair's own. A
@@ -1510,9 +1525,10 @@ def main() -> None:
     # Asked before the push, and only where a merge was granted. Under the grant the
     # request this publish opened can have merged since, which every step below reads
     # as a branch with no open request and would answer by opening a second one for
-    # commits that have already landed. Nowhere else has this problem: without the
-    # grant nothing merges between two runs unless the captain merged it, and then
-    # they are not re-running this.
+    # commits that have already landed. Without the grant nothing merges between two
+    # runs unless the captain merged it, and then they are not re-running this. The
+    # repair path asks the same question, above, about the branch its request is
+    # open from.
     if method:
         kind, request, _ = one_request(forge, path, branch, head)
         if kind == "merged":

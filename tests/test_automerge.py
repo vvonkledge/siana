@@ -1002,6 +1002,31 @@ class ARepair(Fleet):
         self.assertEqual(self.merge_calls(), [])
         self.assertEqual(self.remote(self.ship_branch), self.published)
 
+    def test_a_run_after_the_forge_merged_it_reports_and_advances_nothing(self):
+        """The end state a restart finds, on the repair path.
+
+        Re-running is the documented recovery from a SIANA that restarted between a
+        verdict and this call, and after the grant has done its work the request is
+        merged. Read as a closed request it refuses, which is safe and describes a
+        request that landed as a review thread nobody will read again."""
+        self.assertAccepted(self.publish())
+        armed = len(self.merge_calls())
+        self.seed([self.request(head=self.accepted, state="merged", armed="squash")])
+        text = self.assertAccepted(self.publish())
+        self.assertIn("already merged", text)
+        self.assertIn(self.URL, text)
+        self.assertNoRequestOpened()
+        self.assertEqual(len(self.merge_calls()), armed,
+                         "it went back to the forge about a request that merged")
+
+    def test_a_merged_request_without_the_grant_is_still_a_refusal(self):
+        # The refusal is right where nothing was ever armed: a request the captain
+        # merged by hand is not somewhere an accepted repair belongs.
+        self.project("demo", path=self.repo, ship="just test", qa="echo ok",
+                     target="main", pipeline="true")
+        self.seed([self.request(head=self.published, state="merged")])
+        self.assertRefused(self.publish(), "is not open")
+
     def test_running_it_again_arms_nothing_twice(self):
         self.assertAccepted(self.publish())
         armed = len(self.merge_calls())

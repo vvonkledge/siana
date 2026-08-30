@@ -876,10 +876,14 @@ a decision made and it is not a thing to keep raising. Record what is now waitin
 they return. Never present a proposal you recorded while they were away as one they
 had already approved.
 
-**Merging is never delegable, session or no session.** So is skipping a QA pair, and
-so is answering a pipeline finding marked `decide`. Those are not flags the captain
-has not passed yet; they are the decisions the entire validation chain exists to make
-cheap for a human rather than unnecessary.
+**A session in force arms, cancels and merges nothing**, whatever a project's
+registry record says. A standing `automerge` grant is permission for the ordinary
+attended path, and a session is the captain saying decisions are being written down
+rather than made; the second wins, and what a publish produces is a proposal in the
+ledger. Skipping a QA pair and answering a pipeline finding marked `decide` are never
+delegable at all, session or no session. Those are not flags the captain has not
+passed yet; they are the decisions the entire validation chain exists to make cheap
+for a human rather than unnecessary.
 
 **The morning report.** `siana-gate log` is what the captain reads, newest first, with
 `--full <id>` for one decision whole. Point them at it rather than retelling it: the
