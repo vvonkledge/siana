@@ -18,7 +18,7 @@ import os
 import re
 import unittest
 
-from helpers import TEMPLATE
+from helpers import TEMPLATE, script
 
 PACKAGE = os.path.join(TEMPLATE, "pi-siana")
 
@@ -244,9 +244,21 @@ class Extension(unittest.TestCase):
                          ["abort", "answer", "resume", "start", "status"])
 
     def test_the_grants_it_offers_are_the_command_s_own(self):
-        grants = re.search(r'StringEnum\(\["inventory".*?\]', self.text).group(0)
-        for grant in ("inventory", "retire", "reap-report"):
-            self.assertIn(f'"{grant}"', grants)
+        # Read out of `siana-clean` rather than listed here. The first version
+        # listed the three grants by hand, which is a list only ever compared
+        # against itself: a fourth grant landing in the command would have left
+        # this green while SIANA had no way to give it.
+        offered = re.search(r"StringEnum\(\[([^\]]*)\] as const\),\s*\{",
+                            self.text)
+        self.assertIsNotNone(offered, "no grant enum in cleanup.ts")
+        self.assertEqual(set(re.findall(r'"([^"]+)"', offered.group(1))),
+                         set(script("siana-clean").GRANTS))
+
+    def test_the_close_grant_says_what_it_unlocks_and_when(self):
+        # The description is the only thing SIANA reads about a grant before
+        # choosing one, and the ordering is the half a name cannot carry.
+        self.assertIn("siana-close-workspace", self.text)
+        self.assertIn("after that task's worktree was retired", self.text)
 
     def test_it_holds_no_copy_of_the_protocol(self):
         # The rule this distro is built on: logic that can be exact belongs in a
@@ -316,6 +328,24 @@ class Cleaner(unittest.TestCase):
 
     def test_it_never_pushes_or_merges(self):
         self.assertIn("Never push, merge, open or approve", self.flat)
+
+    def test_it_is_told_the_close_boundary_and_its_ordering(self):
+        # The two things a cleaner could get wrong here are which workspace and
+        # when, and both cost an agent or a whole project's fleet.
+        self.assertIn("siana-close-workspace", self.flat)
+        self.assertIn("The order is retire, then close, and never the other way "
+                      "round.", self.flat)
+        self.assertIn("only if it *succeeded*", self.flat)
+
+    def test_it_is_told_never_to_pick_a_workspace_itself(self):
+        self.assertIn("You never choose which workspace.", self.flat)
+        for never in ("label", "number in the list", "name of the agent",
+                      "resembles a branch", "what is focused"):
+            self.assertIn(never, self.flat)
+
+    def test_it_never_closes_anything_with_herdr_itself(self):
+        self.assertIn("Never close a herdr workspace, a pane, or a worktree with "
+                      "`herdr` itself", self.flat)
 
 
 if __name__ == "__main__":

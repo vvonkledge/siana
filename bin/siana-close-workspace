@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""Close the Herdr workspace a finished minion left behind, and only that one.
+
+`siana-retire` removes a minion's worktree and deliberately leaves its workspace
+open, because closing a workspace kills the agent inside it and that was never
+mechanics to take. The cost of leaving it is real and it accumulates: one idle agent
+and one open workspace per retirement, which is the part of cleanup a delegated run
+could not finish.
+
+The captain has granted exactly one thing, and this command is the whole of it: a
+*terminal* task's *own* workspace, which is a *linked worktree* workspace, whose
+worktree has *already been retired*, which *nobody else* is in. Every one of those is
+a refusal here rather than a sentence in a prompt, because each of them is exact and
+an exact rule belongs in a script.
+
+Usage:
+    siana-close-workspace <task-id>
+
+**A task id, never a workspace id.** The destructive decision is which workspace, and
+a command taking a workspace id would put that decision in whatever typed it - a
+cleaner, a paste, a loop over a listing. A task id makes identity a lookup through
+records the fleet already keeps: the queue says who owned the task, the owner names a
+pane, the pane names its workspace, and the registry says which repository that
+workspace has to belong to. Nothing about the choice is left to the caller.
+
+**Identity is the recorded pane and nothing else.** Never the label - `siana-dispatch`
+says herdr does not enforce unique labels and the captain has several workspaces
+called `siana`. Never the workspace number, which is a position in a list and shifts
+every time another workspace closes. Never the agent name, which herdr frees the
+moment an agent exits and hands to the next minion on that task. Never focus, which
+is wherever the captain happens to be looking. Each of those resolves to *a*
+workspace; only the recorded pane resolves to *this task's*.
+
+**Retire first, always.** Closing a workspace before its worktree is removed strands
+the worktree: the tree stays on disk with no pane to look at it from, and
+`siana-retire`'s own refusals - loose work, an unanchored commit - never get read by
+anybody. So the retirement's postcondition is checked here independently rather than
+assumed from an exit code somewhere else: the recorded tree is gone from the disk and
+gone from git's own list of worktrees. That also makes the ordering unfakeable. A
+retirement that refused leaves the tree exactly where it was, so this refuses too,
+for the same reason and without having to know that the refusal happened.
+
+**A source workspace is a hard refusal, not a warning.** Closing a project's own
+checkout workspace closes every linked-worktree workspace under it, so one wrong
+close takes the whole project's fleet down at once. Herdr distinguishes the two:
+`is_linked_worktree` is true for a workspace `worktree.create` made and false for the
+project's own checkout. Required true, and a missing key is a refusal - the absence
+of the field is exactly what a plain `workspace.create` workspace looks like, and
+reading absence as permission is the direction that cascades.
+
+**Idempotent only against an answer.** A workspace herdr does not list is one already
+closed; a herdr that will not answer is a fact about herdr and about no workspace at
+all. Those read identically to a caller that treats an error as an absence, so the
+no-op path is reached only after a read that succeeded.
+
+Nothing here removes a worktree, deletes a branch, closes a pane on its own, or
+reaps. Those are other commands' with other bars, and this one is deliberately the
+narrowest destructive thing in the fleet.
+"""
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching the rest of the fleet."""
+
+    def __init__(self, message: str, hints=()):
+        self.message, self.hints = message, tuple(hints)
+        super().__init__(1)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class Unreachable(Refusal):
+    """herdr never answered. One fact about herdr and about no workspace, so it must
+    never be read as "the workspace is gone": that reading turns every outage into a
+    successful no-op and tells the captain their fleet was tidied up."""
+
+
+def die(message: str, *hints: str, kind=Refusal):
+    raise kind(message, hints)
+
+
+def fold(store: str, key: str):
+    """Fold an append-only datafile store into {key: record}.
+
+    Read-only, exactly as `siana-dispatch` and `siana-retire` read it: the last line
+    for an id wins and a tombstone is an absence, because a dropped record read as a
+    record with every field missing would resolve to a project with no path."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def git(path: str, *args: str):
+    """git, run in `path`. Returns (returncode, stdout, stderr), all decided by the
+    caller: the questions asked here have a "no" that is a normal answer."""
+    p = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                       check=False)
+    return p.returncode, p.stdout, p.stderr.strip()
+
+
+def same_path(a: str, b: str) -> bool:
+    """realpath both sides. git reports a worktree by its real path while herdr
+    recorded the one it was created under, and on macOS those differ for anything
+    below /tmp or /var. Comparing them as typed reads a healthy pair as a
+    disagreement, which here is the difference between closing and refusing.
+
+    Correct on a path that no longer exists, which is the ordinary case: the recorded
+    tree has been retired by the time anything gets this far, and `realpath` on a
+    missing path still normalises the spelling of the directories above it."""
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+class Herdr:
+    """One connection per call: the server closes the socket after each response.
+
+    The same client `siana-dispatch` speaks, and deliberately the same shape of
+    refusal: a herdr that errors has answered about the thing asked after, and a
+    herdr that never answers has answered about nothing.
+    """
+
+    def __init__(self, path: str, timeout: float = 30.0) -> None:
+        self.path, self.timeout, self.seq = path, timeout, 0
+
+    def call(self, method: str, **params):
+        self.seq += 1
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(self.timeout)
+            try:
+                sock.connect(self.path)
+            except OSError as e:
+                die(f"cannot reach herdr at {self.path}: {e}", kind=Unreachable)
+            try:
+                sock.sendall((json.dumps({"id": f"req_{self.seq}", "method": method,
+                                          "params": params}) + "\n").encode())
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        die(f"herdr {method}: connection closed without a response",
+                            kind=Unreachable)
+                    buf += chunk
+            except OSError as e:
+                die(f"herdr {method}: {e}", kind=Unreachable)
+        try:
+            msg = json.loads(buf.split(b"\n", 1)[0])
+        except (json.JSONDecodeError, ValueError) as e:
+            # Not `Unreachable`: herdr said something. It is unusable, and a caller
+            # deciding whether a workspace exists must treat unusable as unknown
+            # rather than as either answer.
+            die(f"herdr {method}: the reply is not JSON: {e}")
+        if not isinstance(msg, dict):
+            die(f"herdr {method}: the reply is not an object")
+        if "error" in msg:
+            err = msg["error"] if isinstance(msg["error"], dict) else {}
+            die(f"herdr {method}: {err.get('code')}: {err.get('message')}")
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            die(f"herdr {method}: the reply carries no result object")
+        return result
+
+
+# `<kind>@<pane-id>`, and a pane id is `<workspace-id>:<pane>`. Both halves are shape
+# rules rather than lookups, and they are strict on purpose: this is the one place a
+# workspace id is derived, so a spelling this cannot read has to refuse rather than
+# resolve to a prefix that happens to name something.
+OWNER = re.compile(r"(?P<kind>[A-Za-z0-9][A-Za-z0-9_-]*)@"
+                   r"(?P<pane>(?P<workspace>[A-Za-z0-9]+):[A-Za-z0-9]+)")
+
+
+def workspace_of(owner: str):
+    """The workspace an owner names, or None when it names none.
+
+    Used twice with different consequences - once for the task being closed, where a
+    None is a refusal, and once per other task in the queue, where a None is a record
+    that cannot be in the way of anything.
+    """
+    match = OWNER.fullmatch(owner or "")
+    return match.group("workspace") if match else None
+
+
+def project_of(task: dict, home: str) -> dict:
+    """Task to project directory, through the captain's registry.
+
+    The same resolution `siana-retire` makes, for the same reason: the repository a
+    workspace has to belong to is looked up and never taken from herdr's own answer.
+    Without it herdr would be both the claim and its own corroboration, and a
+    workspace whose metadata named some other repository would close on the strength
+    of naming it consistently.
+    """
+    handle = task.get("project")
+    if not handle:
+        die(f"{task['id']} carries no project",
+            "the project is what says which repository this workspace has to",
+            "belong to, so without one there is nothing to check it against")
+
+    registry = os.path.join(home, "projects.jsonl")
+    if not os.path.isfile(os.path.join(home, "schema-projects.yaml")):
+        die(f"no project registry at {registry}",
+            "the registry is what turns a project handle into a directory",
+            "run `just init` in the distro")
+    projects = fold(registry, "handle")
+    if handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {handle}",
+            f"known handles: {known}",
+            f"the captain adds projects to {registry}; a path is never guessed")
+    cfg = projects[handle]
+
+    path = os.path.abspath(os.path.expanduser(str(cfg["path"])))
+    if not os.path.isdir(path):
+        die(f"{handle} points at {path}, which is not a directory",
+            f"fix the `path` for {handle} in {registry}")
+
+    # Same default as dispatch and retire, for the same reason: a record predating
+    # the field reads as isolated, because isolation withheld is the direction that
+    # loses work.
+    if not cfg.get("worktree", True):
+        die(f"{handle} has worktree isolation off, so {task['id']} never had a "
+            f"worktree workspace",
+            "its minion worked in the project tree itself, in a workspace that is",
+            "the captain's own; nothing in this fleet closes that")
+
+    rc, out, _ = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc != 0:
+        die(f"{handle} is at {path}, which is not a git repository",
+            "the registry says its minions get worktrees, so either the record is",
+            "wrong or the checkout is gone; look before closing anything")
+    return {"handle": handle, "path": path, "git_dir": out.strip()}
+
+
+def still_a_worktree(repo: str, recorded: str) -> bool:
+    """Whether git still registers `recorded` as a worktree of `repo`.
+
+    The second half of the retirement postcondition, and the half a missing directory
+    cannot answer. `git worktree remove` unregisters and deletes together, but a tree
+    deleted by hand leaves its registration behind, and a registration is what a
+    `git worktree repair` would bring the tree back from. Closing on the strength of
+    an absent directory alone would therefore close a workspace whose worktree git
+    still believes in.
+    """
+    rc, out, err = git(repo, "worktree", "list", "--porcelain")
+    if rc != 0:
+        die(f"cannot list the worktrees of {repo}: {err}",
+            "whether the tree was retired is the thing this has to know before",
+            "anything is closed, and git is the only one that can say")
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "worktree" and value and same_path(value, recorded):
+            return True
+    return False
+
+
+def workspaces(h: Herdr):
+    """Every workspace herdr lists, as a list of records.
+
+    A shape this cannot read is a refusal rather than an empty list. An empty list is
+    "no workspaces", which on the no-op path below means "already closed", and an
+    unreadable answer must never resolve to a statement about the world.
+    """
+    listed = h.call("workspace.list").get("workspaces")
+    if not isinstance(listed, list):
+        die("herdr workspace.list did not answer with a list of workspaces",
+            "nothing here can say what is open, so nothing here may close anything")
+    for entry in listed:
+        if not isinstance(entry, dict) or not entry.get("workspace_id"):
+            die("herdr listed a workspace with no workspace_id",
+                "the answer cannot be matched against a recorded pane, and a",
+                "partial match is how the wrong workspace gets closed")
+    return listed
+
+
+def matching(listed, workspace_id: str):
+    """The one workspace with this id, None when there is none, a refusal when herdr
+    somehow lists two. Herdr's ids are unique, so two is not a tie to break: it is an
+    answer this command cannot act on."""
+    found = [w for w in listed if w["workspace_id"] == workspace_id]
+    if len(found) > 1:
+        die(f"herdr lists {len(found)} workspaces called {workspace_id}",
+            "a workspace id is herdr's own unique handle, so this is an answer",
+            "nothing here can act on; look at `herdr workspace list`")
+    return found[0] if found else None
+
+
+def check_it_is_this_tasks_tree(w: dict, task_id: str, recorded: str,
+                                project: dict) -> None:
+    """Everything herdr has to agree about before this workspace is the one.
+
+    Each of these is a different way of being the wrong workspace, and they are asked
+    in the order that puts the cheapest catastrophe first: a workspace with no
+    worktree metadata at all, then a source workspace, then one open on another tree,
+    then one in another repository. The first that fails stops the command, because
+    every one of them is on its own a reason not to close anything.
+    """
+    wt = w.get("worktree")
+    if not isinstance(wt, dict):
+        die(f"herdr reports no worktree behind {w['workspace_id']}",
+            f"{task_id} was dispatched into its own worktree, and a workspace with",
+            "no worktree metadata is a plain one - the captain's own, or a session",
+            "somebody opened by hand; this closes neither")
+
+    if wt.get("is_linked_worktree") is not True:
+        die(f"{w['workspace_id']} is not a linked-worktree workspace",
+            f"herdr says is_linked_worktree={wt.get('is_linked_worktree')!r}, so",
+            "this is a project's own checkout rather than a minion's tree",
+            "closing a source workspace closes every linked worktree workspace",
+            "under it, which is the whole project's fleet in one call")
+
+    checkout = wt.get("checkout_path")
+    if not checkout or not same_path(checkout, recorded):
+        die(f"{w['workspace_id']} is open on {checkout or 'nothing herdr names'}, "
+            f"but {task_id} recorded its work in {recorded}",
+            "these are not the same tree, so this workspace belongs to some other",
+            "task - or herdr has given this id to a workspace made since",
+            "nothing has been closed")
+
+    root = wt.get("repo_root")
+    if not root or not same_path(root, project["path"]):
+        named = root or "a repository herdr does not name"
+        die(f"{w['workspace_id']} belongs to {named}, and {task_id} is a "
+            f"{project['handle']} task",
+            f"the registry puts {project['handle']} at {project['path']}",
+            "a workspace in another repository is another project's, whatever its",
+            "checkout path resembles")
+
+    key = wt.get("repo_key")
+    if not key or not same_path(key, project["git_dir"]):
+        die(f"{w['workspace_id']} names {key or 'no repository key'}, and git puts "
+            f"{project['handle']}'s at {project['git_dir']}",
+            "the root and the key are two statements about one repository, and",
+            "a workspace this command closes has to make both of them")
+
+
+def check_nobody_is_in_it(w: dict, task_id: str, tasks_file: str,
+                          workspace_id: str) -> None:
+    """Live, focused, or somebody else's. Three ways a workspace is in use, and the
+    third is the one no reading of herdr can see on its own."""
+    # A missing field and the value `unknown` are two different answers and are
+    # treated as such. `unknown` is herdr saying it has identified no agent in there,
+    # which is exactly what a finished minion leaves behind and is the ordinary case
+    # this grant exists for. A field that is not there at all is a shape this cannot
+    # read, and an unreadable state is one that might be working.
+    status = w.get("agent_status")
+    if not status:
+        die(f"herdr says nothing about what is running in {workspace_id}",
+            "a workspace whose state cannot be read is one that might be working;",
+            "closing it kills whatever is in it")
+    if status == "working":
+        die(f"{workspace_id} is working",
+            f"herdr reports an agent still running there, and {task_id} is done, so",
+            "these disagree about whether anything is left to do",
+            "closing it kills that agent mid-turn; look at the workspace first")
+    # Asked for its presence and then for its value, the same distinction as
+    # `agent_status` above: `False` is herdr saying nobody is looking at it, and an
+    # absent field is herdr not saying, which is not the same answer and must not
+    # read as one because `.get` returns a falsy value for both.
+    if "focused" not in w:
+        die(f"herdr does not say whether {workspace_id} is focused",
+            "focus is one of the two things that make a workspace somebody's right",
+            "now, and an answer that omits it cannot rule that out")
+    if w["focused"]:
+        die(f"{workspace_id} is the workspace the captain is looking at",
+            "closing it takes the captain's own view out from under them",
+            "focus is never identity here, and it is a refusal on its own")
+
+    # The queue, not herdr. A second task whose minion was put in this workspace is
+    # invisible to `workspace.list`, which reports one agent status for the whole
+    # workspace however many panes are in it. A `doing` one is a live minion, and the
+    # rest are records that would be left pointing at a workspace that is gone.
+    sharing = []
+    for other in fold(tasks_file, "id").values():
+        if other.get("id") == task_id:
+            continue
+        if workspace_of(other.get("owner")) == workspace_id:
+            sharing.append(f"{other.get('id')} ({other.get('status')}, "
+                           f"{other.get('owner')})")
+    if sharing:
+        die(f"{workspace_id} is named by {len(sharing)} other task(s) in the queue: "
+            + ", ".join(sorted(sharing)),
+            "a workspace holds as many panes as were split in it, and closing it",
+            "takes every one of them down at once",
+            "custody shared between two tasks is never inferred away here; whether",
+            "those records are stale is SIANA's to say")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("task_id", help="the task whose workspace is to be closed")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+    tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(home, "tasks.jsonl")
+
+    if not os.path.isfile(tasks_file):
+        die(f"no task store at {tasks_file}", "run `just init` in the distro")
+    task = fold(tasks_file, "id").get(args.task_id)
+    if task is None:
+        die(f"no such task: {args.task_id}",
+            f"run `tasks --file {tasks_file} list` to see the queue")
+
+    # `done` is the only terminal status the queue has. `todo` and `blocked` both go
+    # back out to a minion, and a re-dispatch of a blocked task is exactly when its
+    # recorded pane matters again; `doing` is somebody working right now.
+    status = task.get("status")
+    if status != "done":
+        die(f"{args.task_id} is {status or 'in no status this can read'}, not done",
+            "only a finished task's workspace is closed here: everything else is",
+            "either work in progress or work going back out to a minion",
+            "a task still held by a minion is `siana-dispatch --check` and then",
+            f"`tasks --file {tasks_file} reset {args.task_id}`, and neither of those",
+            "is this command's to do")
+
+    owner = task.get("owner") or ""
+    workspace_id = workspace_of(owner)
+    if workspace_id is None:
+        die(f"{args.task_id} has no owner naming a pane: {owner or '(none)'}",
+            "the recorded pane is the only thing here that resolves to a workspace,",
+            "and a label, a number, an agent name or whatever is focused would each",
+            "resolve to some workspace rather than to this task's",
+            "this task was claimed outside `siana-dispatch`, or its record was edited")
+
+    recorded = task.get("cwd")
+    if not recorded:
+        die(f"{args.task_id} records no worktree",
+            "the recorded tree is what proves the workspace herdr names is this",
+            "task's and not another's, so without it there is nothing to match")
+
+    project = project_of(task, home)
+
+    # The retirement's postcondition, read from the world rather than taken from
+    # anybody's exit code. Both halves: a directory that is gone and a git that has
+    # stopped registering it.
+    if os.path.exists(recorded):
+        die(f"{recorded} is still there, so {args.task_id} has not been retired",
+            "closing the workspace now would strand that tree: it would stay on",
+            "disk with no pane to look at it from, and `siana-retire`'s refusals",
+            "about loose work and unanchored commits would go unread",
+            f"run `siana-retire {args.task_id}` first, and deal with whatever it",
+            "refuses on; this command is never the way around one of those")
+    if still_a_worktree(project["path"], recorded):
+        die(f"git still registers {recorded} as a worktree of {project['path']}",
+            "the directory is gone but its registration is not, so the tree was",
+            "deleted by hand rather than retired, and `git worktree repair` would",
+            "bring it back",
+            f"clear it with `git -C {project['path']} worktree prune`, which touches",
+            f"no working tree, then run `siana-retire {args.task_id}` and this again")
+
+    h = Herdr(os.environ.get("HERDR_SOCKET_PATH",
+                             os.path.expanduser("~/.config/herdr/herdr.sock")))
+    listed = workspaces(h)
+    w = matching(listed, workspace_id)
+    if w is None:
+        # Reached only past a read that succeeded, which is the whole of what makes
+        # this a no-op rather than a guess: herdr answered, and its answer does not
+        # hold this workspace.
+        print(f"already  {workspace_id} is not open (the workspace behind {owner})")
+        print("  read   herdr answered and did not list it, so this is absence")
+        print("         and not silence; nothing was closed")
+        return
+
+    check_it_is_this_tasks_tree(w, args.task_id, recorded, project)
+    check_nobody_is_in_it(w, args.task_id, tasks_file, workspace_id)
+
+    h.call("workspace.close", workspace_id=workspace_id)
+
+    # Asked again rather than believed. `workspace.close` answering `ok` is herdr
+    # saying it took the request, and what this command claims to have done is that
+    # the workspace is gone.
+    if matching(workspaces(h), workspace_id) is not None:
+        die(f"herdr still lists {workspace_id} after closing it",
+            "the close was accepted and did not take effect, which is a state this",
+            "cannot read; look at `herdr workspace list` before anything else",
+            "nothing else has been touched")
+
+    print(f"closed   {workspace_id} (the workspace behind {owner})")
+    print(f"  tree   {recorded} was retired first, and git no longer lists it")
+    print(f"  kept   every branch and every other workspace in "
+          f"{project['handle']}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Refusal as r:
+        print(f"error: {r.message}", file=sys.stderr)
+        for h in r.hints:
+            print(f"  {h}", file=sys.stderr)
+        raise SystemExit(1) from None

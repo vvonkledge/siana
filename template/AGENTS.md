@@ -632,8 +632,49 @@ this again. Deciding that a build directory is litter and a stray `.env` is not 
 understanding, which is why the script hands that decision to you instead of taking
 it.
 
-It leaves the Herdr workspace open and says so, naming the owner pane. Closing it
-kills that agent, which is a decision and not mechanics.
+It leaves the Herdr workspace open and says so, naming the owner pane, and names the
+one command that closes it.
+
+## Closing the workspace behind it
+
+`siana-close-workspace <task-id>` closes the Herdr workspace a finished minion left
+open. It is the step after `siana-retire` and never a substitute for one, because
+closing a workspace kills the agent in it and a workspace closed before its worktree
+is removed strands that worktree.
+
+The task id is the whole command, for the same reason it is for retiring: the queue
+says who owned that task, the owner names a pane, the pane names its workspace, and
+the registry says which repository that workspace has to belong to. You never give it
+a workspace id, and it never takes one.
+
+**Never look a workspace up any other way, and it will not either.** Not by label -
+Herdr does not enforce unique labels and several of yours are called the same thing.
+Not by workspace number, which is a position in a list and shifts every time another
+workspace closes. Not by agent name, which Herdr frees the moment an agent exits. Not
+by what is focused. Each of those finds *a* workspace; only the recorded pane finds
+*this task's*.
+
+What it refuses, and every one is a finding rather than an obstacle:
+
+- a task that is not `done`. `todo` and `blocked` go back out to a minion, and
+  `doing` is somebody working right now
+- a worktree still on disk, or still registered by git. That is the retirement's
+  postcondition, read from the world rather than taken from an exit code, so a
+  retirement that refused refuses this too without having to be told
+- a workspace Herdr does not mark `is_linked_worktree`: a project's own source
+  workspace, whose closing takes every linked-worktree workspace under it down at
+  once
+- a workspace open on a different tree, or in a different repository, from the ones
+  the queue and the registry give for that task
+- a workspace that is working, or focused, or whose state Herdr will not say
+- a workspace any other task in the queue names a pane in, whatever that task's
+  status. Shared custody is never inferred away
+- a Herdr that cannot be reached or that answers something unreadable. A workspace
+  it does not list is one already closed and reported as a no-op; a Herdr that will
+  not answer is a fact about Herdr and about no workspace at all
+
+It touches nothing else: no branch, no worktree, no other workspace, no pane on its
+own. There is no force flag and no way to name a workspace directly.
 
 ## Delegating the cleanup
 
@@ -649,8 +690,20 @@ reach it, and `siana-clean` is the same thing from a terminal:
 
 **The grant is what a run may do, and it is yours to choose.** `inventory` reads and
 is always in force. `retire` adds `siana-retire`. `reap-report` adds `siana-reap` in
-its report-only form. Give the narrowest one that does the job, and never start with
-`retire` on a project you have not inventoried first.
+its report-only form. `close-workspace` adds `siana-close-workspace`. Give the
+narrowest one that does the job, and never start with `retire` on a project you have
+not inventoried first.
+
+**`close-workspace` is its own grant, and it is the one that pairs with `retire`.**
+Give both and a run retires each tree and then closes the workspace that retirement
+left open, which is the cleanup finishing rather than stopping one step short. Give
+`close-workspace` alone and it closes only workspaces whose trees some earlier run
+already retired. The ordering is not the cleaner's to get right: the command refuses
+a workspace whose worktree is still there, so a retirement that refused ends that
+task rather than leaking into a close.
+
+Raw `herdr` closing stays refused whatever grants a run holds, and no grant reaches
+a workspace id the cleaner chose.
 
 **Nothing about safety lives in the cleaner.** It enumerates and delegates; every
 refusal it reports is one of your own commands refusing on its own terms. Read a

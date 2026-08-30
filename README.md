@@ -115,10 +115,11 @@ The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
 so a contract with no `.jsonl` beside it is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
-`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
-`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
-`siana-clean`, `siana-report`. They are links, so a `git pull` here updates the
-commands with no reinstall. It does not update the home; `just upgrade` does that.
+`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
+`siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
+`siana-gate`, `siana-clean`, `siana-report`. They are links, so a `git pull` here
+updates the commands with no reinstall. It does not update the home; `just upgrade`
+does that.
 
 ### The distro's own pi package
 
@@ -262,8 +263,9 @@ this convention keep the names they have, and every command still finds them.
 
 You never make one of these by hand, and nothing here pushes one. `siana-publish`
 pushes the branch a QA minion accepted, and only that; `siana-retire` removes the
-worktree once nothing is left in it that only it holds; `siana-reap` removes the
-branch once the work has landed.
+worktree once nothing is left in it that only it holds; `siana-close-workspace`
+closes the Herdr workspace that retirement left open, and only after it; `siana-reap`
+removes the branch once the work has landed.
 
 ### What the merge request says
 
@@ -495,15 +497,32 @@ registers, and it is the same command underneath.
 
 A run carries a grant, and the grants are named after the commands they unlock.
 `inventory` reads and is always in force. `retire` adds `siana-retire`. `reap-report`
-adds `siana-reap` in its report-only form. There is no grant that reaches `siana-reap
---yes`, because a wrong reap is the one mistake in this fleet that loses work.
+adds `siana-reap` in its report-only form. `close-workspace` adds
+`siana-close-workspace`. There is no grant that reaches `siana-reap --yes`, because a
+wrong reap is the one mistake in this fleet that loses work.
 
-There is no grant that closes a Herdr workspace either, and that one is a gap rather
-than a boundary. `siana-retire` removes the worktree and leaves the workspace open on
-purpose, printing that closing it kills the agent inside and is yours to decide. So a
-delegated run leaves one open workspace and one idle agent behind per retirement,
-exactly as retiring by hand does. Closing them is still yours, and giving anything
-else that authority is a decision only you can make.
+`close-workspace` is the narrow authority you granted to close the Herdr workspace a
+finished minion leaves behind, and it is a grant of its own rather than part of
+`retire` because closing a workspace kills the agent in it. Start a run with both and
+it retires each tree and then closes the workspace that retirement left open, which
+is where the idle agent and the open workspace per retirement used to accumulate.
+
+The narrowness is in the command rather than in what the cleaner was told.
+`siana-close-workspace` takes a task id, and resolves the workspace from that task's
+own recorded owner pane - never from a label, a workspace number, an agent name or
+what is focused, each of which finds *a* workspace rather than *that task's*. It
+closes only a `done` task's workspace, only when Herdr says the workspace is a
+linked-worktree one open on exactly the tree the queue recorded, in exactly the
+repository the registry gives that project, with nothing running in it, unfocused,
+and named by no other task in the queue. And it closes only after the retirement has
+actually happened: the tree gone from disk and gone from git's own list of worktrees,
+read from the world rather than taken from an exit code.
+
+That ordering is load-bearing twice over. A workspace closed before its worktree is
+removed strands the worktree, and a project's *source* workspace closes every
+linked-worktree workspace under it, so a workspace Herdr does not mark
+`is_linked_worktree` is refused outright. Raw `herdr` closing stays refused to a
+cleanup run whatever grants it holds.
 
 The cleaner does no safety thinking of its own. It enumerates and delegates, and
 every refusal it meets is one of your existing commands refusing on its own terms.

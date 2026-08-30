@@ -62,32 +62,38 @@ Exit codes, in the shape `siana-pipeline` reads:
         either way; the message says which it was and what to do about it
     3   a question is pending. Read it, answer it, resume
 
-The grants, and there are three. They are named after the commands they unlock,
+The grants, and there are four. They are named after the commands they unlock,
 because a grant that does not name a command is a grant nobody can check:
 
-    inventory     read the queue, the registry, git and herdr. Change nothing
-    retire        also `siana-retire <task-id>`, one task at a time
-    reap-report   also `siana-reap <project>` in its report-only form
+    inventory        read the queue, the registry, git and herdr. Change nothing
+    retire           also `siana-retire <task-id>`, one task at a time
+    reap-report      also `siana-reap <project>` in its report-only form
+    close-workspace  also `siana-close-workspace <task-id>`, after that task's
+                     `siana-retire` succeeded and never before
 
 `inventory` is always in force and is the default. There is no grant that reaches
 `siana-reap --yes`: reaping is the one mistake in this fleet that loses work, so it
 stays the captain's, and what a cleanup run produces about it is a report SIANA turns
 into a decision.
 
-**There is no grant for closing a herdr workspace, and that is a gap rather than a
-boundary.** Say it plainly, because the reason is not the one it looks like.
-`siana-retire` removes the worktree and deliberately leaves the workspace open,
-printing that closing it kills the agent inside and is the captain's to decide
-(`bin/siana-retire`, the success path). So a delegated run retires the tree and still
-leaves one open workspace and one idle agent behind, exactly as a hand-run retirement
-does. Nothing here made that better and nothing here made it worse.
+**`close-workspace` is a whole grant of its own rather than part of `retire`,
+because closing a workspace kills the agent in it.** The captain granted it narrowly
+and deliberately, and the narrowness is in the command: `siana-close-workspace` takes
+a task id, resolves the workspace from that task's recorded owner pane and from
+nothing else, and refuses unless herdr agrees the workspace is a linked worktree one,
+open on exactly the tree that task recorded, in exactly the repository the registry
+gives that task's project, with nothing running in it and no other task's pane in it.
 
-It stays that way because granting anything the authority to close a workspace is
-granting it the authority to kill a live agent, and two places in this distro already
-record that as a decision rather than as mechanics. Widening it is the captain's call
-and would be its own change, with the ordering that call has to respect: closing a
-workspace before its worktree is removed strands the worktree permanently, and
-closing a project's *source* workspace closes every worktree workspace under it.
+Two orderings are load-bearing and both are refusals in that command rather than
+instructions here. Closing a workspace before its worktree is removed strands the
+worktree, so the retirement's postcondition - the tree gone from disk and gone from
+git's own list - is checked before anything closes. And closing a project's *source*
+workspace closes every worktree workspace under it, so a workspace herdr does not
+mark `is_linked_worktree` is refused outright.
+
+A run may hold `retire` and `close-workspace` together, which is the pairing the
+whole thing is for: retire the tree, then close the workspace the retirement left
+open. `retire` on its own is unchanged and closes nothing.
 
 **What the guard is, and what it is not.** Every run puts a directory of refusing
 shims on the front of the child's `PATH`, so a fleet command outside the grant fails
@@ -133,7 +139,7 @@ ROUND_S = int(os.environ.get("SIANA_CLEAN_ROUND_S", "1800"))
 # flush its last event, short enough that an abort is not itself a wait.
 GRACE_S = 5
 
-GRANTS = ("inventory", "retire", "reap-report")
+GRANTS = ("inventory", "retire", "reap-report", "close-workspace")
 
 # What each shim refuses, and the whole of it. A command absent from this table is a
 # command the child reaches unchanged, which is the right default: the cleaner has to
@@ -154,6 +160,9 @@ GUARDS = {
                      "a cleaner asks; it never answers, starts, resumes or aborts"),),
     "siana-retire": (("grant:retire",
                       "this run's grant does not include retiring"),),
+    "siana-close-workspace": (("grant:close-workspace",
+                               "this run's grant does not include closing a"
+                               " workspace"),),
     "siana-reap": (("grant:reap-report",
                     "this run's grant does not include reaping, even to report"),
                    ("globs:--y*,-y*",
@@ -235,9 +244,15 @@ WORD_AFTER = {
 # and then died on that line. The guard exists to stop the *cleaner* reaching git
 # directly, not to stop the command whose judgment the whole design defers to.
 #
+# `siana-close-workspace` is here for the same reason and needs it just as much: it
+# asks git which worktrees a repository still registers, and the guard's `git` shim
+# refuses `worktree` followed by a destructive verb - a rule that reads the word after
+# the verb, and therefore one more thing standing between this command and the answer
+# it has to have before anything is closed.
+#
 # Everything else keeps the guard, so a fleet command cannot become a way to launder
-# an arbitrary call: these two take a task id and a project handle and nothing else.
-DELEGATES = ("siana-retire", "siana-reap")
+# an arbitrary call: all three take a task id or a project handle and nothing else.
+DELEGATES = ("siana-retire", "siana-reap", "siana-close-workspace")
 
 # `git worktree` and `git branch` read in their common form and destroy in their
 # flagged one, so they are matched on the pair rather than on the verb. Kept apart

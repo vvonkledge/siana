@@ -110,6 +110,29 @@ class Shims(unittest.TestCase):
         self.assertIn("'worktree') SAW=1 ;;", body)
         self.assertIn("'add'|'remove'|'prune'|'move'|'repair') BAD=1 ;;", body)
 
+    def test_the_close_boundary_is_refused_without_its_own_grant(self):
+        # `retire` must not unlock it. Closing a workspace kills the agent in it,
+        # which is why the captain granted it separately.
+        body = self.shim("siana-close-workspace", c.GUARDS["siana-close-workspace"],
+                         grants=["inventory", "retire", "reap-report"])
+        self.assertIn("does not include closing a workspace", body)
+        self.assertNotIn("exec", body)
+
+    def test_the_close_boundary_passes_through_under_its_grant(self):
+        body = self.shim("siana-close-workspace", c.GUARDS["siana-close-workspace"],
+                         grants=["inventory", "close-workspace"])
+        self.assertIn(f"exec '{self.TRUE}' \"$@\"", body)
+        self.assertNotIn("is not this cleanup run's to call", body)
+
+    def test_raw_herdr_closing_stays_refused_under_the_close_grant(self):
+        # The grant unlocks one task-addressed command and never herdr itself. A
+        # workspace id the cleaner chose is the one input this design never takes.
+        body = self.shim("herdr", c.GUARDS["herdr"], grants=list(c.GRANTS))
+        for argv in (("workspace", "close", "w9"), ("pane", "close", "w9:p2"),
+                     ("worktree", "remove", "--force", "/nowhere")):
+            self.assertEqual(self.render(body, *argv).returncode, 1, argv)
+        self.assertEqual(self.render(body, "workspace", "list").returncode, 0)
+
     def test_a_delegated_command_is_exec_with_the_guard_off_its_path(self):
         # `siana-retire` ends with `git worktree remove`, and the guard refuses that.
         # It is the safety boundary this whole design defers to, so it reaches the
@@ -1161,6 +1184,89 @@ class Run(HomeTest):
         out = self.clean("start", "--grant", "reap-report")
         self.assertNotIn("not this cleanup run's to call", out.stdout)
         self.assertIn("unknown project", out.stdout)
+
+    def test_the_close_boundary_is_refused_inside_a_run_without_its_grant(self):
+        # Under `retire`, which is the grant that would otherwise look like it
+        # covers finishing the job.
+        self.write_script({"steps": [{"run": ["siana-close-workspace", "a-task"]}],
+                           "exit": 0})
+        out = self.clean("start", "--grant", "retire")
+        self.assertIn("not this cleanup run's to call", out.stdout)
+        self.assertIn("does not include closing a workspace", out.stdout)
+
+    def test_the_close_boundary_reaches_the_real_command_under_its_grant(self):
+        # The real command's own refusal, not the shim's: the grant unlocks the
+        # boundary and the boundary keeps every judgment it already had.
+        self.queue()
+        self.store("tasks.jsonl", {"id": "a-task", "title": "A task",
+                                   "status": "doing", "project": "siana"})
+        self.write_script({"steps": [{"run": ["siana-close-workspace", "a-task"]}],
+                           "exit": 0})
+        out = self.clean("start", "--grant", "close-workspace")
+        self.assertNotIn("not this cleanup run's to call", out.stdout)
+        self.assertIn("a-task is doing, not done", out.stdout)
+
+    def test_the_close_boundary_reaches_the_real_git(self):
+        # It asks git which worktrees a repository still registers before anything
+        # closes, and the guard's `git` shim refuses `worktree` followed by a
+        # destructive verb. `siana-retire` lost its last line to exactly this.
+        stand_in = os.path.join(self.fakebin, "siana-close-workspace")
+        with open(stand_in, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "git worktree list --porcelain /nowhere 2>&1 | head -1\n")
+        os.chmod(stand_in, 0o755)
+        self.write_script({"steps": [{"run": ["siana-close-workspace", "a-task"]}],
+                           "exit": 0})
+        out = self.clean("start", "--grant", "close-workspace")
+        self.assertNotIn("not this cleanup run's to call", out.stdout)
+        self.assertIn("fatal", out.stdout)
+
+    def test_a_close_grant_alone_does_not_unlock_retiring(self):
+        # And the other way round, so neither grant is quietly the other.
+        self.write_script({"steps": [{"run": ["siana-retire", "a-task"]}],
+                           "exit": 0})
+        out = self.clean("start", "--grant", "close-workspace")
+        self.assertIn("does not include retiring", out.stdout)
+
+    def test_a_run_can_hold_both_grants_and_reach_both_commands(self):
+        # The pairing the grant exists for: retire the tree, then close the
+        # workspace that retirement left open. Both reach their real command in one
+        # run, and each answers with its own refusal rather than the shim's.
+        self.queue()
+        self.store("tasks.jsonl", {"id": "a-task", "title": "A task",
+                                   "status": "doing", "project": "siana"})
+        self.write_script({"steps": [
+            {"run": ["siana-retire", "a-task"]},
+            {"run": ["siana-close-workspace", "a-task"]}], "exit": 0})
+        self.assertAccepted(self.clean("start", "--grant", "retire",
+                                       "--grant", "close-workspace"))
+        # The round's own stream, because `siana-clean` carries forward the last
+        # message as the report and this round produced two.
+        with open(self.at("cleanup", "runs", self.only_run(),
+                          "round-1.jsonl")) as fh:
+            stream = fh.read()
+        self.assertNotIn("not this cleanup run's to call", stream)
+        self.assertIn("a-task is still held by", stream)
+        self.assertIn("a-task is doing, not done", stream)
+
+    def test_the_close_grant_unlocks_no_reaping(self):
+        # A grant unlocks the one command it is named after. Reaping is the one
+        # mistake in this fleet that loses work and stays behind its own grant.
+        self.write_script({"steps": [{"run": ["siana-reap", "siana"]}], "exit": 0})
+        out = self.clean("start", "--grant", "close-workspace")
+        self.assertIn("does not include reaping", out.stdout)
+
+    def test_the_close_grant_unlocks_no_branch_deletion(self):
+        self.write_script({"steps": [
+            {"run": ["git", "branch", "-D", "siana/a-task"]}], "exit": 0})
+        out = self.clean("start", "--grant", "close-workspace")
+        self.assertIn("not this cleanup run's to call", out.stdout)
+
+    def test_raw_herdr_closing_is_refused_inside_a_run_that_holds_the_grant(self):
+        self.write_script({"steps": [
+            {"run": ["herdr", "workspace", "close", "w9"]}], "exit": 0})
+        out = self.clean("start", "--grant", "close-workspace")
+        self.assertIn("not this cleanup run's to call", out.stdout)
 
     def test_reap_under_its_grant_still_refuses_the_flag(self):
         # Report-only first, and the flag is refused however it is spelled.

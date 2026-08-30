@@ -56,15 +56,23 @@ by anything in this package.
 
 A cleanup run carries a grant, and the grants are named after the commands they
 unlock: `inventory` reads, `retire` adds `siana-retire`, `reap-report` adds
-`siana-reap` in its report-only form. There is no grant that reaches `siana-reap
---yes`, because a wrong reap is the one mistake in this fleet that loses work.
+`siana-reap` in its report-only form, and `close-workspace` adds
+`siana-close-workspace`. There is no grant that reaches `siana-reap --yes`, because a
+wrong reap is the one mistake in this fleet that loses work.
 
-There is none that closes a herdr workspace either, and that is a gap rather than a
-boundary. `siana-retire` removes the worktree and leaves the workspace open on
-purpose, printing that closing it kills the agent inside and is the captain's to
-decide. A delegated run therefore leaves one open workspace and one idle agent behind
-per retirement, exactly as a hand-run retirement does. Widening that is the captain's
-call and would be its own change.
+`close-workspace` is its own grant and not part of `retire`, because closing a
+workspace kills the agent in it. It unlocks one command, that command takes a task
+id, and the workspace it closes is resolved from that task's own recorded owner pane
+- never from a label, a workspace number, an agent name or what is focused, each of
+which finds *a* workspace rather than *this task's*.
+
+Two orderings are load-bearing, and both are refusals in the command rather than
+sentences in the cleaner's prompt. A workspace closed before its worktree is removed
+strands that worktree, so the retirement's postcondition is checked first: the tree
+gone from disk and gone from git's own list of worktrees. And closing a project's
+source workspace closes every linked-worktree workspace under it, so a workspace
+herdr does not mark `is_linked_worktree` is refused outright. Raw `herdr` closing
+stays refused whatever grants a run holds.
 
 A question the cleaner marks `captain` cannot be answered by SIANA on the captain's
 behalf. `siana-clean answer` refuses it until an obligation id is named, so the path
@@ -98,7 +106,8 @@ not a wall.
 ## Recovering from a failure
 
 Every failure leaves the fleet untouched, because nothing here mutates anything: the
-mutations are `siana-retire`'s, and it fails closed on its own inputs.
+mutations are `siana-retire`'s and `siana-close-workspace`'s, and both fail closed on
+their own inputs.
 
 **pi is missing, or the model is unavailable.** The run fails at round one and
 nothing was done. Install pi, or do the cleanup by hand with `siana-retire`.

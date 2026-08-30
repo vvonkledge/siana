@@ -309,9 +309,9 @@ class Init(Recipe):
                   os.path.join(".pi", "extensions", "wake.ts")):
             self.assertTrue(os.path.exists(self.at(f)), f"init left out {f}")
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
-                  "siana-owe", "siana-retire", "siana-handoff", "siana-publish",
-                  "siana-reap", "siana-pipeline", "siana-afk", "siana-gate",
-                  "siana-clean", "siana-report"):
+                  "siana-owe", "siana-retire", "siana-close-workspace",
+                  "siana-handoff", "siana-publish", "siana-reap", "siana-pipeline",
+                  "siana-afk", "siana-gate", "siana-clean", "siana-report"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this

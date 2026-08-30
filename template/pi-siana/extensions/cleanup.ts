@@ -154,9 +154,15 @@ export default function (pi: ExtensionAPI): void {
 				Type.String({ description: "one project handle; omitted means every project" }),
 			),
 			grants: Type.Optional(
-				Type.Array(StringEnum(["inventory", "retire", "reap-report"] as const), {
-					description: "what this run may do. `inventory` is always in force",
-				}),
+				Type.Array(
+					StringEnum(["inventory", "retire", "reap-report", "close-workspace"] as const),
+					{
+						description:
+							"what this run may do. `inventory` is always in force. `close-workspace` " +
+							"adds `siana-close-workspace <task-id>`, which closes a finished task's own " +
+							"herdr workspace only after that task's worktree was retired",
+					},
+				),
 			),
 			text: Type.Optional(Type.String({ description: "the answer, for action `answer`" })),
 			decision: Type.Optional(
