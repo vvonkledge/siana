@@ -195,39 +195,28 @@ init: _contract-drift
         # and a package directory can be called anything. Anything else the captain
         # installed locally in this home is theirs and is never touched.
         #
-        # Handed back resolved, because `pi remove` matches a source by the path it
-        # resolves to and not by package name: the string as stored is relative to
-        # `.pi/`, and a bare name resolves against $PWD, so both quietly match
+        # Handed to `pi remove` resolved, because it matches a source by the path
+        # it resolves to and not by package name: the string as stored is relative
+        # to `.pi/`, and a bare name resolves against $PWD, so both quietly match
         # nothing. Its exit code is not trusted either - nothing to remove is exit
         # 1, which is the ordinary state of a first install.
         #
-        # `if 1:` so the reader below can be indented as a recipe line without
-        # python calling that an indentation error. A settings.json pi cannot be
-        # read from is a stop and never an empty list: taken as empty, init would
-        # append beside whatever is in there and rebuild the collision it is here
-        # to remove.
+        # A settings.json pi cannot be read from is a stop and never an empty list:
+        # taken as empty, init would append beside whatever is in there and rebuild
+        # the collision it is here to remove.
         settings="$home/.pi/settings.json"
-        if [ -f "$settings" ]; then
-            if ! configured="$(python3 -c 'if 1:
-                import json, os, sys
-                with open(sys.argv[1]) as fh:
-                    sources = json.load(fh).get("packages", [])
-                base = os.path.dirname(os.path.abspath(sys.argv[1]))
-                for source in sources:
-                    print(os.path.abspath(os.path.join(base, source)))
-                ' "$settings" 2>&1)"; then
-                echo "$settings is not readable as pi's settings" >&2
-                echo "$configured" >&2
-                echo "  pi wrote it and pi reads it; repair or delete it, then" >&2
-                echo "  run init again" >&2
-                exit 1
-            fi
-            printf '%s\n' "$configured" | while IFS= read -r source; do
-                [ -n "$source" ] \
-                    && [ -f "$source/skills/agent-tasks/SKILL.md" ] || continue
-                (cd "$home" && pi remove -l -a "$source" >/dev/null 2>&1 || true)
-            done
+        if ! configured="$(just _pi-packages "$settings" 2>&1)"; then
+            echo "$settings is not readable as pi's settings" >&2
+            echo "$configured" >&2
+            echo "  pi wrote it and pi reads it; repair or delete it, then run" >&2
+            echo "  init again" >&2
+            exit 1
         fi
+        printf '%s\n' "$configured" | while IFS= read -r source; do
+            [ -n "$source" ] \
+                && [ -f "$source/skills/agent-tasks/SKILL.md" ] || continue
+            (cd "$home" && pi remove -l -a "$source" >/dev/null 2>&1 || true)
+        done
         # -a because pi refuses to rewrite an existing project-local config in an
         # untrusted directory, and re-running init must not be a first-run-only path.
         (cd "$home" && pi install -l -a "$(cd "$pkg" && pwd)" >/dev/null)
@@ -366,6 +355,44 @@ upgrade: _initialized init
         echo
         echo "Re-apply anything you still want, then delete that directory."
     fi
+
+# The pi packages a home has configured, one resolved absolute path per line.
+#
+# Shared by `init`, which removes the queue ones before installing the package it
+# was asked for, and by `doctor`, which counts them. One reader rather than two
+# that have to agree: a doctor reporting on a different list than init writes is
+# worse than no report at all.
+#
+# Resolved, because a source as stored is relative to `.pi/` and both callers need
+# a path they can test from somewhere else. No settings file is no packages and
+# exits 0, which is the ordinary state of a home before its first install. One
+# that cannot be read exits nonzero with the one line json gives for why, for the
+# caller to refuse on rather than read as empty. A traceback is what every other
+# read in this file is written to keep off the captain's screen.
+#
+# `if 1:` so the reader can be indented as a recipe line without python calling
+# that an indentation error: just ends a recipe at the first unindented line, and
+# a heredoc terminator cannot be indented with spaces.
+#
+# `[no-exit-message]` because both callers report the failure themselves, and
+# just's own "recipe failed" line arrives inside the text they are quoting.
+[private]
+[no-exit-message]
+_pi-packages settings:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f '{{settings}}' ] || exit 0
+    python3 -c 'if 1:
+        import json, os, sys
+        try:
+            with open(sys.argv[1]) as fh:
+                sources = json.load(fh).get("packages", [])
+        except (OSError, ValueError) as why:
+            sys.exit(str(why))
+        base = os.path.dirname(os.path.abspath(sys.argv[1]))
+        for source in sources:
+            print(os.path.abspath(os.path.join(base, source)))
+        ' '{{settings}}'
 
 # Warn when the home's task contract predates the installed `tasks`. A field the
 # CLI writes but the contract lacks is rejected by `extra: forbid` as a raw
@@ -511,6 +538,45 @@ doctor: _contract-drift
             else
                 echo "  missing .pi/extensions/wake.ts (\`just init\` writes it;" \
                      "without it \`siana-watch\` refuses to start)"
+            fi
+            # The queue package the settings file actually configures, counted
+            # rather than taken on trust from the file being there. `pi install`
+            # only appends, so a home can end up carrying two; pi loads the first
+            # and skips the rest, and says so at startup and nowhere else. This
+            # report used to call such a home complete, which is how one ran for
+            # days reading its queue skill from a package the captain had stopped
+            # configuring. Nothing is repaired here - `just init` is what owns the
+            # list - so this only has to make the state sayable.
+            if ! sources="$(just _pi-packages "$home/.pi/settings.json" 2>&1)"; then
+                echo "  stale   .pi/settings.json cannot be read as pi's" \
+                     "settings" >&2
+                echo "$sources" | sed 's/^/          /' >&2
+            else
+                # A here-string and not a pipeline, so `queue` survives the loop,
+                # and not `for` over the words, so a package path with a space in
+                # it is one path.
+                queue=""
+                while IFS= read -r source; do
+                    [ -n "$source" ] \
+                        && [ -f "$source/skills/agent-tasks/SKILL.md" ] || continue
+                    queue="$queue$source"$'\n'
+                done <<< "$sources"
+                queue="${queue%$'\n'}"
+                count="$(printf '%s' "$queue" | grep -c . || true)"
+                if [ "$count" = 1 ]; then
+                    echo "  ok      .pi/settings.json queue package"
+                elif [ "$count" = 0 ]; then
+                    echo "  missing a queue package in .pi/settings.json" \
+                         "(\`just init\` installs one; without it a pi" \
+                         "session opens with no queue in front of it)"
+                else
+                    echo "  stale   .pi/settings.json configures $count queue" \
+                         "packages, and pi loads only the first" >&2
+                    echo "$queue" | sed 's/^/          /' >&2
+                    echo "          \`just init\` installs one instead of adding" \
+                         "to the list; run it to" >&2
+                    echo "          keep the package it is configured for" >&2
+                fi
             fi
         fi
     done
