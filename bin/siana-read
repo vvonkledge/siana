@@ -59,10 +59,6 @@ import sys
 import time
 from datetime import UTC, datetime
 
-# The four stores this reads. Only their names are here; where each one lives is
-# resolved below, because one of them moves.
-STORES = ("tasks", "projects", "obligations", "decisions")
-
 OK, REFUSED, USAGE = 0, 1, 2
 
 # What `datafile list --json` must have said for its answer to be usable. Checked
