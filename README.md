@@ -26,8 +26,9 @@ has been run on an operating system other than macOS.
 
 | Tool       | Verified   | Why it is needed                                      |
 | ---------- | ---------- | ----------------------------------------------------- |
-| `python3`  | 3.13.13    | every `siana-*` command but `siana` and `siana-brief` |
+| `python3`  | 3.13.13    | every `siana-*` command that is not bash or node      |
 | `bash`     | 5.3.9      | `siana`, `siana-brief`, and the recipes in `justfile` |
+| `node`     | 26.7.0     | `siana-console`; no other command here needs it       |
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
 | `datafile` | 0.1.1      | every record store: queue, registry, obligations      |
@@ -659,6 +660,9 @@ smallest process that puts those same documents on a socket, and it is the whole
 what it does. You start it yourself, and you stop it with Ctrl-C or `kill`. Nothing
 in the fleet starts it, nothing in the fleet depends on it, and stopping it leaves
 SIANA, the watcher, every minion and every store exactly as they were.
+
+It is the one command here that runs on `node`, so `just doctor` reports whether
+there is one to run it on.
 
 Read what it is before you run it:
 

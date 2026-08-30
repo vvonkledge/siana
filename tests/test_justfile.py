@@ -148,6 +148,20 @@ class Doctor(Recipe):
         self.assertIn("missing AGENTS.md", out.stdout)
         self.assertIn("missing orders.md", out.stdout)
 
+    def test_the_console_runtime_is_reported_when_it_is_there(self):
+        self.assertIn("ok      node -> ", self.just("doctor").stdout)
+
+    def test_a_machine_with_no_node_is_not_a_broken_install(self):
+        """`siana-console` is the only thing here that runs on node.
+
+        Reported as `missing` beside `tasks`, an absent node would read as a broken
+        install on every machine that has never wanted a console - and `doctor`
+        crying wolf once is `doctor` nobody reads twice.
+        """
+        out = self.just("doctor", env={"PATH": self.distro_path(without=("node",))})
+        self.assertIn("none    node (only siana-console needs it)", out.stdout)
+        self.assertNotIn("missing node", out.stdout)
+
     def test_an_empty_store_is_a_zero_and_never_a_fault(self):
         # datafile writes the .jsonl on the first append, so absent-with-a-contract
         # is an empty store. Doctor must not cry wolf about it.
