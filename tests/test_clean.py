@@ -25,6 +25,10 @@ from helpers import BIN, TEMPLATE, HomeTest, gone_pid, script, until
 
 c = script("siana-clean")
 
+# The clauses `siana-reap` is guarded with, which is the one command needing two:
+# refused outright without the grant, and refused its `--yes` with it.
+GUARD_REAP = c.GUARDS["siana-reap"]
+
 # A round that finishes and reports, which is the ordinary case every other script
 # here is a variation on.
 QUIET = {"steps": [{"say": "Inventoried 3 worktrees. Nothing outstanding."}],
@@ -33,43 +37,74 @@ QUIET = {"steps": [{"say": "Inventoried 3 worktrees. Nothing outstanding."}],
 
 class Shims(unittest.TestCase):
     """The guard, as text. Generated per run out of the grant, so what it refuses is
-    a pure function of two arguments and belongs under a direct test rather than
+    a pure function of its arguments and belongs under a direct test rather than
     behind a spawned agent."""
+
+    QUESTION = "/nowhere/question.json"
+
+    def shim(self, name, clauses, real, grants):
+        return c.shim(name, clauses, real, grants, self.QUESTION)
 
     def test_a_refusal_never_executes_its_own_message(self):
         # This is not hypothetical. The first version wrote the message into a
         # double-quoted `echo`, and the refusal for `herdr` contains the words
         # `siana-retire` in backticks, so every refused herdr call ran siana-retire.
         # A guard that executes its own refusal text is worse than no guard.
-        body = c.shim("herdr", "words:close", "removal is `siana-retire`'s",
-                      "/bin/echo", ["inventory"])
+        body = self.shim("herdr", (("words:close", "removal is `siana-retire`'s"),),
+                         "/bin/echo", ["inventory"])
         self.assertNotIn('echo "', body)
         self.assertIn("printf '%s\\n'", body)
-        self.assertIn("'\\''", body)      # the apostrophe, escaped rather than eaten
+        self.assertIn("'\\''", body)     # the apostrophe, escaped rather than eaten
 
     def test_a_granted_command_passes_straight_through(self):
-        body = c.shim("siana-retire", "grant:retire", "no", "/bin/true",
-                      ["inventory", "retire"])
+        body = self.shim("siana-retire", (("grant:retire", "no"),), "/bin/true",
+                         ["inventory", "retire"])
         self.assertIn("exec '/bin/true' \"$@\"", body)
-        self.assertNotIn("refused", body)
+        self.assertNotIn("is not this cleanup run's to call", body)
 
     def test_an_ungranted_command_never_reaches_the_real_one(self):
-        body = c.shim("siana-retire", "grant:retire", "no", "/bin/true",
-                      ["inventory"])
+        body = self.shim("siana-retire", (("grant:retire", "no"),), "/bin/true",
+                         ["inventory"])
         self.assertIn("refused", body)
         self.assertNotIn("exec", body)
 
     def test_a_command_that_is_not_installed_is_still_refused(self):
         # Absent today and installed tomorrow must not become reachable to a run
         # that was already refused it.
-        body = c.shim("siana-publish", "always", "no", None, ["inventory"])
+        body = self.shim("siana-publish", (("always", "no"),), None, ["inventory"])
         self.assertIn("refused", body)
         self.assertNotIn("exec", body)
 
     def test_the_git_pair_rule_reads_the_word_after_the_verb(self):
-        body = c.shim("git", "words:push", "no", "/bin/true", ["inventory"])
+        body = self.shim("git", (("words:push", "no"),), "/bin/true", ["inventory"])
         self.assertIn("'worktree') SAW=1 ;;", body)
         self.assertIn("'add'|'remove'|'prune'|'move'|'repair') BAD=1 ;;", body)
+
+    def test_a_second_clause_still_applies_once_the_first_is_granted(self):
+        # `siana-reap` is the reason clauses are a list. With one clause it had only
+        # the flag rule, so the `reap-report` grant unlocked nothing while four
+        # documents said it did.
+        body = self.shim("siana-reap", GUARD_REAP, "/bin/true",
+                         ["inventory", "reap-report"])
+        self.assertIn("'--yes') BAD=1 ;;", body)
+        self.assertIn("exec '/bin/true'", body)
+
+    def test_an_ungranted_first_clause_refuses_before_the_second_is_read(self):
+        body = self.shim("siana-reap", GUARD_REAP, "/bin/true", ["inventory"])
+        self.assertIn("does not include reaping", body)
+        self.assertNotIn("--yes", body)
+        self.assertNotIn("exec", body)
+
+    def test_every_shim_refuses_while_a_question_is_waiting(self):
+        # The guarantee is that nothing after the uncertain point runs, and until
+        # this existed the only thing holding it was a sentence in a prompt.
+        for name, clauses in c.GUARDS.items():
+            body = self.shim(name, clauses, "/bin/true", list(c.GRANTS))
+            if "exec" not in body:
+                continue          # refused outright; the gate is beside the point
+            self.assertIn(f"if [ -e '{self.QUESTION}' ]; then", body, name)
+            self.assertLess(body.index("question is waiting"), body.index("exec"),
+                            name)
 
 
 class Runbook(unittest.TestCase):
@@ -84,23 +119,25 @@ class Runbook(unittest.TestCase):
         self.path = os.path.join(self.dir, "runbook.md")
 
     def test_appending_the_same_question_twice_writes_once(self):
-        self.assertTrue(c.runbook_append(self.path, "q1", "Is it?", "No."))
-        self.assertFalse(c.runbook_append(self.path, "q1", "Is it?", "No."))
+        qid = "clean-20260101-000000-q1"
+        self.assertTrue(c.runbook_append(self.path, qid, "Is it?", "No."))
+        self.assertFalse(c.runbook_append(self.path, qid, "Is it?", "No."))
         with open(self.path) as fh:
-            self.assertEqual(fh.read().count("q1"), 1)
+            self.assertEqual(fh.read().count(qid), 1)
 
     def test_the_same_wording_under_a_different_id_is_a_second_entry(self):
         # Two runs can legitimately reach the same wording about different
         # worktrees, and de-duplicating on prose would silently drop the second.
-        c.runbook_append(self.path, "q1", "Is it?", "No.")
-        self.assertTrue(c.runbook_append(self.path, "q2", "Is it?", "Yes."))
+        c.runbook_append(self.path, "clean-20260101-000000-q1", "Is it?", "No.")
+        self.assertTrue(c.runbook_append(self.path, "clean-20260102-000000-q1",
+                                         "Is it?", "Yes."))
         with open(self.path) as fh:
             text = fh.read()
         self.assertIn("No.", text)
         self.assertIn("Yes.", text)
 
     def test_initialising_an_existing_runbook_never_touches_it(self):
-        c.runbook_append(self.path, "q1", "Is it?", "No.")
+        c.runbook_append(self.path, "clean-20260101-000000-q1", "Is it?", "No.")
         c.runbook_init(self.path)
         with open(self.path) as fh:
             self.assertIn("No.", fh.read())
@@ -597,15 +634,54 @@ class Run(HomeTest):
         self.assertNotIn("not this cleanup run's to call", out.stdout)
         self.assertIn("a-task is still held by a minion", out.stdout)
 
-    def test_reap_is_report_only_however_it_is_called(self):
-        self.assertIn("reaping is the captain's",
-                      self.probe("siana-reap", "siana", "--yes"))
-        self.assertIn("reaping is the captain's",
-                      self.probe("siana-reap", "-y", "siana"))
+    def test_reap_is_refused_outright_without_the_grant(self):
+        # The grant has to unlock something, or SIANA choosing the narrowest one is
+        # being told it withheld something it did not.
+        self.assertIn("does not include reaping",
+                      self.probe("siana-reap", "siana"))
 
-    def test_reap_without_the_flag_reaches_the_real_command(self):
-        self.assertNotIn("not this cleanup run's to call",
-                         self.probe("siana-reap", "siana"))
+    def test_reap_reaches_the_real_command_under_its_grant(self):
+        self.write_script({"steps": [{"run": ["siana-reap", "siana"]}], "exit": 0})
+        out = self.clean("start", "--grant", "reap-report")
+        self.assertNotIn("not this cleanup run's to call", out.stdout)
+        self.assertIn("unknown project", out.stdout)
+
+    def test_reap_under_its_grant_still_refuses_the_flag(self):
+        # Report-only first, and the flag is refused however it is spelled.
+        for flag in ("--yes", "-y"):
+            self.write_script({"steps": [{"run": ["siana-reap", "siana", flag]}],
+                               "exit": 0})
+            out = self.clean("start", "--grant", "reap-report")
+            self.assertIn("reaping is the captain's", out.stdout, flag)
+
+    def test_nothing_granted_is_callable_once_a_question_is_waiting(self):
+        # The brief's guarantee, as a property of the mechanism rather than of the
+        # cleaner's prompt: a cleaner that asked and then kept going is refused.
+        self.queue()
+        self.store("tasks.jsonl", {"id": "a-task", "title": "A task",
+                                   "status": "done", "project": "siana"})
+        self.write_script({"steps": [
+            {"ask": {"body": "Is that tree's .env yours?", "kind": "siana"}},
+            {"run": ["siana-retire", "a-task"]},
+            {"say": "kept going after asking"}], "exit": 0})
+        out = self.clean("start", "--grant", "retire")
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+        stream = self.at("cleanup", "runs", self.only_run(), "round-1.jsonl")
+        with open(stream) as fh:
+            said = fh.read()
+        self.assertIn("not callable while a question is waiting", said)
+        self.assertNotIn("still held by a minion", said)
+
+    def test_the_gate_lifts_once_the_question_is_answered(self):
+        # A gate that never lifted would make a resumed run useless.
+        self.write_script({"steps": [{"ask": {"body": "Is it?", "kind": "siana"}}],
+                           "exit": 0})
+        self.clean("start", "--grant", "retire")
+        run_id = self.only_run()
+        self.clean("answer", run_id, "--text", "Refuse it.")
+        self.write_script({"steps": [{"run": ["siana-reap", "siana"]}], "exit": 0})
+        out = self.assertAccepted(self.clean("resume", run_id))
+        self.assertNotIn("while a question is waiting", out)
 
     def test_the_destructive_git_verbs_are_refused_and_the_readers_are_not(self):
         for argv in (["git", "push"], ["git", "worktree", "remove", "x"],

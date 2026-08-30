@@ -33,8 +33,13 @@ the other.
 
 **The question is on disk before anybody sees it.** `ask` writes it and returns; the
 cleaner is only then permitted to stop. So a machine that dies between the two loses
-a round of work and never loses the question, and nothing after the uncertain point
-runs until an answer is durably recorded.
+a round of work and never loses the question.
+
+**And nothing after the uncertain point runs**, which is enforced rather than asked
+for: every shim in the guard below refuses while that question file is there. A
+cleaner that ignored its instructions and kept going is stopped by the same mechanism
+that keeps it inside its grant, because "no step after the uncertain point" is an
+exact rule and an exact rule belongs in a script.
 
 Usage:
     siana-clean start [--project <handle>] [--grant <name>]...  begin one run
@@ -48,7 +53,8 @@ Usage:
 Exit codes, in the shape `siana-pipeline` reads:
 
     0   the round finished and there is nothing outstanding
-    1   refused, or a fault. Nothing was left half-done; the message says what to do
+    1   refused, a fault, or a run deliberately aborted. Nothing was left half-done
+        either way; the message says which it was and what to do about it
     3   a question is pending. Read it, answer it, resume
 
 The grants, and there are three. They are named after the commands they unlock,
@@ -109,30 +115,42 @@ GRANTS = ("inventory", "retire", "reap-report")
 # read the world, and a guard that had to enumerate every reader would go stale
 # against the first new one.
 #
-# The rules are matched over the child's whole argument list, because `git worktree
-# remove` and `git -C x worktree remove` are the same call and only the words tell
-# them apart.
+# Each entry is a tuple of clauses, and a command is refused when any of them fires.
+# Two rather than one is what `siana-reap` needs and is why this is a list: it is
+# refused outright to a run without the `reap-report` grant, *and* refused its `--yes`
+# to a run that has it. With one clause it had only the second, so the grant unlocked
+# nothing while four documents said it did.
+#
+# The word rules are matched over the child's whole argument list, because `git
+# worktree remove` and `git -C x worktree remove` are the same call and only the
+# words tell them apart.
 GUARDS = {
-    "siana-retire": ("grant:retire", "this run's grant does not include retiring"),
-    "siana-reap": ("flags:--yes,-y", "reaping is the captain's; report it and stop"),
-    "siana-publish": ("always", "publishing is SIANA's, after QA accepts"),
-    "siana-dispatch": ("always", "dispatching is SIANA's"),
-    "siana-brief": ("always", "briefing is SIANA's"),
-    "siana-gate": ("always", "the gate is SIANA's"),
-    "siana-afk": ("always", "advisory sessions are the captain's"),
-    "siana-watch": ("always", "the watcher is the captain's grant"),
-    "siana-pipeline": ("always", "the pipeline validates a minion's branch"),
-    "siana-handoff": ("always", "a handoff is written by whoever did the work"),
-    "pi": ("always", "a cleanup run does not start another agent"),
-    "tasks": ("words:add,done,block,reset,drop,delete,put,edit,set",
-              "the queue is SIANA's; a cleanup run reads it and never writes it"),
-    "datafile": ("words:put,rm,delete,repair",
-                 "the stores are SIANA's; a cleanup run reads them and never writes"),
-    "git": ("words:push,commit,merge,rebase,reset,clean,am,cherry-pick",
-            "nothing in a cleanup run changes a repository's history"),
-    "herdr": ("words:close,remove,kill,prompt",
-              "worktree and workspace removal is `siana-retire`'s, and only its"),
+    "siana-retire": (("grant:retire",
+                      "this run's grant does not include retiring"),),
+    "siana-reap": (("grant:reap-report",
+                    "this run's grant does not include reaping, even to report"),
+                   ("flags:--yes,-y",
+                    "reaping is the captain's; report it and stop")),
+    "siana-publish": (("always", "publishing is SIANA's, after QA accepts"),),
+    "siana-dispatch": (("always", "dispatching is SIANA's"),),
+    "siana-brief": (("always", "briefing is SIANA's"),),
+    "siana-gate": (("always", "the gate is SIANA's"),),
+    "siana-afk": (("always", "advisory sessions are the captain's"),),
+    "siana-watch": (("always", "the watcher is the captain's grant"),),
+    "siana-pipeline": (("always", "the pipeline validates a minion's branch"),),
+    "siana-handoff": (("always", "a handoff is written by whoever did the work"),),
+    "pi": (("always", "a cleanup run does not start another agent"),),
+    "tasks": (("words:add,done,block,reset,drop,delete,put,edit,set",
+               "the queue is SIANA's; a cleanup run reads it and never writes it"),),
+    "datafile": (("words:put,rm,delete,repair",
+                  "the stores are SIANA's; a cleanup run reads them and never"
+                  " writes"),),
+    "git": (("words:push,commit,merge,rebase,reset,clean,am,cherry-pick",
+             "nothing in a cleanup run changes a repository's history"),),
+    "herdr": (("words:close,remove,kill,prompt",
+               "worktree and workspace removal is `siana-retire`'s, and only its"),),
 }
+
 
 # `git worktree` and `git branch` read in their common form and destroy in their
 # flagged one, so they are matched on the pair rather than on the verb. Kept apart
@@ -412,32 +430,61 @@ def match_pairs(verb, bad):
     ]
 
 
-def shim(name: str, rule: str, instead: str, real, grants) -> str:
+def question_gate(name: str, question: str):
+    """Shell that refuses while this run has a question waiting.
+
+    The guarantee is that nothing after the uncertain point runs until an answer is
+    durably recorded, and until this existed the only thing holding it was a sentence
+    in the cleaner's prompt. That is the wrong place for it by this project's own
+    rule: an exact rule belongs in a script. The shims are written once at spawn
+    time, so the check has to be at the front of the shim rather than baked into it,
+    and the file it looks for is the same one `pending()` reads.
+
+    Every guarded command gets this, readers included. After a cleaner has asked
+    there is nothing further for it to do but finish its turn, so a reader that
+    still answered would only be helping it gather more state it must not act on.
+    """
+    said = [f"refused: {name} is not callable while a question is waiting",
+            "  you asked SIANA something and it has not been answered yet",
+            "  stop now and finish your turn. This run is resumed with the answer"]
+    return ([f'if [ -e {sq(question)} ]; then']
+            + [f"  printf '%s\\n' {sq(line)} >&2" for line in said]
+            + ["  exit 1", "fi"])
+
+
+def shim(name: str, clauses, real, grants, question: str) -> str:
     """One shim's text: `sh`, because it runs on every command the child issues, and
-    small enough that a reader can check it without trusting this comment."""
-    refuse = refusal_lines(name, instead)
-    always = rule == "always" or (rule.startswith("grant:")
-                                  and rule.split(":", 1)[1] not in grants)
-    if real is None:
-        # Nothing to fall through to. Written anyway rather than skipped: a command
-        # absent today and installed tomorrow must not become reachable to a run that
-        # was already refused it.
-        always = True
-    if always:
-        return "\n".join(["#!/bin/sh", *refuse]) + "\n"
-    passthrough = f'exec {sq(real)} "$@"'
-    if rule.startswith("grant:"):
-        return "\n".join(["#!/bin/sh", passthrough]) + "\n"
-    kind, values = rule.split(":", 1)
-    lines = ["#!/bin/sh", "BAD=0", *match_words(values.split(","))]
-    if kind == "words" and name == "git":
-        for verb, bad in GIT_PAIRS:
-            lines += match_pairs(verb, bad)
-    elif kind not in ("words", "flags"):
-        die(f"unknown guard rule: {rule}")
-    lines += ['if [ "$BAD" = 1 ]; then',
-              *[f"  {line}" for line in refuse],
-              "fi", passthrough]
+    small enough that a reader can check it without trusting this comment.
+
+    A clause is `always`, `grant:<name>`, `flags:<a,b>` or `words:<a,b>`. The first
+    two are decided here, when the shim is written, because the grant does not change
+    within a run; the last two are decided by the shim, because they are about the
+    arguments it is given. Any clause firing refuses.
+    """
+    lines = ["#!/bin/sh", *question_gate(name, question)]
+    for rule, instead in clauses:
+        refuse = refusal_lines(name, instead)
+        if rule == "always" or (rule.startswith("grant:")
+                                and rule.split(":", 1)[1] not in grants):
+            return "\n".join(["#!/bin/sh", *refuse]) + "\n"
+        if real is None:
+            # Nothing to fall through to. Written anyway rather than skipped: a
+            # command absent today and installed tomorrow must not become reachable
+            # to a run that was already refused it.
+            return "\n".join(["#!/bin/sh", *refuse]) + "\n"
+        if rule.startswith("grant:"):
+            continue                       # granted, so this clause has nothing to say
+        kind, values = rule.split(":", 1)
+        if kind not in ("words", "flags"):
+            die(f"unknown guard rule: {rule}")
+        lines += ["BAD=0", *match_words(values.split(","))]
+        if kind == "words" and name == "git":
+            for verb, bad in GIT_PAIRS:
+                lines += match_pairs(verb, bad)
+        lines += ['if [ "$BAD" = 1 ]; then',
+                  *[f"  {line}" for line in refuse],
+                  "fi"]
+    lines.append(f'exec {sq(real)} "$@"')
     return "\n".join(lines) + "\n"
 
 
@@ -447,12 +494,16 @@ def guard_dir(run_dir: str, grants) -> str:
     Written per run rather than shipped, because what is refused depends on the grant
     this run was given, and a shipped guard would have to read state to know it -
     which is a second place the grant would live.
+
+    The one thing the shims read at call time is this run's pending question, because
+    that is the one thing that changes while the run is going.
     """
     guard = os.path.join(run_dir, "guard")
     os.makedirs(guard, exist_ok=True)
     path = clean_path()
-    for name, (rule, instead) in GUARDS.items():
-        body = shim(name, rule, instead, shutil.which(name, path=path), grants)
+    question = os.path.join(run_dir, "question.json")
+    for name, clauses in GUARDS.items():
+        body = shim(name, clauses, shutil.which(name, path=path), grants, question)
         target = os.path.join(guard, name)
         with open(target, "w") as fh:
             fh.write(body)
@@ -790,6 +841,23 @@ def spawn(paths: Home, rec: dict, resolved) -> dict:
                     command=process_command(proc.pid), round=round_no,
                     updated=now(), detail="a cleaner is working"))
 
+    # stderr is drained on its own thread and into a bounded buffer. Both halves
+    # matter. Left unread until after the stdout loop, a child that writes more than
+    # the pipe buffer - 64KB on darwin - blocks in `write`, never exits, never closes
+    # stdout, and the parent sits in `for line in proc.stdout` with nothing coming:
+    # the round then burns its whole 30-minute budget and reports as a wedged
+    # cleaner rather than as this harness deadlocking on its own pipe. And read
+    # without a bound, a child that streams a gigabyte of tracebacks would be held
+    # in memory whole, when what the failure report prints is the last two thousand
+    # characters of it.
+    errbuf = []
+
+    def drain():
+        for chunk in iter(lambda: proc.stderr.read(4096), ""):
+            errbuf.append(chunk)
+            if len(errbuf) > 8:
+                del errbuf[:len(errbuf) - 8]
+
     report, truncated, written = "", False, 0
     # The deadline is a timer on the child's process group and not a check inside the
     # read loop. A wedged round is exactly one that has stopped producing output, so
@@ -808,6 +876,8 @@ def spawn(paths: Home, rec: dict, resolved) -> dict:
     watchdog = threading.Timer(ROUND_S, on_deadline)
     watchdog.daemon = True
     watchdog.start()
+    errors = threading.Thread(target=drain, daemon=True)
+    errors.start()
     try:
         with open(paths.stream(run_id, round_no), "w") as out:
             for line in proc.stdout:
@@ -827,8 +897,11 @@ def spawn(paths: Home, rec: dict, resolved) -> dict:
         watchdog.cancel()
         if killed:
             reap(proc)
-        stderr = proc.stderr.read() if proc.stderr else ""
         code = proc.wait()
+        # The child is gone, so the drain has reached end of file. Joined with a
+        # bound anyway: this must never be the thing that hangs the command.
+        errors.join(timeout=GRACE_S)
+        stderr = "".join(errbuf)
     why = killed[0] if killed else None
     return {"round": round_no, "ended": now(), "exit": -1 if why else code,
             "report": report[:REPORT_CAP], "stderr": tail(stderr),
@@ -1003,7 +1076,13 @@ def cmd_ask(paths: Home, args) -> int:
             "`captain` is a product choice or an irreversible action, and SIANA",
             "records those as decisions rather than answering them")
     slug = re.sub(r"[^a-z0-9]+", "-", body.lower())[:32].strip("-") or "question"
-    qid = f"q{len(answers(paths, run_id)) + 1}-{slug}"
+    # The run id is part of the question id, and that is not decoration. The runbook
+    # is idempotent on this string, so a per-run counter alone means every run's
+    # first question is `q1-<slug>` and two runs whose first questions share a
+    # 32-character prefix collide: the second answer is silently never appended, and
+    # the next cleaner reads the first run's answer as the fleet's policy. The run id
+    # is already unique by construction, so prefixing with it closes that.
+    qid = f"{run_id}-q{len(answers(paths, run_id)) + 1}-{slug}"
     write_json(paths.question(run_id),
                {"qid": qid, "run": run_id, "body": body, "kind": args.kind,
                 "options": [o for o in args.option if o.strip()], "asked": now()})

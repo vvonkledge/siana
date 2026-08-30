@@ -45,6 +45,10 @@ to disk and ends; the command returns with exit 3 and the question in its output
 the deadlock a nested agent invites - a parent blocked on a child that is blocked on
 the parent - has nowhere to happen.
 
+**Nothing after that point runs, and it is the guard that says so.** Every shim
+refuses while the question file is there, so a cleaner that ignored its instructions
+and kept working is stopped by a mechanism rather than by a sentence in a prompt.
+
 ## The authority boundary
 
 The cleaner reports to SIANA. SIANA reports to the captain. Neither of those is moved

@@ -85,6 +85,10 @@ protocol is that nothing after the uncertain point runs until an answer is recor
 and one more step is exactly how that guarantee is lost. Your run is resumed later,
 with the answer, by SIANA.
 
+Every guarded command refuses while your question is waiting, so if you try one
+anyway you will be told so rather than allowed to. Read that refusal as this
+paragraph, not as an obstacle: finish your turn.
+
 Ask one question per round. If you find three, ask the one that blocks the most and
 report the other two in your final message.
 
