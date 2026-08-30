@@ -45,9 +45,18 @@ Write it as prose with headings, for a captain reading on a phone. No tables of
 identifiers, no dumps of the JSON, and no paragraph that exists to show that you
 looked.
 
-**1. What happened.** Outcomes, not activity. What landed, what was accepted, what
-was rejected and what came back blocked. A minion that ran for three hours and
-produced nothing is not an outcome; say that it produced nothing.
+**1. What happened.** Outcomes, not activity. What landed, what was accepted and what
+was rejected. A minion that ran for three hours and produced nothing is not an
+outcome; say that it produced nothing.
+
+A task the queue holds as `blocked` does not belong here. It is work waiting on an
+answer, so it is actionable and it goes under risk or under what the captain has to
+decide - reporting it as something that already happened is how a live blocker stops
+being read as one. Resolved findings are a different thing, they live in their own
+store, and they are read from that store rather than reconstructed from the queue.
+If that store is absent or unreadable, say so as an unavailable source exactly as you
+would for any other: filling the gap from the queue would put settled work back in
+front of the captain as though it were still open.
 
 **2. Health.** Is the fleet moving. Whether the watcher is running, whether anything
 is dispatched, whether anything has been `doing` far longer than its shape should

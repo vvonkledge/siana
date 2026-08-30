@@ -167,9 +167,10 @@ GUARDS = {
     "siana-pipeline": (("always", "the pipeline validates a minion's branch"),),
     "siana-handoff": (("always", "a handoff is written by whoever did the work"),),
     "pi": (("always", "a cleanup run does not start another agent"),),
-    "tasks": (("words:add,done,block,reset,drop,delete,put,edit,set",
+    "tasks": (("words:init,add,start,done,block,unblock,reset,dep,drop,"
+               "setup,skill,pi-package",
                "the queue is SIANA's; a cleanup run reads it and never writes it"),),
-    "datafile": (("words:put,rm,delete,repair",
+    "datafile": (("words:put,delete,repair,compact,roll,setup,skill,pi-package",
                   "the stores are SIANA's; a cleanup run reads them and never"
                   " writes"),),
     "git": (("words:push,commit,merge,rebase,reset,clean,am,cherry-pick,revert,"
@@ -180,6 +181,25 @@ GUARDS = {
                "worktree and workspace removal is `siana-retire`'s, and only its"),),
 }
 
+
+# The subcommands of a guarded command that only read, declared so that the ones that
+# write can be checked against the command itself rather than against this file.
+#
+# A hand-written list of verbs drifts, and it drifts silently and in the dangerous
+# direction. This one did: it named `delete`, `put`, `edit` and `set`, none of which
+# `tasks` has, while missing `start`, `unblock`, `dep` and `init`, which it does -
+# so `tasks start <id> --owner <name>` reached the real command and dispatched a task
+# under the captain's queue, which is the one thing `siana-dispatch` is refused
+# outright for. `datafile compact` and `datafile roll`, which rewrite an append-only
+# store in place, were open for the same reason.
+#
+# `tests/test_clean.py` asks each command for its own verbs and refuses to pass while
+# one of them is in neither list, so the next verb either of these grows is a red
+# suite rather than a hole nobody sees.
+GUARD_READS = {
+    "tasks": ("show", "list"),
+    "datafile": ("get", "list", "keys", "stores", "validate", "schema"),
+}
 
 # A word that is benign in one position and not in another, as {command: {word:
 # flag}}: the word is refused everywhere except immediately after that flag.

@@ -15,6 +15,7 @@ the runbook are all the ones that ship. Nothing here stubs a store.
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -160,6 +161,65 @@ class Shims(unittest.TestCase):
             self.assertIn(f"if [ -e '{self.QUESTION}' ]; then", body, name)
             self.assertLess(body.index("question is waiting"), body.index("exec"),
                             name)
+
+
+class GuardedVerbs(unittest.TestCase):
+    """Every subcommand of a guarded command is classified, checked against the
+    command rather than against the guard's own table.
+
+    A hand-written list of verbs drifts silently and in the dangerous direction, and
+    this one did: it named four subcommands `tasks` does not have while missing four
+    it does, so `tasks start <id> --owner <name>` reached the real command and
+    dispatched a task under the captain's queue. Nothing could have caught that by
+    reading `bin/siana-clean`, because the file agreed with itself.
+
+    Both commands name their whole set the same way, in the error argparse writes for
+    an invalid choice, so one parser answers for both. A verb in neither list fails
+    here, which is the right direction: unclassified is a decision somebody has to
+    make, not a default to be inherited.
+    """
+
+    def verbs(self, command):
+        out = subprocess.run([command, "__no_such_subcommand__"],
+                             capture_output=True, text=True, timeout=60)
+        text = out.stdout + out.stderr
+        match = re.search(r"choose from ([^)]+)\)", text)
+        self.assertIsNotNone(match, f"{command} did not name its commands:\n{text}")
+        return {v.strip().strip("'\"") for v in match.group(1).split(",")}
+
+    def guarded(self, command):
+        words = set()
+        for rule, _ in c.GUARDS[command]:
+            kind, values = rule.split(":", 1)
+            self.assertEqual(kind, "words", command)
+            words.update(values.split(","))
+        return words
+
+    def check(self, command):
+        real = self.verbs(command)
+        guarded, reads = self.guarded(command), set(c.GUARD_READS[command])
+        self.assertEqual(guarded - real, set(),
+                         f"{command}: guarded against verbs it does not have")
+        self.assertEqual(reads - real, set(),
+                         f"{command}: declared reads it does not have")
+        self.assertEqual(real - guarded - reads, set(),
+                         f"{command}: verbs classified as neither read nor write")
+        self.assertEqual(guarded & reads, set(),
+                         f"{command}: verbs classified as both")
+
+    @unittest.skipUnless(shutil.which("tasks"), "needs tasks")
+    def test_every_tasks_verb_is_classified(self):
+        self.check("tasks")
+
+    @unittest.skipUnless(shutil.which("datafile"), "needs datafile")
+    def test_every_datafile_verb_is_classified(self):
+        self.check("datafile")
+
+    def test_the_reader_and_writer_lists_are_the_only_two(self):
+        # A guarded command with no declared reads would pass `check` vacuously by
+        # having every verb in its word list, which is a different bug wearing the
+        # same green.
+        self.assertEqual(set(c.GUARD_READS), {"tasks", "datafile"})
 
 
 class Runbook(unittest.TestCase):
@@ -911,10 +971,26 @@ class Run(HomeTest):
         self.assertIn("siana-retire", said)
 
     def test_writing_the_queue_is_refused_and_reading_it_is_not(self):
-        self.assertIn("not this cleanup run's to call",
-                      self.probe("tasks", "done", "x"))
-        self.assertNotIn("not this cleanup run's to call",
-                         self.probe("tasks", "list"))
+        # `start` is the one that mattered and was open: it dispatches a task and
+        # takes ownership of it, which is what `siana-dispatch` is refused outright
+        # for - and the cleaner runs with SIANA_TASK_ID unset, so it presents to the
+        # queue as the orchestrator rather than as a minion.
+        for verb in ("done", "start", "unblock", "dep", "drop", "add", "init"):
+            self.assertIn("not this cleanup run's to call",
+                          self.probe("tasks", verb, "x"), verb)
+        for verb in ("list", "show"):
+            self.assertNotIn("not this cleanup run's to call",
+                             self.probe("tasks", verb), verb)
+
+    def test_rewriting_a_store_in_place_is_refused(self):
+        # `compact` and `roll` rewrite an append-only store, and the child's cwd is
+        # the home, so they reach the captain's own stores.
+        for verb in ("compact", "roll", "put", "delete", "repair"):
+            self.assertIn("not this cleanup run's to call",
+                          self.probe("datafile", "-f", "x.jsonl", verb), verb)
+        for verb in ("list", "get", "keys", "stores", "validate", "schema"):
+            self.assertNotIn("not this cleanup run's to call",
+                             self.probe("datafile", "-f", "x.jsonl", verb), verb)
 
     def test_a_nested_agent_is_refused(self):
         self.assertIn("does not start another agent", self.probe("pi", "-p", "hi"))

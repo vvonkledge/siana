@@ -152,6 +152,16 @@ class Skill(unittest.TestCase):
         self.assertIn("siana-owe close", self.text)
         self.assertIn("siana-owe outcome", self.text)
 
+    def test_a_blocked_task_is_reported_as_actionable_and_not_as_history(self):
+        # The compatibility point with the findings store being designed elsewhere.
+        # Everything the queue holds as `blocked` is work waiting on an answer, and
+        # resolved findings come from their own store rather than from the queue.
+        flat = " ".join(self.text.split())
+        self.assertIn("A task the queue holds as `blocked` does not belong here",
+                      flat)
+        self.assertIn("they live in their own store", flat)
+        self.assertIn("rather than reconstructed from the queue", flat)
+
     def test_it_separates_a_recommendation_from_authority(self):
         self.assertIn("A recommendation is not authority", self.text)
         self.assertIn("Active blockers", self.text)
