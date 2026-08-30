@@ -496,10 +496,14 @@ registers, and it is the same command underneath.
 A run carries a grant, and the grants are named after the commands they unlock.
 `inventory` reads and is always in force. `retire` adds `siana-retire`. `reap-report`
 adds `siana-reap` in its report-only form. There is no grant that reaches `siana-reap
---yes`, because a wrong reap is the one mistake in this fleet that loses work, and
-there is none that closes a herdr workspace, because `siana-retire` owns worktree
-removal and a second route to the same destruction would be a second copy of a safety
-judgment that must have exactly one.
+--yes`, because a wrong reap is the one mistake in this fleet that loses work.
+
+There is no grant that closes a Herdr workspace either, and that one is a gap rather
+than a boundary. `siana-retire` removes the worktree and leaves the workspace open on
+purpose, printing that closing it kills the agent inside and is yours to decide. So a
+delegated run leaves one open workspace and one idle agent behind per retirement,
+exactly as retiring by hand does. Closing them is still yours, and giving anything
+else that authority is a decision only you can make.
 
 The cleaner does no safety thinking of its own. It enumerates and delegates, and
 every refusal it meets is one of your existing commands refusing on its own terms.

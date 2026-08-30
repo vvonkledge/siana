@@ -57,9 +57,14 @@ by anything in this package.
 A cleanup run carries a grant, and the grants are named after the commands they
 unlock: `inventory` reads, `retire` adds `siana-retire`, `reap-report` adds
 `siana-reap` in its report-only form. There is no grant that reaches `siana-reap
---yes`, and there is none that closes a herdr workspace: `siana-retire` owns worktree
-removal, and a second route to the same destruction would be a second copy of a
-safety judgment that must have exactly one.
+--yes`, because a wrong reap is the one mistake in this fleet that loses work.
+
+There is none that closes a herdr workspace either, and that is a gap rather than a
+boundary. `siana-retire` removes the worktree and leaves the workspace open on
+purpose, printing that closing it kills the agent inside and is the captain's to
+decide. A delegated run therefore leaves one open workspace and one idle agent behind
+per retirement, exactly as a hand-run retirement does. Widening that is the captain's
+call and would be its own change.
 
 A question the cleaner marks `captain` cannot be answered by SIANA on the captain's
 behalf. `siana-clean answer` refuses it until an obligation id is named, so the path

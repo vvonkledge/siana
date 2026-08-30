@@ -69,13 +69,25 @@ because a grant that does not name a command is a grant nobody can check:
     retire        also `siana-retire <task-id>`, one task at a time
     reap-report   also `siana-reap <project>` in its report-only form
 
-`inventory` is always in force and is the default. There is deliberately no grant for
-closing a herdr workspace: `siana-retire` owns worktree removal, whatever that
-command does about the workspace behind it is that command's decision, and a second
-route to the same destruction would be a second copy of a safety judgment that must
-have exactly one. There is no grant that reaches `siana-reap --yes` either. Reaping
-is the one mistake in this fleet that loses work, so it stays the captain's, and what
-a cleanup run produces about it is a report SIANA turns into a decision.
+`inventory` is always in force and is the default. There is no grant that reaches
+`siana-reap --yes`: reaping is the one mistake in this fleet that loses work, so it
+stays the captain's, and what a cleanup run produces about it is a report SIANA turns
+into a decision.
+
+**There is no grant for closing a herdr workspace, and that is a gap rather than a
+boundary.** Say it plainly, because the reason is not the one it looks like.
+`siana-retire` removes the worktree and deliberately leaves the workspace open,
+printing that closing it kills the agent inside and is the captain's to decide
+(`bin/siana-retire`, the success path). So a delegated run retires the tree and still
+leaves one open workspace and one idle agent behind, exactly as a hand-run retirement
+does. Nothing here made that better and nothing here made it worse.
+
+It stays that way because granting anything the authority to close a workspace is
+granting it the authority to kill a live agent, and two places in this distro already
+record that as a decision rather than as mechanics. Widening it is the captain's call
+and would be its own change, with the ordering that call has to respect: closing a
+workspace before its worktree is removed strands the worktree permanently, and
+closing a project's *source* workspace closes every worktree workspace under it.
 
 **What the guard is, and what it is not.** Every run puts a directory of refusing
 shims on the front of the child's `PATH`, so a fleet command outside the grant fails
