@@ -354,7 +354,7 @@ class Init(Recipe):
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
                   "siana-owe", "siana-retire", "siana-handoff", "siana-publish",
                   "siana-reap", "siana-pipeline", "siana-afk", "siana-gate",
-                  "siana-read"):
+                  "siana-read", "siana-console"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this
