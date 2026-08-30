@@ -93,8 +93,13 @@ def main() -> int:
         elif "run" in step:
             # Through the PATH it was given, which is how the guard is exercised:
             # what a shim does is only true if the child reaches the shim.
-            proc = subprocess.run(step["run"], capture_output=True, text=True)
-            say(f"ran {step['run'][0]}, exit {proc.returncode}: "
+            #
+            # `$RUN` is the one substitution, so that a test can have the child name
+            # its own run without knowing the id when it writes the script.
+            argv = [a.replace("$RUN", os.environ.get("SIANA_CLEAN_RUN", ""))
+                    for a in step["run"]]
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            say(f"ran {argv[0]}, exit {proc.returncode}: "
                 f"{(proc.stdout + proc.stderr).strip()}")
         elif "die" in step:
             os.kill(os.getpid(), int(step["die"]))

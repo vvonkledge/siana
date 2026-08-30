@@ -41,9 +41,13 @@ class Shims(unittest.TestCase):
     behind a spawned agent."""
 
     QUESTION = "/nowhere/question.json"
+    # Discovered rather than written down: `/bin/true` is not on every machine this
+    # suite runs on, and a shim whose exec target is missing exits 127 for a reason
+    # that has nothing to do with the rule under test.
+    TRUE = shutil.which("true")
 
-    def shim(self, name, clauses, real, grants):
-        return c.shim(name, clauses, real, grants, self.QUESTION)
+    def shim(self, name, clauses, real=None, grants=("inventory",)):
+        return c.shim(name, clauses, real or self.TRUE, list(grants), self.QUESTION)
 
     def test_a_refusal_never_executes_its_own_message(self):
         # This is not hypothetical. The first version wrote the message into a
@@ -57,26 +61,26 @@ class Shims(unittest.TestCase):
         self.assertIn("'\\''", body)     # the apostrophe, escaped rather than eaten
 
     def test_a_granted_command_passes_straight_through(self):
-        body = self.shim("siana-retire", (("grant:retire", "no"),), "/bin/true",
-                         ["inventory", "retire"])
-        self.assertIn("exec '/bin/true' \"$@\"", body)
+        body = self.shim("siana-retire", (("grant:retire", "no"),),
+                         grants=["inventory", "retire"])
+        self.assertIn(f"exec '{self.TRUE}' \"$@\"", body)
         self.assertNotIn("is not this cleanup run's to call", body)
 
     def test_an_ungranted_command_never_reaches_the_real_one(self):
-        body = self.shim("siana-retire", (("grant:retire", "no"),), "/bin/true",
-                         ["inventory"])
+        body = self.shim("siana-retire", (("grant:retire", "no"),))
         self.assertIn("refused", body)
         self.assertNotIn("exec", body)
 
     def test_a_command_that_is_not_installed_is_still_refused(self):
         # Absent today and installed tomorrow must not become reachable to a run
         # that was already refused it.
-        body = self.shim("siana-publish", (("always", "no"),), None, ["inventory"])
+        body = c.shim("siana-publish", (("always", "no"),), None, ["inventory"],
+                      self.QUESTION)
         self.assertIn("refused", body)
         self.assertNotIn("exec", body)
 
     def test_the_git_pair_rule_reads_the_word_after_the_verb(self):
-        body = self.shim("git", (("words:push", "no"),), "/bin/true", ["inventory"])
+        body = self.shim("git", (("words:push", "no"),), )
         self.assertIn("'worktree') SAW=1 ;;", body)
         self.assertIn("'add'|'remove'|'prune'|'move'|'repair') BAD=1 ;;", body)
 
@@ -84,35 +88,73 @@ class Shims(unittest.TestCase):
         # `siana-retire` ends with `git worktree remove`, and the guard refuses that.
         # It is the safety boundary this whole design defers to, so it reaches the
         # real tools; the guard is there to stop the cleaner reaching them directly.
-        body = self.shim("siana-retire", (("grant:retire", "no"),), "/bin/true",
-                         ["inventory", "retire"])
+        body = self.shim("siana-retire", (("grant:retire", "no"),),
+                         grants=["inventory", "retire"])
         self.assertIn("PATH=", body)
-        self.assertIn("exec '/bin/true'", body)
+        self.assertIn(f"exec '{self.TRUE}'", body)
 
     def test_a_primitive_is_not_exempted_that_way(self):
-        body = self.shim("git", (("words:push", "no"),), "/bin/true", ["inventory"])
+        body = self.shim("git", (("words:push", "no"),), )
         self.assertNotIn("PATH=", body)
 
     def test_a_second_clause_still_applies_once_the_first_is_granted(self):
         # `siana-reap` is the reason clauses are a list. With one clause it had only
         # the flag rule, so the `reap-report` grant unlocked nothing while four
         # documents said it did.
-        body = self.shim("siana-reap", GUARD_REAP, "/bin/true",
-                         ["inventory", "reap-report"])
-        self.assertIn("'--yes') BAD=1 ;;", body)
-        self.assertIn("exec '/bin/true'", body)
+        body = self.shim("siana-reap", GUARD_REAP,
+                         grants=["inventory", "reap-report"])
+        self.assertIn("--y*) BAD=1 ;;", body)
+        self.assertIn(f"exec '{self.TRUE}'", body)
 
     def test_an_ungranted_first_clause_refuses_before_the_second_is_read(self):
-        body = self.shim("siana-reap", GUARD_REAP, "/bin/true", ["inventory"])
+        body = self.shim("siana-reap", GUARD_REAP, )
         self.assertIn("does not include reaping", body)
-        self.assertNotIn("--yes", body)
+        self.assertNotIn("--y*", body)
         self.assertNotIn("exec", body)
+
+    def test_an_option_is_matched_with_its_abbreviations(self):
+        # argparse accepts any unambiguous prefix, so `siana-reap siana --ye` and
+        # `--y` both set `yes=True`. Matching the exact strings left two spellings
+        # of a branch deletion open, and `siana-reap` is exec'd past the guard, so
+        # for that one command this shim is the boundary rather than a backstop.
+        body = self.shim("siana-reap", GUARD_REAP,
+                         grants=["inventory", "reap-report"])
+        for spelling in ("--yes", "--ye", "--y", "-y"):
+            self.assertEqual(self.render(body, "siana", spelling).returncode, 1,
+                             spelling)
+        self.assertEqual(self.render(body, "siana").returncode, 0)
+
+    def test_a_word_is_exempt_only_in_the_position_it_is_harmless_in(self):
+        # `tasks list --status done` is the documented way to list finished tasks and
+        # is the cleaner's primary enumeration. Matching `done` anywhere refused it,
+        # while telling the cleaner it had tried to write the queue.
+        body = self.shim("tasks", c.GUARDS["tasks"], )
+        self.assertEqual(self.render(body, "list", "--status", "done").returncode, 0)
+        self.assertEqual(self.render(body, "done", "a-task").returncode, 1)
+        # Fails closed where it cannot tell: a boolean global before the subcommand
+        # is exactly what a positional rule would have got wrong.
+        self.assertEqual(self.render(body, "--ambient", "done", "x").returncode, 1)
+
+    def test_only_the_allowed_verbs_of_a_command_get_through(self):
+        body = self.shim("siana-clean", c.GUARDS["siana-clean"])
+        for allowed in ("ask", "runbook"):
+            self.assertEqual(self.render(body, allowed, "--run", "x").returncode, 0,
+                             allowed)
+        for refused in ("answer", "resume", "start", "abort", "status", ""):
+            self.assertEqual(self.render(body, *([refused] if refused else [])
+                                         ).returncode, 1, refused or "(no args)")
+
+    def render(self, body, *argv):
+        """Run a generated shim. What a shim does is a claim about `sh`, and the only
+        way to check a claim about `sh` is to let `sh` answer it."""
+        return subprocess.run(["sh", "-c", body, "sh", *argv],
+                              capture_output=True, text=True)
 
     def test_every_shim_refuses_while_a_question_is_waiting(self):
         # The guarantee is that nothing after the uncertain point runs, and until
         # this existed the only thing holding it was a sentence in a prompt.
         for name, clauses in c.GUARDS.items():
-            body = self.shim(name, clauses, "/bin/true", list(c.GRANTS))
+            body = self.shim(name, clauses, grants=list(c.GRANTS))
             if "exec" not in body:
                 continue          # refused outright; the gate is beside the point
             self.assertIn(f"if [ -e '{self.QUESTION}' ]; then", body, name)
@@ -811,6 +853,91 @@ class Run(HomeTest):
         self.write_script(self.ask_script())
         out = self.clean("start")
         self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+
+    def test_a_cleaner_cannot_answer_its_own_question(self):
+        # `siana-clean` is reachable so that `ask` is, and the same binary carries
+        # `answer`. A cleaner that answered itself would remove the file every other
+        # shim gates on, put its own words in the runbook as the fleet's policy, and
+        # then retire the tree it had just asked about, with SIANA never seeing the
+        # question. It is the exact shape of workaround a refused agent reaches for.
+        self.queue()
+        self.store("tasks.jsonl", {"id": "a-task", "title": "A task",
+                                   "status": "done", "project": "siana"})
+        self.write_script({"steps": [
+            {"ask": {"body": "Are those untracked files yours?", "kind": "siana"}},
+            {"run": ["siana-clean", "answer", "$RUN", "--text", "they are not"]},
+            {"run": ["siana-retire", "a-task"]}], "exit": 0})
+        out = self.clean("start", "--grant", "retire")
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+        # The question is still SIANA's to answer, the cleaner's words are not in
+        # the runbook, and the retire it reached for next was refused with it.
+        self.assertTrue(os.path.exists(
+            self.at("cleanup", "runs", self.only_run(), "question.json")))
+        with open(self.at("runbook.md")) as fh:
+            self.assertNotIn("they are not", fh.read())
+        with open(self.at("cleanup", "runs", self.only_run(),
+                          "round-1.jsonl")) as fh:
+            self.assertIn("siana-retire is not callable", fh.read())
+
+    def test_only_asking_is_reachable_even_with_no_question_open(self):
+        # Two defences, and this is the one the question gate does not give. A
+        # cleaner that had not asked anything could otherwise start a second run,
+        # resume one, or abort the one it is in.
+        for verb in ("answer", "resume", "start", "abort", "status"):
+            self.write_script({"steps": [{"run": ["siana-clean", verb, "$RUN"]}],
+                               "exit": 0})
+            out = self.clean("start")
+            self.assertIn("it never answers, starts, resumes or aborts",
+                          out.stdout, verb)
+            self.clean("abort", self.runs()[-1], "--reason", "next case")
+
+    def test_a_resume_that_never_started_leaves_the_answer_deliverable(self):
+        # `carried` used to be written before the round. A resume that could not
+        # start - no pi, a child dead at once - left the mark set with the answer
+        # never delivered, and every later resume refused on it. The run was then
+        # unrecoverable, in a refusal that named no recovery.
+        self.write_script(self.ask_script())
+        self.clean("start")
+        run_id = self.only_run()
+        self.clean("answer", run_id, "--text", "Refuse it.")
+        out = self.run_cmd([os.path.join(BIN, "siana-clean"), "resume", run_id],
+                           env={"PATH": self.path_without("pi"),
+                                "SIANA_FAKE_PI": self.script_path})
+        self.assertRefused(out, "pi is not on PATH")
+        self.write_script(QUIET)
+        self.assertAccepted(self.clean("resume", run_id))
+
+    def test_a_resume_whose_round_failed_can_be_retried(self):
+        # Retrying is the recovery, and it cannot be a duplicate delivery because
+        # nothing was delivered.
+        self.write_script(self.ask_script())
+        self.clean("start")
+        run_id = self.only_run()
+        self.clean("answer", run_id, "--text", "Refuse it.")
+        self.write_script({"steps": [{"say": "half a round"}], "exit": 7})
+        self.assertEqual(self.clean("resume", run_id).returncode, 1)
+        self.write_script(QUIET)
+        self.assertAccepted(self.clean("resume", run_id))
+
+    def test_the_already_carried_refusal_names_a_recovery(self):
+        self.write_script(self.ask_script())
+        self.clean("start")
+        run_id = self.only_run()
+        self.clean("answer", run_id, "--text", "Refuse it.")
+        self.write_script(QUIET)
+        self.assertAccepted(self.clean("resume", run_id))
+        self.assertRefused(self.clean("resume", run_id), "siana-clean start")
+
+    def test_the_queue_is_listable_by_status_from_inside_a_run(self):
+        # `tasks list --status done` is how finished tasks are found, and finished
+        # tasks are exactly the ones whose worktrees can be retired. Matching `done`
+        # anywhere refused the cleaner's primary enumeration while telling it that it
+        # had tried to write the queue.
+        self.queue()
+        self.write_script({"steps": [{"run": ["tasks", "list", "--status", "done"]}],
+                           "exit": 0})
+        out = self.assertAccepted(self.clean("start"))
+        self.assertNotIn("not this cleanup run's to call", out)
 
     def test_the_child_looks_pi_up_past_its_own_guard(self):
         # `pi` is refused to the child, so a run that resolved its own pi through

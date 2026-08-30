@@ -41,6 +41,11 @@ cleaner that ignored its instructions and kept going is stopped by the same mech
 that keeps it inside its grant, because "no step after the uncertain point" is an
 exact rule and an exact rule belongs in a script.
 
+This command is itself in that guard, allowed `ask` and `runbook` and nothing else. A
+cleaner that could answer its own question would remove the file every other shim
+gates on, put its own words in the runbook as the fleet's policy, and then do the
+thing it had just asked about, with SIANA never seeing the question.
+
 Usage:
     siana-clean start [--project <handle>] [--grant <name>]...  begin one run
     siana-clean status [<run>] [--json]                         what a run is doing
@@ -125,11 +130,13 @@ GRANTS = ("inventory", "retire", "reap-report")
 # worktree remove` and `git -C x worktree remove` are the same call and only the
 # words tell them apart.
 GUARDS = {
+    "siana-clean": (("only:ask,runbook",
+                     "a cleaner asks; it never answers, starts, resumes or aborts"),),
     "siana-retire": (("grant:retire",
                       "this run's grant does not include retiring"),),
     "siana-reap": (("grant:reap-report",
                     "this run's grant does not include reaping, even to report"),
-                   ("flags:--yes,-y",
+                   ("globs:--y*,-y*",
                     "reaping is the captain's; report it and stop")),
     "siana-publish": (("always", "publishing is SIANA's, after QA accepts"),),
     "siana-dispatch": (("always", "dispatching is SIANA's"),),
@@ -151,6 +158,24 @@ GUARDS = {
                "worktree and workspace removal is `siana-retire`'s, and only its"),),
 }
 
+
+# A word that is benign in one position and not in another, as {command: {word:
+# flag}}: the word is refused everywhere except immediately after that flag.
+#
+# `tasks list --status done` is the whole reason this exists. It is the documented
+# way to list finished tasks, it is the cleaner's primary enumeration - finished
+# tasks are exactly the ones whose worktrees can be retired - and matching `done`
+# anywhere in the argument list refused it while saying the cleaner had tried to
+# write the queue.
+#
+# An exemption rather than a rule about where the subcommand sits, because both
+# `tasks` and `datafile` take boolean global flags (`--ambient`, `--version`) and any
+# positional rule that did not know about them would read the subcommand off by one
+# and fail *open*. This fails closed: a word not in exactly the exempted position is
+# still refused.
+WORD_AFTER = {
+    "tasks": {"done": "--status"},
+}
 
 # The commands the cleaner delegates to, which are themselves the safety boundary.
 # They are exec'd with the guard taken off their PATH, because they have to reach the
@@ -411,10 +436,40 @@ def refusal_lines(name: str, instead: str):
     return [f"printf '%s\\n' {sq(line)} >&2" for line in said] + ["exit 1"]
 
 
-def match_words(words, var="BAD"):
-    """Shell that sets BAD when any argument is one of these words."""
-    cases = "\n".join(f'    {sq(w)}) {var}=1 ;;' for w in words)
-    return ['for a in "$@"; do', "  case \"$a\" in", cases, "  esac", "done"]
+def match_words(words, exempt=None, quote=True):
+    """Shell that sets BAD when any argument is one of these words.
+
+    `exempt` maps a word to the flag it is harmless directly after, so that a value
+    is not mistaken for a subcommand. `quote` off leaves the entries as `sh` patterns
+    rather than literals, which is how an option and its abbreviations are matched at
+    once: argparse accepts `--ye` and `--y` for `--yes`, so a rule spelled out in
+    exact strings is a rule with two spellings around it.
+    """
+    exempt = exempt or {}
+    arms = []
+    for word in words:
+        pattern = sq(word) if quote else word
+        if word in exempt:
+            arms.append(f'    {pattern}) [ "$PREV" = {sq(exempt[word])} ] || BAD=1 ;;')
+        else:
+            arms.append(f"    {pattern}) BAD=1 ;;")
+    return ['PREV=""', 'for a in "$@"; do', "  case \"$a\" in",
+            "\n".join(arms), "  esac", '  PREV="$a"', "done"]
+
+
+def match_first(allowed, name: str):
+    """Shell that refuses unless the first argument is one of these.
+
+    The inverse of every other rule here, and it is what `siana-clean` needs. That
+    command is deliberately reachable from inside a run, because `ask` is how a
+    cleaner puts a question in front of SIANA - but the same binary also carries
+    `answer`, and a cleaner that answered its own question would remove the file
+    every other shim gates on and then retire the tree it had just asked about,
+    with SIANA never seeing the question. An allowlist is the only shape that says
+    "this one verb and nothing else the binary happens to grow".
+    """
+    cases = "|".join(sq(a) for a in allowed)
+    return [f'case "${{1:-}}" in', f"  {cases}) ;;", "  *) BAD=1 ;;", "esac"]
 
 
 def match_pairs(verb, bad):
@@ -486,9 +541,14 @@ def shim(name: str, clauses, real, grants, question: str) -> str:
         if rule.startswith("grant:"):
             continue                       # granted, so this clause has nothing to say
         kind, values = rule.split(":", 1)
-        if kind not in ("words", "flags"):
+        if kind not in ("words", "flags", "globs", "only"):
             die(f"unknown guard rule: {rule}")
-        lines += ["BAD=0", *match_words(values.split(","))]
+        lines.append("BAD=0")
+        if kind == "only":
+            lines += match_first(values.split(","), name)
+        else:
+            lines += match_words(values.split(","), WORD_AFTER.get(name),
+                                 quote=kind != "globs")
         if kind == "words" and name == "git":
             for verb, bad in GIT_PAIRS:
                 lines += match_pairs(verb, bad)
@@ -1117,10 +1177,20 @@ def cmd_resume(paths: Home, args) -> int:
         if rec.get("carried") == resolved["qid"]:
             die(f"{args.run} has already carried {resolved['qid']} forward",
                 f"it is {rec['status']}: {rec.get('detail', '')}".rstrip(),
-                "resuming again would re-run a round off an answer already used")
-        rec = dict(rec, carried=resolved["qid"])
-        write_json(paths.record(args.run), rec)
-        return finish(paths, rec, spawn(paths, rec, resolved))
+                "resuming again would re-run a round off an answer already used",
+                f"start a fresh run instead: siana-clean start{scope_flags(rec)}")
+        result = spawn(paths, rec, resolved)
+        # Marked after the round, and only when the round actually ran. Written
+        # before it, a resume that never started - no pi on PATH, a child that died
+        # at once - left the mark set with the answer never delivered, and every
+        # later resume refused on it. The run was then unrecoverable, and said so in
+        # a refusal that named no recovery.
+        #
+        # A failed round is left unmarked deliberately: retrying it is the recovery,
+        # and it cannot be a duplicate delivery because nothing was delivered.
+        if result["failed"] is None:
+            rec = dict(rec, carried=resolved["qid"])
+        return finish(paths, rec, result)
     finally:
         drop_lock(paths)
 

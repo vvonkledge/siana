@@ -89,6 +89,11 @@ Every guarded command refuses while your question is waiting, so if you try one
 anyway you will be told so rather than allowed to. Read that refusal as this
 paragraph, not as an obstacle: finish your turn.
 
+`siana-clean` is one of them, and you are allowed `ask` and `runbook` from it and
+nothing else. Answering, starting, resuming and aborting a run are SIANA's, and a
+cleaner that answered its own question would be writing a guess into the one file
+that must not hold one.
+
 Ask one question per round. If you find three, ask the one that blocks the most and
 report the other two in your final message.
 
