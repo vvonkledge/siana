@@ -328,8 +328,12 @@ delivery into a turn in flight: pi's only way to hand one a message is to queue 
 and pressing Escape to interrupt empties that queue into the input editor - your
 draft with the wake pasted in front of it, which is the same bug from the other end.
 So a wake raised while SIANA is working is held, not queued, and goes out when the
-turn ends. Nothing is lost by waiting: the count is on disk and nothing records it as
-taken until it has actually been sent.
+turn ends. Nothing is lost by waiting: the count is on disk, and it is recorded as
+taken only once pi has said it accepted the message and is starting the turn on it.
+Handing pi a message tells you nothing on its own - the call reports no result, and
+a session can report itself idle and still refuse the prompt - so the extension
+waits to be told rather than assuming, and a wake pi would not take is sent again
+rather than counted.
 
 So the watcher checks that SIANA's session is reading before it starts, and refuses
 with what to do about it when it is not:
@@ -349,7 +353,7 @@ session drains it as it starts.
 
 If wakes stop being taken while the watcher runs, it says so on its stderr every
 five minutes and keeps counting. It cannot say why, and it does not guess. There are
-three reasons and they want different things from you:
+five reasons and they want different things from you:
 
 - **SIANA is mid-turn.** A long turn holds every wake raised during it. Nothing to
   do: the wake goes out within half a second of the turn ending.
@@ -358,12 +362,25 @@ three reasons and they want different things from you:
   half way through typing. Send that message or clear it, and the held wake goes out
   within half a second. Nothing else is needed, and restarting SIANA here would
   throw the draft away.
+- **SIANA is compacting.** A `/compact` you asked for refuses every message for as
+  long as it runs, while the session still reports itself idle. The extension is
+  told nothing about the refusal, so it waits and sends the wake again: it goes out
+  within five seconds of the compaction finishing. Nothing to do.
+- **SIANA cannot start a turn on it.** Pi took the message past its input gate and
+  then refused to run it: no model is selected, or the credentials have expired. The
+  extension is told nothing, so it sends the wake again every two minutes and nothing
+  ever accepts it. This is the only one of the five that never clears on its own, and
+  the only one `just doctor` is no help with - it reports that session present and
+  healthy throughout. What says so is pi's own error, printed into SIANA's transcript
+  on every retry. Select a model, or run `/login`, and the held wake goes out on the
+  next retry.
 - **The session is gone.** `just doctor` says whether one is running. Start SIANA
   again and it drains everything counted while it was away.
 
 Only the last of those is a reason to restart anything, which is why the warning
-names all three and diagnoses none: restarting SIANA over one of the first two
-discards the draft, or the turn, that the wake was waiting on.
+names all five and diagnoses none: restarting SIANA over any of the first four
+discards the draft, the turn, or the compaction that the wake was waiting on, and
+leaves a missing model or expired credentials exactly where they were.
 
 ### Leave it advisory
 

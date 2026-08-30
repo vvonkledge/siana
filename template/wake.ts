@@ -19,6 +19,17 @@
  * and that is the hook the tasks package injects the ambient queue view from. A
  * custom message would run SIANA's reconcile turn with the queue missing from it.
  *
+ * That send is fire-and-forget: `ExtensionAPI.sendUserMessage` is declared `void`,
+ * and the promise it discards is caught by pi into an error channel with no
+ * extension event behind it, so a rejection reaches the captain's transcript and
+ * never this code. The call returning says the call was made and nothing else. Nor
+ * does the gate in front of it stand in for one: `ctx.isIdle()` is
+ * `!_isAgentRunActive` alone, and `compact()` settles the run before it starts, so
+ * a manual compaction is a stable window - seconds to tens of seconds - where the
+ * gate says yes and every prompt is thrown away. A wake taken as delivered there
+ * was delivered nowhere. So a send is an attempt, and only pi saying it accepted
+ * the prompt turns that attempt into a consumed wake. See `flush` below.
+ *
  * This never reads `tasks.jsonl`. Starting `siana-watch` is the captain's autonomy
  * grant, given by starting that process and withdrawn by stopping it. An extension
  * that read the queue itself would advance the fleet whenever SIANA was running, so
@@ -42,6 +53,35 @@ export const WAKE = "The queue moved. Reconcile it.";
  *  Half a second against the watcher's two-second poll: invisible either way. */
 export const POLL_MS = 500;
 
+/** How long a send pi never took is left alone before it is made again.
+ *
+ *  Pacing, not safety: what makes delivery once-only is that only pi's own
+ *  acceptance advances the mark, and that holds at any cadence. What this bounds is
+ *  the captain's transcript. Pi reports a refused extension send by printing the
+ *  error and its stack into the chat, so a wake retried on the half-second poll
+ *  would write a screen of red through a compaction the captain is watching. Five
+ *  seconds is a handful of lines across the longest of those, and it is what the
+ *  wake costs once the refusal clears. */
+export const REFUSED_MS = 5_000;
+
+/** How long a send pi took in and never started is waited for before it is made
+ *  again.
+ *
+ *  Only one of `prompt()`'s throw paths - the manual compaction one - opens before
+ *  the `input` event. The rest open after it: a run that started between the gate
+ *  and the streaming check, no model selected, credentials that expired, an
+ *  automatic compaction that failed. So a send can be seen going in and never come
+ *  out, and there is no event that tells this apart from one still working. Waited
+ *  out rather than held: an attempt kept forever would block every wake for the
+ *  rest of the session, which is a worse failure than the one being repaired, and
+ *  the captain fixing what pi complained about would not restore delivery.
+ *
+ *  Two minutes because the longest legitimate gap here is the automatic compaction
+ *  `prompt()` runs between the two events, which is an LLM round trip. Cut short,
+ *  the cost is a second wake turn; left out, the cost is every wake after this one.
+ *  So it is set well past that round trip rather than tight against it. */
+export const UNCONFIRMED_MS = 120_000;
+
 /** Where the two counters and the liveness record live. The watcher looks here by
  *  the same name, so this is a shared constant in spirit and neither side may
  *  rename it alone. */
@@ -56,6 +96,19 @@ interface Paths {
   pending: string;
   consumed: string;
   consumer: string;
+}
+
+/** A wake handed to pi and not yet known to have been taken. */
+interface Attempt {
+  /** What `consumed` becomes if pi accepts it, read at send time so that a wake
+   *  raised while this one is in flight is not swallowed by it. */
+  mark: number;
+  /** Whether pi has emitted `input` for this send. Until it has, the send is not
+   *  known to have got past the one throw path that opens while the session reports
+   *  idle, and there is nothing in flight to wait for. */
+  entered: boolean;
+  /** When the send was made. Read only to pace the retry of one pi never took. */
+  at: number;
 }
 
 /**
@@ -123,6 +176,26 @@ export default function (pi: ExtensionAPI): void {
   let consumed = 0;
   let recorded = 0;
   let held = 0;
+  // The one send this extension is waiting on pi to accept, and nothing more: a
+  // wake is attempted, then confirmed, and the two are not the same event. Null
+  // between them means there is nothing outstanding and a wake may go out.
+  let attempt: Attempt | null = null;
+
+  /**
+   * The mark that is written once, and only once the wake has actually landed.
+   *
+   * Kept apart from `consumed` because delivery and recording fail for different
+   * reasons and only this half is retryable. Never reached before an acceptance:
+   * `consumed` moves in `accepted` below and nowhere else. Until it lands the
+   * watcher reads the wake as untaken and says so, which is the right thing for it
+   * to be saying while this cannot write.
+   */
+  function record(): void {
+    if (recorded < consumed) {
+      writeCounter(paths!.consumed, consumed);
+      recorded = consumed;
+    }
+  }
 
   /**
    * Deliver the wake, or hold it, in one synchronous block.
@@ -152,32 +225,80 @@ export default function (pi: ExtensionAPI): void {
    * alone either way. What it buys is that a wake does not start a turn while the
    * captain is mid-sentence, which would force their draft to arrive after it as a
    * steer.
+   *
+   * The send itself is an attempt and never a delivery. It is registered before the
+   * call, inside the same block, because pi calls this extension's `input` handler
+   * from inside the call: registering after it would be registering after the
+   * answer had already come back.
    */
   function flush(ctx: ExtensionContext): void {
-    if (held > consumed) {
+    // A send that is not going to be answered, dropped so the wake can be made
+    // again. Which wait applies is the only thing `entered` decides here, and the
+    // two are far apart because they are bounded by different things.
+    //
+    // Unentered is a send pi threw away before it reached its input gate. `prompt()`
+    // emits `input` before it awaits anything and the runner calls handlers in
+    // turn, so the handler below runs inside the `sendUserMessage` call or within a
+    // microtask of it: a send still unentered after `REFUSED_MS` never got that
+    // far, and a manual compaction is what does that for its whole duration.
+    // Nothing was delivered and no turn was started. The five seconds are pacing
+    // and not the argument - what makes delivery once-only is that only an
+    // acceptance advances the mark - and they are an unhurried answer to the one
+    // thing that could delay that handler, another extension's `input` handler
+    // awaiting ahead of it.
+    //
+    // Entered is a send pi took in and never started, which every throw path but
+    // the compaction one produces. `UNCONFIRMED_MS` says why that is waited out
+    // rather than held forever, and why it is minutes rather than seconds.
+    const wait = attempt?.entered ? UNCONFIRMED_MS : REFUSED_MS;
+    if (attempt && Date.now() - attempt.at >= wait) attempt = null;
+    // One attempt at a time, and it outlives the callback that made it: a wake pi
+    // has taken and not yet started is not sent again by the next poll or the next
+    // watch event, because a second send is a second paid turn. Nothing else clears
+    // one but the wait above, an acceptance, and a new session - the last because
+    // the prompt belonged to the session that is gone.
+    if (attempt === null && held > consumed) {
       // No editor at all - print mode, rpc - is an empty editor: there is no draft
       // to arrive in the wrong order behind the wake.
       const draft = ctx.hasUI ? ctx.ui.getEditorText() : "";
       if (ctx.isIdle() && draft.trim() === "") {
-        const mark = held;
+        attempt = { mark: held, entered: false, at: Date.now() };
         pi.sendUserMessage(WAKE);
-        // Here, and never after the write below. This is what makes delivery
-        // once-only, and the wake has now been delivered: left behind `held` by a
-        // write that threw, the next tick would send the same wake again half a
-        // second later, and again, for as long as the write kept failing - and
-        // `sendUserMessage` always triggers a turn, so that is a paid turn every
-        // half second with nothing but a stderr line five minutes later to say so.
-        consumed = mark;
       }
     }
-    // Recorded separately, because delivery and recording fail for different
-    // reasons and only this half is retryable. It is never reached before a send
-    // has succeeded: `consumed` moves nowhere else. Until it lands the watcher
-    // reads the wake as untaken and says so, which is the right thing for it to
-    // be saying while this cannot write.
-    if (recorded < consumed) {
-      writeCounter(paths!.consumed, consumed);
-      recorded = consumed;
+    record();
+  }
+
+  /**
+   * Pi saying it took a prompt, which is the only thing that consumes a wake.
+   *
+   * `before_agent_start` is emitted after every one of `prompt()`'s throw paths -
+   * compaction, streaming, no model, no credentials - and immediately before the
+   * run starts, so it is the first moment a prompt is known to have been accepted
+   * rather than discarded. It is also the event the tasks package injects the
+   * ambient queue from, so a wake that reaches it is a wake SIANA reads the queue
+   * behind.
+   *
+   * Correlated, and not merely counted. The event carries the prompt and not where
+   * it came from, so on its own it cannot tell this extension's wake from the
+   * captain typing the same sentence, from another extension's message, or from a
+   * turn that has nothing to do with either. What tells them apart is the `input`
+   * event in front of it, which does carry the source: an attempt is only
+   * confirmable once pi has shown it this extension's own send.
+   *
+   * The one shape this cannot separate is another sender putting exactly this
+   * sentence into pi while an attempt of this extension's is in flight. It costs a
+   * duplicate turn, never a lost wake: the count is correct either way and the
+   * wake this extension sent still arrives.
+   */
+  function accepted(prompt: string): void {
+    if (!attempt || !attempt.entered || prompt !== WAKE) return;
+    consumed = attempt.mark;
+    attempt = null;
+    try {
+      record();
+    } catch {
+      /* the mark is behind what was delivered, and the next tick writes it */
     }
   }
 
@@ -247,6 +368,31 @@ export default function (pi: ExtensionAPI): void {
     timer.unref?.();
   }
 
+  /**
+   * Pi taking a prompt as far as its input gate, and saying whose it is.
+   *
+   * `source` is "extension" for a send like the one in `flush` and "interactive"
+   * for the captain typing, so this is where a wake is told from a prompt that
+   * merely looks like one. It is emitted after the compaction throw and before the
+   * model, credential and streaming ones, which is why reaching it is not yet an
+   * acceptance: it says the send is in pi's hands, and `accepted` above says pi
+   * kept it.
+   *
+   * This never transforms and never handles. Registering it means pi emits `input`
+   * for every prompt in the session, the captain's included, and an extension that
+   * answered one of those would be editing what they typed.
+   */
+  pi.on("input", (event, _ctx) => {
+    if (attempt && !attempt.entered && event.source === "extension"
+        && event.text === WAKE) {
+      attempt.entered = true;
+    }
+  });
+
+  pi.on("before_agent_start", (event, _ctx) => {
+    accepted(event.prompt);
+  });
+
   pi.on("session_start", (_event, ctx) => {
     const home = process.env.SIANA_HOME || ctx.cwd;
     const dir = join(home, WAKE_DIR);
@@ -261,6 +407,11 @@ export default function (pi: ExtensionAPI): void {
     };
     consumed = recorded = counter(paths.consumed);
     held = consumed;
+    // Nothing survives a session boundary. An attempt this process never saw
+    // confirmed took no turn either, so the new session finds the wake untaken on
+    // disk and sends it again; one this process did see confirmed is on disk as
+    // consumed, and is not sent again.
+    attempt = null;
     // Rewritten on every session_start, which covers a record left behind by a pi
     // that was killed: the watcher verifies the pid and the command, so a stale
     // one is refused rather than believed, and replacing it is the recovery.
