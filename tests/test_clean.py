@@ -771,6 +771,27 @@ class Run(HomeTest):
                              text=True).stdout
         return [line for line in out.splitlines() if self.script_path in line]
 
+    def test_a_live_run_is_not_read_as_interrupted(self):
+        # The command string was recorded the instant after `Popen`, before the child
+        # had finished exec'ing, so a `#!/usr/bin/env` shebang made `ps` report one
+        # thing and then another and an exact comparison failed intermittently. A live
+        # run then read as interrupted, and `abort` took its "already gone" branch and
+        # never killed the cleaner.
+        self.write_script({"steps": [{"say": "started"}, {"sleep": 120}],
+                           "exit": 0})
+        running = subprocess.Popen(
+            [os.path.join(BIN, "siana-clean"), "start"], cwd=self.home,
+            env=self.command_env({"PATH": self.distro_path(self.fakebin),
+                                  "SIANA_FAKE_PI": self.script_path}),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True)
+        self.addCleanup(running.kill)
+        self.assertTrue(until(lambda: self.calls()), "the cleaner never started")
+        run_id = self.only_run()
+        out = self.assertAccepted(self.clean("status", run_id))
+        self.assertIn("running", out)
+        self.assertNotIn("interrupted", out)
+
     def test_an_interrupted_run_reads_as_interrupted_rather_than_running(self):
         # A process killed between spawning a child and recording its exit never
         # wrote anything, so the one status that could be a lie is checked against
@@ -811,6 +832,43 @@ class Run(HomeTest):
         kept = [f for f in os.listdir(self.at("cleanup", "runs", run_id))
                 if f.startswith("abandoned-")]
         self.assertEqual(len(kept), 1, kept)
+
+    def test_aborting_a_running_round_keeps_the_reason(self):
+        # The case the `if running` branch exists for and the one nothing exercised.
+        # `abort` kills the cleaner while the process running the round is still
+        # blocked reading its output; that pipe closes, the round ends as "the
+        # cleaner exited -15", and it used to write that over the captain's reason -
+        # so every reader said the cleaner had crashed rather than been stopped.
+        self.write_script({"steps": [{"say": "started"}, {"sleep": 120}],
+                           "exit": 0})
+        running = subprocess.Popen(
+            [os.path.join(BIN, "siana-clean"), "start"], cwd=self.home,
+            env=self.command_env({"PATH": self.distro_path(self.fakebin),
+                                  "SIANA_FAKE_PI": self.script_path}),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True)
+        self.addCleanup(running.kill)
+        self.assertTrue(until(lambda: self.calls()), "the cleaner never started")
+        run_id = self.only_run()
+        self.assertTrue(until(lambda: self.record(run_id)["status"] == "running"))
+        self.clean("abort", run_id, "--reason", "the captain said stop")
+        running.wait(timeout=30)
+        self.assertEqual(self.record(run_id)["status"], "failed")
+        self.assertEqual(self.record(run_id)["detail"],
+                         "aborted: the captain said stop")
+        self.assertIn("aborted: the captain said stop",
+                      self.assertAccepted(self.clean("status")))
+
+    def test_an_aborted_run_is_not_resumable(self):
+        # Otherwise every later round would be recorded as the abort rather than as
+        # what it did, because the marker is what `finish` reads.
+        self.write_script(self.ask_script())
+        self.clean("start")
+        run_id = self.only_run()
+        self.clean("answer", run_id, "--text", "Refuse it.")
+        self.clean("abort", run_id, "--reason", "the captain said stop")
+        self.assertRefused(self.clean("resume", run_id),
+                           "was aborted", "siana-clean start")
 
     def test_an_aborted_run_stops_reporting_a_question_to_answer(self):
         # `pending()` is "the file is there", so a kept question meant `status` went

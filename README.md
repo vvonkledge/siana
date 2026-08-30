@@ -507,7 +507,16 @@ else that authority is a decision only you can make.
 
 The cleaner does no safety thinking of its own. It enumerates and delegates, and
 every refusal it meets is one of your existing commands refusing on its own terms.
-What it does instead of guessing is stop:
+
+What keeps it to that is a directory of refusing shims put on the front of its `PATH`
+for the run. A command outside the grant fails with a message naming what to do
+instead, so the ordinary way an agent goes wrong - reaching for the next obvious
+command - is stopped by a mechanism rather than by a sentence in a prompt. It is not
+a sandbox, and it is worth knowing which: it intercepts command names, so a binary
+invoked by absolute path is outside it. What actually holds is that the destructive
+work lives in commands that fail closed on their own inputs.
+
+What the cleaner does instead of guessing is stop:
 
     $ siana-clean start --grant retire
     run      clean-20260830-0730
@@ -533,8 +542,8 @@ That is a property of the command and not a wall around the file. A cleaner runs
 a shell, and a shell can write any file its user can, so the rule against editing the
 runbook by hand is carried in the cleaner's instructions the way the rest of its
 scope is. The child is started without the harness's file-writing tools, which
-narrows it. Treat the runbook the way you treat the guard below: a real boundary
-against the ordinary mistake, not a sandbox.
+narrows it. Read it the way you read the shim guard above: a real boundary against
+the ordinary mistake, and not a wall.
 
 If anything goes wrong, nothing was half-done. The mutations belong to commands that
 fail closed on their own inputs, so a killed cleaner, an unavailable model or a

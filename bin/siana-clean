@@ -334,6 +334,9 @@ class Home:
     def answers(self, run_id: str) -> str:
         return os.path.join(self.run_dir(run_id), "answers.jsonl")
 
+    def aborted(self, run_id: str) -> str:
+        return os.path.join(self.run_dir(run_id), "aborted.json")
+
     def log(self, run_id: str) -> str:
         return os.path.join(self.run_dir(run_id), "rounds.jsonl")
 
@@ -759,14 +762,24 @@ def state(paths: Home, run_id: str) -> dict:
     between spawning a child and recording its exit never wrote anything. So the one
     status that could be a lie is checked against the operating system every time it
     is read, exactly as `siana-watch` and `siana-afk` check their grants.
+
+    Identity is the run id in the child's argument list, and not the command string
+    recorded when it was spawned. That string is captured the instant after `Popen`
+    returns, which is before the child has finished exec'ing: a `#!/usr/bin/env`
+    shebang means `ps` first reports `/usr/bin/env python3 ...` and then reports
+    `python3 ...`, so an exact comparison failed intermittently and a live run read as
+    interrupted. `abort` then took its "the process is already gone" branch and never
+    killed the cleaner, which is how a run could be aborted with the cleaner still
+    working. The run id is unique, appears in the child's argv because its system
+    prompt is written under the run directory, and survives an exec unchanged.
     """
     rec = read_json(paths.record(run_id), "run record")
     if rec is None:
         known = ", ".join(paths.ids()) or "(there are none)"
         die(f"no cleanup run under that id: {run_id}", f"runs: {known}")
     if rec.get("status") == "running":
-        pid, command = rec.get("pid"), rec.get("command") or ""
-        if not (pid and command and process_command(pid) == command):
+        pid = rec.get("pid")
+        if not (pid and run_id in process_command(pid)):
             rec = dict(rec, status="failed",
                        detail="the process running it is gone; it was interrupted")
     return rec
@@ -1131,8 +1144,18 @@ def finish(paths: Home, rec: dict, result: dict) -> int:
     with open(paths.log(run_id), "a") as fh:
         fh.write(json.dumps(result) + "\n")
 
+    # The abort marker is read first, because the process that wrote it is not this
+    # one. `abort` kills the cleaner while this is still blocked reading its output;
+    # the pipe closes, the round ends as "the cleaner exited -15", and this used to
+    # write that over the captain's stated reason - so `status`, the captain's report
+    # and everything downstream said the cleaner had crashed rather than that it was
+    # deliberately stopped. Derived from disk rather than from what this believes, the
+    # way the pending question already is.
+    stopped = read_json(paths.aborted(run_id), "abort record")
     question = pending(paths, run_id)
-    if question:
+    if stopped:
+        status, detail = "failed", f"aborted: {stopped['reason']}"
+    elif question:
         status, detail = "question", question["body"]
     elif result["failed"]:
         status, detail = "failed", result["failed"]
@@ -1152,7 +1175,7 @@ def finish(paths: Home, rec: dict, result: dict) -> int:
         report_question(run_id, question)
         return 3
     if status == "failed":
-        print(f"  failed {result['failed']}")
+        print(f"  failed {detail}")
         for line in result["stderr"].splitlines()[-6:]:
             print(f"    {line}")
         print("  state  nothing was left half-done. Every mutation this run could")
@@ -1239,6 +1262,14 @@ def cmd_resume(paths: Home, args) -> int:
         if rec["status"] == "running":
             die(f"{args.run} is already running (pid {rec.get('pid')})",
                 "wait for it, or `siana-clean abort` it")
+        # An abort ends a run. Resuming one would re-run a round under a marker that
+        # says it was stopped, so every round after it would be recorded as the abort
+        # rather than as what it did.
+        stopped = read_json(paths.aborted(args.run), "abort record")
+        if stopped:
+            die(f"{args.run} was aborted: {stopped['reason']}",
+                "an abort ends a run; its rounds and questions are kept as history",
+                f"start a fresh one: siana-clean start{scope_flags(rec)}")
         history = answers(paths, args.run)
         if not history:
             die(f"{args.run} has no answered question to carry on from",
@@ -1366,6 +1397,11 @@ def cmd_answer(paths: Home, args) -> int:
 
 def cmd_abort(paths: Home, args) -> int:
     rec = state(paths, args.run)
+    # Written before the kill, and that order is the whole of it. The process running
+    # the round is a different one and is about to notice its child die; if it reached
+    # `finish` before this landed, it would record its own account of the death and
+    # the reason for stopping would be gone.
+    write_json(paths.aborted(args.run), {"reason": args.reason, "at": now()})
     if rec["status"] == "running":
         try:
             os.killpg(os.getpgid(rec["pid"]), signal.SIGTERM)
