@@ -14,6 +14,14 @@ editor when the captain interrupts with Escape, so a queued wake is the same bug
 keystroke later. `tests/fake_pi.mjs` models both the queue and the restore, which is
 why `Busy` below can drive the whole reproduction rather than assert on an argument.
 
+The third rule is that handing pi the message is not delivering it. `sendUserMessage`
+is `void` and swallows its own rejection, and `isIdle()` says only that no run is
+active - a manual compaction refuses every prompt for its whole duration with that
+gate wide open - so a wake counted on the strength of the call returning is a wake
+that can be counted and never delivered. `Acceptance` and `Refused` below are that
+boundary: the mark moves on pi's own `before_agent_start`, correlated to this
+extension's own send by the `input` event in front of it, and on nothing else.
+
 So these drive the extension rather than read it. It runs on the real node event
 loop, against a real filesystem, with its own directory watch and its own interval;
 what is scripted is pi's side of the six calls it makes, in `tests/fake_pi.mjs`. No
@@ -30,6 +38,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import unittest
 
 from helpers import DISTRO, TEMPLATE, HomeTest, script
@@ -139,6 +148,21 @@ class WakeTest(HomeTest):
     def consumed(self):
         return w.read_counter(os.path.join(self.wake, w.CONSUMED))
 
+    def took(self, count, timeout=15):
+        """The mark, once the extension has had its chance to move it.
+
+        Polled rather than read, because a wake is consumed when pi says it took
+        the prompt and not when the send call returns: the confirmation arrives on
+        a later callback of pi's own, so a read timed off the send itself would be
+        asking before the answer exists. A wake that is never confirmed spends the
+        whole timeout here and then fails on the number, which is the right way
+        round - `assertEqual(self.consumed(), 0)` is how a test says it was held,
+        and that one still reads the file once."""
+        deadline = time.monotonic() + timeout
+        while self.consumed() != count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.consumed(), count)
+
     def consumer(self):
         return w.read_consumer(self.home)
 
@@ -155,7 +179,7 @@ class Delivery(WakeTest):
         state = pi("settle", sent=1)
         self.assertEqual(len(state["sent"]), 1, state)
         self.assertEqual(state["sent"][0]["content"], WAKE)
-        self.assertEqual(self.consumed(), 1)
+        self.took(1)
 
     def test_a_wake_raised_during_the_session_is_taken(self):
         pi = self.session()
@@ -192,7 +216,7 @@ class Delivery(WakeTest):
         state = pi("settle", sent=1)
         state = pi("quiet")
         self.assertEqual(len(state["sent"]), 1, state["sent"])
-        self.assertEqual(self.consumed(), 3, "the high-water mark is what was raised")
+        self.took(3)  # the high-water mark is what was raised
 
     def test_a_wake_is_taken_once_however_long_the_session_runs_after(self):
         self.raise_wake()
@@ -209,7 +233,7 @@ class Delivery(WakeTest):
             self.raise_wake()
             state = pi("settle", sent=n)
             self.assertEqual(len(state["sent"]), n, state["sent"])
-            self.assertEqual(self.consumed(), n)
+            self.took(n)
 
 
 class Busy(WakeTest):
@@ -254,7 +278,7 @@ class Busy(WakeTest):
         state = pi("settle", sent=1)
         self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
         self.assertIsNone(state["sent"][0]["options"], "the wake was queued")
-        self.assertEqual(self.consumed(), 1)
+        self.took(1)
 
     def test_interrupting_a_turn_restores_no_wake_into_the_editor(self):
         # The reproduction, end to end. Editor empty, turn in flight, wake raised;
@@ -288,7 +312,7 @@ class Busy(WakeTest):
         pi("editor", text="")
         state = pi("settle", sent=1)
         self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
-        self.assertEqual(self.consumed(), 1)
+        self.took(1)
 
     def test_wakes_raised_through_one_long_turn_cost_one_message(self):
         pi = self.session()
@@ -300,7 +324,7 @@ class Busy(WakeTest):
         pi("settle", sent=1)
         state = pi("quiet")
         self.assertEqual(len(state["sent"]), 1, state["sent"])
-        self.assertEqual(self.consumed(), 3, "the high-water mark is what was raised")
+        self.took(3)  # the high-water mark is what was raised
 
     def test_a_wake_held_mid_turn_is_still_there_after_a_restart(self):
         # Nothing was recorded, so nothing was lost. A captain who quits SIANA in
@@ -315,15 +339,154 @@ class Busy(WakeTest):
         again("start")
         state = again("settle", sent=1)
         self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
-        self.assertEqual(self.consumed(), 1)
+        self.took(1)
+
+
+class Acceptance(WakeTest):
+    """What turns a send into a consumed wake.
+
+    `pi.sendUserMessage` is declared `void` and its rejection is swallowed into an
+    error channel with no extension event behind it, so the call returning says the
+    call was made and nothing else. The gate in front of it does not stand in for an
+    answer either: `ctx.isIdle()` is `!_isAgentRunActive`, and a manual compaction
+    settles the run before it starts, so the whole of a `/compact` is a window where
+    the session reports idle and throws every prompt away.
+
+    So the mark moves on pi's own word and on nothing else. `before_agent_start` is
+    that word - emitted after every throw path and immediately before the run - and
+    the `input` event in front of it is what says the accepted prompt was this
+    extension's, because `before_agent_start` carries the text and never the
+    source."""
+
+    def test_the_mark_waits_for_the_start_and_does_not_move_on_the_send(self):
+        # The window this whole repair is about, held open. The send has gone and pi
+        # has not yet said it took it, so the wake is not yet delivered and the
+        # counter must not say it is.
+        pi = self.session()
+        pi("start")
+        pi("hold-starts", value=True)
+        self.raise_wake()
+        state = pi("settle", sent=1)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.assertEqual(self.consumed(), 0, "the send was read as a delivery")
+        pi("hold-starts", value=False)
+        self.took(1)
+
+    def test_an_accepted_send_is_not_made_again_while_it_is_in_flight(self):
+        # Both callbacks that can send run during this hold: the poll fires three
+        # times over the quiet window, and raising another wake hands the directory
+        # watch an event of its own. A second send is a second paid turn, so an
+        # attempt pi has taken and not yet started outlives both.
+        pi = self.session()
+        pi("start")
+        pi("hold-starts", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        self.raise_wake()
+        state = pi("quiet")
+        self.assertEqual(len(state["sent"]), 1, state["sent"])
+        # And the wake raised behind it is not swallowed by the one in flight: the
+        # attempt consumes the count it was made for and no more.
+        pi("hold-starts", value=False)
+        self.took(1)
+        state = pi("settle", sent=2)
+        self.assertEqual(len(state["sent"]), 2, state["sent"])
+        self.took(2)
+
+    def test_a_turn_started_beside_the_wake_never_confirms_it(self):
+        # A turn of the captain's running while this extension waits on its own
+        # send. The two start events differ in nothing but their text, so the text
+        # is what has to be read - and it is read against the one sentence a wake
+        # ever carries.
+        pi = self.session()
+        pi("start")
+        pi("hold-starts", value=True)
+        self.raise_wake()
+        pi("settle", sent=1)
+        pi("prompt", text="what is the fleet doing?", source="interactive")
+        pi("quiet", ms=200)
+        self.assertEqual(self.consumed(), 0, "someone else's turn took the wake")
+        pi("hold-starts", value=False)
+        self.took(1)
+
+    def test_a_turn_the_captain_started_never_confirms_a_wake_pi_refused(self):
+        # The dangerous state, and the reason the source is read at all. The send
+        # was thrown away, so an attempt is outstanding and has never been seen by
+        # pi; the captain then types the wake's own sentence. Nothing about the turn
+        # that follows is this extension's, and `before_agent_start` cannot say so:
+        # it carries the text and never where the text came from.
+        pi = self.session()
+        pi("start")
+        pi("refuse-sends", value=True)
+        self.raise_wake()
+        pi("quiet", ms=200)
+        pi("prompt", text=WAKE, source="interactive")
+        pi("quiet", ms=200)
+        self.assertEqual(self.consumed(), 0,
+                         "the captain's own turn consumed the wake")
+        # And the wake is still there to be delivered once pi takes prompts again.
+        pi("refuse-sends", value=False)
+        state = pi("settle", sent=1, timeout=30_000)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.took(1)
+
+    def test_another_extensions_message_never_confirms_a_wake_pi_refused(self):
+        # Same state, and a message from an extension that is not this one. The
+        # source matches and the text does not, so this is the half of the
+        # correlation the source cannot carry.
+        pi = self.session()
+        pi("start")
+        pi("refuse-sends", value=True)
+        self.raise_wake()
+        pi("quiet", ms=200)
+        pi("prompt", text="a message from somewhere else", source="extension")
+        pi("quiet", ms=200)
+        self.assertEqual(self.consumed(), 0)
+        pi("refuse-sends", value=False)
+        state = pi("settle", sent=1, timeout=30_000)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.took(1)
+
+    def test_a_run_starting_on_its_own_never_confirms_a_wake(self):
+        # `before_agent_start` with no input event in front of it. Nothing in pi
+        # does this, which is why it is worth driving: read on its own, the event
+        # says a turn began and never whose.
+        pi = self.session()
+        pi("start")
+        pi("refuse-sends", value=True)
+        self.raise_wake()
+        pi("quiet", ms=200)
+        pi("agent-start", text=WAKE)
+        pi("quiet", ms=200)
+        self.assertEqual(self.consumed(), 0)
+        pi("refuse-sends", value=False)
+        state = pi("settle", sent=1, timeout=30_000)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.took(1)
+
+    def test_no_wake_is_pending_and_a_turn_carrying_its_words_takes_nothing(self):
+        # Nothing raised at all, and the captain types the wake sentence. There is
+        # no attempt to confirm, so there is nothing for it to consume.
+        pi = self.session()
+        pi("start")
+        pi("prompt", text=WAKE, source="interactive")
+        pi("prompt", text=WAKE, source="extension")
+        pi("quiet")
+        self.assertEqual(self.consumed(), 0)
 
 
 class Refused(WakeTest):
-    """A send the session would not take. The mark must not move on it.
+    """A session that reports idle and refuses the prompt anyway.
+
+    Manual compaction is the shape that matters and it is not a race: `compact()`
+    settles the run before it starts, so for the whole of a `/compact` - an LLM
+    round trip - `isIdle()` is true and `prompt()` throws. The throw lands in a
+    channel this extension cannot subscribe to, so the send looks exactly like an
+    accepted one from here.
 
     `consumed` is a promise that the wake was delivered, and the watcher stops
-    warning once the two counters agree. Written before the send, a refusal would
-    swallow the wake for good and take the only warning about it with it."""
+    warning once the two counters agree. Moved on a refusal it would swallow the
+    wake for good and take the only warning about it with it."""
 
     def test_a_send_the_session_refuses_never_advances_the_mark(self):
         pi = self.session()
@@ -333,20 +496,74 @@ class Refused(WakeTest):
         state = pi("quiet")
         self.assertTrue(state["refused"], "the extension never tried to send")
         self.assertEqual(state["sent"], [])
+        self.assertEqual(state["starts"], [])
         self.assertEqual(self.consumed(), 0)
 
-    def test_the_wake_goes_out_once_the_session_takes_messages_again(self):
-        # A refused send is a fact about that attempt and not about the wake, so it
-        # is held and tried again rather than dropped.
+    def test_the_wake_goes_out_once_the_compaction_ends_and_goes_out_once(self):
+        # The whole repair, end to end. A refused send is a fact about that attempt
+        # and not about the wake, so the wake is held and made again - and it
+        # converges here on the extension's own cadence, with no second queue event
+        # to raise `pending` again and no restart.
         pi = self.session()
         pi("start")
         pi("refuse-sends", value=True)
         self.raise_wake()
         pi("quiet")
+        self.assertEqual(self.consumed(), 0)
         pi("refuse-sends", value=False)
-        state = pi("settle", sent=1)
+        state = pi("settle", sent=1, timeout=30_000)
         self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
-        self.assertEqual(self.consumed(), 1)
+        self.took(1)
+        state = pi("quiet")
+        self.assertEqual(len(state["sent"]), 1, state["sent"])
+
+    def test_a_refused_send_is_not_made_again_on_every_poll(self):
+        # Pi reports a refused extension send by printing the error and its stack
+        # into the captain's chat, so a wake retried on the half-second poll writes
+        # a screen of red through a compaction they are watching. The bound is the
+        # extension's own constant and not the poll.
+        window_ms = 3000
+        refused_ms = int(exported("REFUSED_MS"))
+        pi = self.session()
+        pi("start")
+        pi("refuse-sends", value=True)
+        self.raise_wake()
+        state = pi("quiet", ms=window_ms)
+        tries = len(state["refused"])
+        self.assertGreaterEqual(tries, 1, "the extension never tried to send")
+        self.assertLessEqual(
+            tries, 2 + window_ms // refused_ms,
+            f"the wake was re-sent {tries} times in {window_ms}ms against a "
+            f"{refused_ms}ms retry: every one of those is a red line and a stack "
+            "trace in the captain's transcript")
+
+    def test_a_restart_makes_an_unconfirmed_wake_again(self):
+        # The send was never taken, so no turn ran and nothing was recorded. A
+        # session coming up finds the wake untaken on disk, which is the recovery
+        # for the shapes that do not clear on their own - no model, no credentials.
+        pi = self.session()
+        pi("start")
+        pi("refuse-sends", value=True)
+        self.raise_wake()
+        pi("quiet")
+        pi("shutdown", reason="quit")
+        again = self.session()
+        again("start")
+        state = again("settle", sent=1)
+        self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
+        self.took(1)
+
+    def test_a_restart_after_a_confirmed_wake_never_sends_it_again(self):
+        pi = self.session()
+        pi("start")
+        self.raise_wake()
+        pi("settle", sent=1)
+        self.took(1)
+        pi("shutdown", reason="quit")
+        again = self.session()
+        again("start")
+        state = again("quiet")
+        self.assertEqual(state["sent"], [], "a wake already taken was sent again")
 
 
 class Unwritable(WakeTest):
@@ -382,7 +599,7 @@ class Unwritable(WakeTest):
         self.assertEqual(self.consumed(), 0)
         pi("refuse-writes", value=False)
         state = pi("quiet")
-        self.assertEqual(self.consumed(), 1)
+        self.took(1)
         self.assertEqual(len(state["sent"]), 1)
 
     def test_the_retry_runs_on_the_poll_and_is_never_fed_by_its_own_watch(self):
@@ -449,7 +666,7 @@ class TheEditor(WakeTest):
         pi("editor", text="")
         state = pi("settle", sent=1)
         self.assertEqual([m["content"] for m in state["sent"]], [WAKE])
-        self.assertEqual(self.consumed(), 1)
+        self.took(1)
 
     def test_whitespace_alone_is_an_empty_editor(self):
         pi = self.session()
@@ -593,7 +810,7 @@ class ConsumerRecord(WakeTest):
         self.raise_wake()
         state = pi("settle", sent=2)
         self.assertEqual(len(state["sent"]), 2, state["sent"])
-        self.assertEqual(self.consumed(), 2)
+        self.took(2)
 
 
 class Unattended(WakeTest):
