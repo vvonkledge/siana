@@ -124,6 +124,14 @@ class Shims(unittest.TestCase):
         self.assertIn(f"exec '{self.TRUE}' \"$@\"", body)
         self.assertNotIn("is not this cleanup run's to call", body)
 
+    def test_the_close_boundary_keeps_the_guard_on_its_own_path(self):
+        # The other side of the exemption above, asserted here rather than left to
+        # be read off DELEGATES. Nothing this command does is refused by the guard,
+        # so exempting it would widen the one opening that list is for nothing.
+        body = self.shim("siana-close-workspace", c.GUARDS["siana-close-workspace"],
+                         grants=["inventory", "close-workspace"])
+        self.assertNotIn("PATH=", body)
+
     def test_raw_herdr_closing_stays_refused_under_the_close_grant(self):
         # The grant unlocks one task-addressed command and never herdr itself. A
         # workspace id the cleaner chose is the one input this design never takes.
@@ -132,6 +140,19 @@ class Shims(unittest.TestCase):
                      ("worktree", "remove", "--force", "/nowhere")):
             self.assertEqual(self.render(body, *argv).returncode, 1, argv)
         self.assertEqual(self.render(body, "workspace", "list").returncode, 0)
+
+    def test_the_herdr_refusal_names_the_command_that_does_each_thing(self):
+        # The message is the whole of what a cleaner gets at the moment it reached
+        # for raw herdr, and there are two commands here rather than one. Pointing
+        # a refused close at `siana-retire` sends it to a command that closes
+        # nothing - it prints the close as a separate step and stops.
+        said = self.render(self.shim("herdr", c.GUARDS["herdr"],
+                                     grants=list(c.GRANTS)),
+                           "workspace", "close", "w9").stderr
+        self.assertIn("siana-close-workspace", said)
+        self.assertIn("siana-retire", said)
+        self.assertIn("removing a worktree", said)
+        self.assertIn("closing a workspace", said)
 
     def test_a_delegated_command_is_exec_with_the_guard_off_its_path(self):
         # `siana-retire` ends with `git worktree remove`, and the guard refuses that.
@@ -1206,20 +1227,33 @@ class Run(HomeTest):
         self.assertNotIn("not this cleanup run's to call", out.stdout)
         self.assertIn("a-task is doing, not done", out.stdout)
 
-    def test_the_close_boundary_reaches_the_real_git(self):
-        # It asks git which worktrees a repository still registers before anything
-        # closes, and the guard's `git` shim refuses `worktree` followed by a
-        # destructive verb. `siana-retire` lost its last line to exactly this.
-        stand_in = os.path.join(self.fakebin, "siana-close-workspace")
-        with open(stand_in, "w") as fh:
-            fh.write("#!/bin/sh\n"
-                     "git worktree list --porcelain /nowhere 2>&1 | head -1\n")
-        os.chmod(stand_in, 0o755)
+    def test_the_close_boundary_gets_past_the_guard_to_its_herdr_read(self):
+        # It is not in DELEGATES, so every git call it makes goes through the guard's
+        # own `git` shim. Today the guard refuses neither of them, and this is what
+        # says so: driven to the point where it is talking to herdr, which is past
+        # the status check, past the recorded tree, and past `git worktree list`.
+        # `siana-retire` lost its last line to exactly this kind of drift, and the
+        # day the guard grows a rule that stands in this command's way, this goes red
+        # rather than a cleanup run dying on its final line.
+        self.contract("projects")
+        repo = self.at("repo")
+        os.makedirs(repo)
+        for argv in (("init", "-q", "-b", "main", "."),
+                     ("config", "user.email", "m@example.com"),
+                     ("config", "user.name", "m")):
+            self.assertAccepted(self.run_cmd(["git", "-C", repo, *argv]))
+        self.project("proj", path=repo)
+        self.queue()
+        self.store("tasks.jsonl",
+                   {"id": "a-task", "title": "A task", "status": "done",
+                    "project": "proj", "owner": "claude@w9:p2",
+                    "cwd": self.at("gone-tree")})
         self.write_script({"steps": [{"run": ["siana-close-workspace", "a-task"]}],
                            "exit": 0})
-        out = self.clean("start", "--grant", "close-workspace")
+        out = self.clean("start", "--grant", "close-workspace",
+                         extra={"HERDR_SOCKET_PATH": self.at("no-such.sock")})
         self.assertNotIn("not this cleanup run's to call", out.stdout)
-        self.assertIn("fatal", out.stdout)
+        self.assertIn("cannot reach herdr", out.stdout)
 
     def test_a_close_grant_alone_does_not_unlock_retiring(self):
         # And the other way round, so neither grant is quietly the other.

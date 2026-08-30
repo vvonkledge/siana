@@ -195,8 +195,13 @@ GUARDS = {
              "apply,restore,checkout,switch,stash,rm,mv",
              "a cleanup run changes neither a repository's history nor its"
              " working tree"),),
+    # Named per operation, because after `close-workspace` landed there are two
+    # commands here rather than one, and a refusal that points at the wrong one sends
+    # a cleaner to a command that will not do what it was just refused. `siana-retire`
+    # closes no workspace at all: it prints the close as a separate step and stops.
     "herdr": (("words:close,remove,kill,prompt",
-               "worktree and workspace removal is `siana-retire`'s, and only its"),),
+               "removing a worktree is `siana-retire`'s and closing a workspace is"
+               " `siana-close-workspace`'s; neither is done with herdr directly"),),
 }
 
 
@@ -244,15 +249,17 @@ WORD_AFTER = {
 # and then died on that line. The guard exists to stop the *cleaner* reaching git
 # directly, not to stop the command whose judgment the whole design defers to.
 #
-# `siana-close-workspace` is here for the same reason and needs it just as much: it
-# asks git which worktrees a repository still registers, and the guard's `git` shim
-# refuses `worktree` followed by a destructive verb - a rule that reads the word after
-# the verb, and therefore one more thing standing between this command and the answer
-# it has to have before anything is closed.
+# `siana-close-workspace` is deliberately not here, although it is the same class of
+# command. It reads git twice - `worktree list` and `rev-parse` - and the guard
+# refuses neither, so an exemption would buy it nothing today and would widen the one
+# opening this list is: a command exec'd past the guard is a command the guard is no
+# longer watching. `tests/test_clean.py` drives it through the guard to a herdr read,
+# which is past both git calls, so the day the guard grows a rule that does stand in
+# its way is a red suite rather than a run that dies on its last line.
 #
 # Everything else keeps the guard, so a fleet command cannot become a way to launder
-# an arbitrary call: all three take a task id or a project handle and nothing else.
-DELEGATES = ("siana-retire", "siana-reap", "siana-close-workspace")
+# an arbitrary call: these two take a task id and a project handle and nothing else.
+DELEGATES = ("siana-retire", "siana-reap")
 
 # `git worktree` and `git branch` read in their common form and destroy in their
 # flagged one, so they are matched on the pair rather than on the verb. Kept apart

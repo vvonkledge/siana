@@ -694,13 +694,18 @@ its report-only form. `close-workspace` adds `siana-close-workspace`. Give the
 narrowest one that does the job, and never start with `retire` on a project you have
 not inventoried first.
 
-**`close-workspace` is its own grant, and it is the one that pairs with `retire`.**
+**`close-workspace` is its own grant, and it is given with `retire` or not at all.**
 Give both and a run retires each tree and then closes the workspace that retirement
-left open, which is the cleanup finishing rather than stopping one step short. Give
-`close-workspace` alone and it closes only workspaces whose trees some earlier run
-already retired. The ordering is not the cleaner's to get right: the command refuses
-a workspace whose worktree is still there, so a retirement that refused ends that
-task rather than leaking into a close.
+left open, which is the cleanup finishing rather than stopping one step short.
+
+Giving it alone unlocks the command and gets you nothing, deliberately. The cleaner's
+own rule is that it closes only a tree it retired in this run, and without `retire`
+it can retire nothing, so a close-only run reports that rule and closes no workspace.
+Leftover workspaces from earlier runs are not reachable that way; they are reached by
+running the pair again over the tasks that still have trees, or by hand. The ordering
+is not the cleaner's to get right either: the command refuses a workspace whose
+worktree is still there, so a retirement that refused ends that task rather than
+leaking into a close.
 
 Raw `herdr` closing stays refused whatever grants a run holds, and no grant reaches
 a workspace id the cleaner chose.
