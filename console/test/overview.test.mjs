@@ -195,6 +195,26 @@ test('an age on screen moves as the clock does', async (t) => {
   assert.match(text(page), /moved 5m ago/);
 });
 
+test('a record stamped ahead of this clock says so, and not "ago"', async (t) => {
+  // A record written on another machine, or across a clock step. Calling it "0s ago"
+  // would hide it, and appending "ago" to the phrase that names it reads as nonsense
+  // over exactly the record worth looking at.
+  const page = await opened(t, {
+    snapshot: snapshot({ tasks: [task('a-task', { updated: at(-5 * MINUTE) })] }),
+  });
+  const said = text(page);
+  assert.match(said, /moved ahead of this clock/);
+  assert.doesNotMatch(said, /ahead of this clock ago/);
+});
+
+test('a record whose stamp will not parse says the age is unknown', async (t) => {
+  const page = await opened(t, {
+    snapshot: snapshot({ tasks: [task('a-task', { updated: 'whenever' })] }),
+  });
+  assert.match(text(page), /moved age unknown/);
+  assert.doesNotMatch(text(page), /age unknown ago/);
+});
+
 test('the queue and the decision log are reachable from the home screen',
   async (t) => {
     const page = await opened(t, {

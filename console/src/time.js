@@ -6,6 +6,13 @@
  * phone, and the second one is a fleet nobody is watching.
  */
 
+/** How far ahead of this machine's clock a stamp has to be before it is called out.
+ *
+ * A stamp from the future is a real thing to see - a record written on another
+ * machine, or a clock that stepped - and calling it "0s ago" would hide it. A second
+ * of slack, because two clocks agreeing to the second is not something to report. */
+const AHEAD_MS = -1000;
+
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
@@ -44,10 +51,16 @@ export function sayAge(ms) {
   return hours ? `${days}d ${hours}h` : `${days}d`;
 }
 
-/** How old a stamp is, said, or the reason it cannot be said. */
+/** How old a stamp is, said, or the reason it cannot be said.
+ *
+ * `duration` is what a caller reads before it appends anything. Two of the answers
+ * above are whole phrases rather than lengths of time, and "ahead of this clock ago"
+ * is what happens to a caller that does not check. */
 export function ageOf(text, now) {
   const at = parseStamp(text);
-  if (at === null) return { known: false, ms: null, said: 'age unknown' };
+  if (at === null) {
+    return { known: false, duration: false, ms: null, said: 'age unknown' };
+  }
   const ms = now - at;
-  return { known: true, ms, said: sayAge(ms) };
+  return { known: true, duration: ms >= AHEAD_MS, ms, said: sayAge(ms) };
 }

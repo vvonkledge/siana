@@ -71,11 +71,16 @@ export function Value({ value, missing = 'not set' }) {
   return <>{JSON.stringify(value)}</>;
 }
 
-/** How old a stamp is, ticking. */
+/** How old a stamp is, ticking.
+ *
+ * The suffix goes on a length of time and on nothing else. A stamp that will not
+ * parse, or one from ahead of this machine's clock, is answered with a phrase, and a
+ * phrase with " ago" on the end of it reads as nonsense over a record that is worth
+ * looking at. */
 export function Age({ stamp, suffix = ' ago' }) {
   const age = ageOf(stamp, useTick());
-  if (!age.known) {
-    return <span className="text-amber-400">age unknown</span>;
+  if (!age.duration) {
+    return <span className="text-amber-400">{age.said}</span>;
   }
   return <span>{age.said}{suffix}</span>;
 }
