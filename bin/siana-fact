@@ -512,8 +512,15 @@ def show(fact: dict) -> str:
 def project_facts(facts: dict, project: str):
     """One project's facts, slug order. Sorted rather than log order everywhere,
     because this is what a minion's orders are built from and two dispatches of one
-    task have to produce the same bytes."""
-    return sorted((f for f in facts.values() if f.get("project") == project),
+    task have to produce the same bytes.
+
+    The comparison is on `str(...)` because the caller groups by `str(...)` too, and
+    a record whose `project` is not a string - null, a number, missing - otherwise
+    falls into a bucket that matches nothing: it vanishes from the listing instead
+    of being shown as broken, and leaves an empty group behind it. `malformed` has
+    a branch for exactly that record and `show` is what displays it, so the one
+    thing this must not do is hide it."""
+    return sorted((f for f in facts.values() if str(f.get("project")) == project),
                   key=lambda f: str(f.get("slug")))
 
 

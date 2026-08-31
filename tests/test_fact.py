@@ -183,6 +183,20 @@ class Nonsecret(Facts):
         out = self.assertAccepted(self.fact("list", "demo"))
         self.assertIn("nothing recorded in demo", out)
 
+    def test_a_record_with_no_project_is_shown_as_broken_and_never_hidden(self):
+        # Grouped by `str(...)`, so a record whose project is not a string used to
+        # land in a bucket that matched nothing: invisible in the listing, and an
+        # empty group that took the command out on a traceback instead of the
+        # refusal protocol every other path here uses.
+        self.assertAccepted(self.fact("url", "demo", "staging", "https://x.example.test"))
+        self.store("facts.jsonl", {"id": "demo/odd", "project": None, "slug": "odd",
+                                   "kind": "url", "value": "https://y.example.test",
+                                   "recorded": "2026-08-31T00:00:00Z"})
+        out = self.assertAccepted(self.fact("list"))
+        self.assertIn("odd", out)
+        self.assertIn("BROKEN", out)
+        self.assertNotIn("Traceback", out)
+
     def test_the_list_never_shows_a_credential_value(self):
         self.assertAccepted(self.record_credential())
         out = self.assertAccepted(self.fact("list"))
