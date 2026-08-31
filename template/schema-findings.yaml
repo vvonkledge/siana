@@ -1,0 +1,202 @@
+# Contract for findings.jsonl: a review finding that was found, repaired, and
+# independently accepted - and the evidence that all three happened.
+#
+# The queue holds work someone can still act on. A finding whose successor has been
+# accepted is not work: nobody will do anything about it, and leaving nine of them in
+# `blocked` made the fleet report nine blockers when the actionable number was zero.
+# It is also not nothing. It is the most expensive thing this fleet produces - a
+# second minion reading the first one's work and finding the defect - and it is read
+# again every time similar work is briefed.
+#
+# Records are written by `siana-findings`, never by hand and never by `datafile`
+# directly, and the reason is sharper here than for the other stores. `put` on an
+# existing key reports `updated` and the fold returns the new content; `compact` then
+# deletes the old version for good. Two commands rewrite a finding into "nothing was
+# wrong" and leave no trace. The script is what refuses the second write, and
+# `siana-findings verify` is what notices if someone got past it.
+#
+# It only ever grows, for the reason schema-decisions.yaml gives: a field dropped
+# from a live contract makes every record carrying it vanish from `get` and `list`,
+# and a record of what this fleet found may never silently shrink.
+#
+# Nothing here decides that a successor resolved a finding. `resolution` and
+# `resolved_by` are SIANA's judgment, written by an agent and refused if empty. Every
+# other field is something a script checked, and `verify` checks them all again, so a
+# false claim in `resolution` sits beside green mechanics and can be argued with - it
+# is never confirmed by them.
+
+name: Finding
+key: id
+extra: forbid
+
+fields:
+  id:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{2,47}$'
+    description: >-
+      the id of the queue task this record replaces. Already unique in the queue,
+      and exactly the thing disappearing, so archiving is naturally idempotent: a
+      second attempt finds its own record. A later task reusing a dropped id is
+      refused loudly by `siana-findings`, naming both records, rather than merged
+  case:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{2,47}$'
+    description: >-
+      the rejection chain this round belongs to. One case is archived at a time,
+      because the invariant that ends a chain - the highest round's acceptance is
+      `done` - cannot be checked from one record
+  round:
+    type: int
+    ge: 1
+    description: >-
+      where in the chain this finding sits, from 1. A case is contiguous from 1 with
+      no gaps and no two records at the same round, and `verify` checks it
+  project:
+    type: str
+    min_length: 1
+    max_length: 40
+    description: >-
+      the project handle, which must be in projects.jsonl and must agree with the
+      archived queue record's own `project`
+  kind:
+    type: enum
+    values: [qa, ship, review]
+    description: >-
+      what did the rejecting. `qa` and `review` are minions with their own report;
+      `ship` is the pipeline reviewer, which writes a pipeline record instead. The
+      kind is what says which evidence is absent by nature rather than missing
+  archived_at:
+    type: datetime
+    description: >-
+      stamped by `siana-findings`, because an agent must never type the clock
+  source:
+    type: dict
+    description: >-
+      the queue record verbatim, folded from tasks.jsonl at archive time. A dict, so
+      this contract does not police inside it: it is a snapshot of a different
+      contract and must not be reshaped to fit this one
+  reason:
+    type: str
+    min_length: 1
+    description: >-
+      the blocked reason, lifted out of `source` to the top level. It is the finding
+      in the minion's own words, and a reader must not have to know the queue's
+      field layout to find it
+  summary:
+    type: str
+    min_length: 1
+    max_length: 2000
+    description: >-
+      what was wrong, in one paragraph, for a reader who will not open the report
+  consequence:
+    type: str
+    min_length: 1
+    max_length: 2000
+    description: >-
+      what it would have cost had it shipped. The half of a finding that says why
+      it was worth a whole extra round
+  tags:
+    type: list
+    items: str
+    default: []
+    description: >-
+      what class of defect this was. A tag appearing across more than one case is a
+      finding about how this fleet works that is invisible from any single report
+  branch:
+    type: str
+    required: false
+    min_length: 1
+    description: >-
+      the branch that was rejected. Absent by kind for a `review` of a document,
+      which rejects no branch
+  head:
+    type: str
+    required: false
+    pattern: '^[0-9a-f]{40}$'
+    description: >-
+      the exact commit that was rejected, in full. Pinned as a git ref at archive
+      time, because an unpinned rejected head does not survive `gc --prune=now`
+      once its branch is deleted
+  head_pinned:
+    type: bool
+    default: false
+    description: >-
+      whether `refs/siana/findings/<id>` was created pointing at `head`. A fact
+      about what the archive did, in the past tense, so it never decays. Whether
+      that ref still exists today is `siana-findings verify`'s question, and it
+      answers it by looking
+  resolver:
+    type: str
+    required: false
+    min_length: 1
+    description: >-
+      the queue task that repaired this finding. It must be `done`, and its `base`
+      must be this record's `branch` whenever there is one
+  resolver_head:
+    type: str
+    required: false
+    pattern: '^[0-9a-f]{40}$'
+    description: >-
+      the commit the repair ended on. Absent by kind where the repair produced no
+      commit of its own
+  acceptance:
+    type: str
+    required: false
+    min_length: 1
+    description: >-
+      what independently read the repair. For every round below the highest it is
+      the next round's id, because that round's rejection is what read this one's
+      repair. For the highest round it is a task that is `done` in the queue, and
+      that is the invariant that says the chain has ended
+  landed:
+    type: str
+    required: false
+    min_length: 1
+    description: >-
+      where the work was published, as free text ending in the merge commit. Merged
+      is evidence and never proof: `verify` checks only that the named commit
+      contains `resolver_head`, and containment is not resolution
+  resolution:
+    type: str
+    min_length: 1
+    max_length: 2000
+    description: >-
+      how the successor closed this finding, in SIANA's words. This is judgment and
+      not mechanics. Nothing derives it from ancestry, from `deps`, from `base` or
+      from a merge, and `verify` prints it as "not checked here" so a green verify
+      never reads as an endorsement of the sentence
+  resolved_by:
+    type: str
+    min_length: 1
+    description: >-
+      who wrote that sentence. With `archived_at` it is what makes the judgment
+      attributable, which is the only thing that makes it arguable later
+  evidence:
+    type: list
+    items: str
+    default: []
+    description: >-
+      two shapes. `"<64 hex> <path>"` is a file copied into the blob store, digest
+      first, so the bytes are immutable by construction and the path still says
+      where they came from. `"<kind>:<id>"` is a pointer, today `obligation:` and
+      `task:`. An unrecognised prefix is kept and not checked
+  superseded:
+    type: list
+    items: str
+    default: []
+    description: >-
+      queue tasks removed alongside this record because they exist only to serve it
+      and can never run. Every one must be `todo`, must name this record's `id` in
+      its `deps`, and is removable only while this record has an `acceptance` that
+      is `done` - so an orphaned QA goes only where an independent acceptance of the
+      same work exists somewhere else
+  unknown:
+    type: list
+    items: str
+    default: []
+    description: >-
+      the fields that applied here and could not be established. A field that is
+      null and is not named here does not apply; one that is null and is named here
+      is a hole this fleet knows about. `siana-findings` refuses a name that is not
+      a field of this contract and refuses naming a field that is non-null, so no
+      sentinel value ever has to be invented to fill a gap
