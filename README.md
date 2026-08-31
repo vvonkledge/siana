@@ -92,9 +92,9 @@ Into the home:
   SIANA evolves its own instructions, so a home copy that differs from the template
   is your work, and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
-  `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
-  reason. A contract only ever grows, because a field dropped from a live contract
-  makes every record still carrying it unreadable.
+  `schema-semantic.yaml`, `schema-tasks.yaml`: the store contracts. Also never
+  overwritten, for a harder reason. A contract only ever grows, because a field
+  dropped from a live contract makes every record still carrying it unreadable.
 - `principles.md`, a template for the principles an advisory session holds SIANA to.
   Written only when absent, and never touched by `just upgrade` either: a distro that
   could rewrite it could rewrite what SIANA is held to while you are asleep. It ships
@@ -111,14 +111,15 @@ Into the home:
   [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
-`decisions.jsonl` - are not written here. `datafile` creates each on its first append,
-so a contract with no `.jsonl` beside it is an empty store and not a broken install.
+`decisions.jsonl`, `semantic.jsonl` - are not written here. `datafile` creates each
+on its first append, so a contract with no `.jsonl` beside it is an empty store and
+not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
 `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
-`siana-read`. They are links, so a `git pull` here updates the commands with no
-reinstall. It does not update the home; `just upgrade` does that.
+`siana-read`, `siana-semantic`. They are links, so a `git pull` here updates the
+commands with no reinstall. It does not update the home; `just upgrade` does that.
 
 ### The queue integration
 
@@ -228,6 +229,48 @@ orders every minion there is started with, which is where a project's own conven
 belong; `pipeline` says work there is validated by a pipeline the minion drives
 instead of by a command that runs once, and is described under "A rigor the minion
 drives" below.
+
+### Give a project semantic context
+
+Off unless you turn it on, one project at a time. With no binding, everything below
+this heading may as well not exist: dispatch behaves exactly as it did before, and
+nothing is ever recorded anywhere.
+
+A binding says that minions on one project are briefed from a
+[semantic-layer](https://github.com/vvonkledge/semantic-layer) context pack, and that
+what came of their work is recorded back as a trace. It names every part of that
+explicitly, because none of it can be inferred: a project handle is not an IRI, and a
+directory is not a source.
+
+    datafile -f ~/.siana/semantic.jsonl put \
+        --set project=<the project whose minions get context> \
+        --set provider=<the project whose `semantic-layer` answers> \
+        --set pack=<pack directory, relative to the provider> \
+        --set source=<the source IRI the pack must be about> \
+        --set target=<the target the pack must be about> \
+        --set agent=<the agent IRI runs are attributed to> \
+        --set store=<where the trace store lives>
+
+`~/.siana/schema-semantic.yaml` describes each field. `semantic-layer` itself has to
+be installed where SIANA runs; nothing here reaches into its checkout.
+
+What then happens is two things and no more. Before a minion is claimed or started,
+`siana-dispatch` exports that pack once, checks every field of the answer, writes the
+exact bytes that verified under `~/.siana/semantic/<task-id>/`, and briefs the minion
+from that copy rather than from the live directory. When the task comes back `done`
+or `blocked`, `siana-semantic reconcile` records one span saying a fleet task ran and
+how it came out, then runs the retention pass.
+
+A run carries structure and nothing else: no title, no reason, no brief, no prompt,
+no diff, no path, no environment. There is nowhere in the document to put them.
+
+    siana-semantic status       what is bound, and what is waiting to be recorded
+    siana-semantic reconcile    record every pinned task the queue now says is done
+
+`just doctor` runs the first of those. The second is SIANA's to run when the queue
+moves, and it is exact and idempotent: running it twice records nothing twice, and
+running it after a restart catches everything that went terminal while nothing was
+watching.
 
 ### Branches the fleet leaves in your repository
 
