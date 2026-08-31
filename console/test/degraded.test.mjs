@@ -14,8 +14,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { alerts, opened, go, text } from './harness.mjs';
-import { agent, fleetUnknown, health, obligation, refused, snapshot, store, task,
-  unrunnable } from './fixtures.mjs';
+import { agent, decision, fleetUnknown, health, obligation, project, refused,
+  snapshot, store, task, unrunnable } from './fixtures.mjs';
 
 test('an unreadable queue is a refusal on screen and never an empty queue',
   async (t) => {
@@ -77,6 +77,75 @@ test('a corrupt store shows its bad lines beside the records it could read',
     assert.match(said, /2 lines in this store could not be read/);
     assert.match(said, /Expecting value/);
     assert.match(said, /a-task/, 'what could be read is still shown');
+  });
+
+test('a drilldown over a damaged store says so rather than looking healthy',
+  async (t) => {
+    const page = await opened(t, {
+      snapshot: snapshot({
+        sources: {
+          tasks: store('tasks', [task('a-task')], {
+            badLines: [{ line: 4, error: 'Expecting value: line 1 column 1' }],
+            total: 2,
+          }),
+        },
+      }),
+      hash: '#/task/a-task',
+    });
+    const said = text(page);
+    assert.match(said, /a-task/);
+    assert.match(said, /The queue is damaged/);
+    assert.match(said, /1 line in this store could not be read/);
+  });
+
+test('a record lost to a damaged line is never called done and folded away',
+  async (t) => {
+    // The sharpest case in this file. The record the captain asked for may be
+    // exactly the one an unreadable line took with it, and a screen that says it was
+    // probably finished is this console inventing the one thing it exists to report.
+    const page = await opened(t, {
+      snapshot: snapshot({
+        sources: {
+          tasks: store('tasks', [task('a-task')], {
+            badLines: [{ line: 4, error: 'Expecting value: line 1 column 1' }],
+            total: 2,
+          }),
+        },
+      }),
+      hash: '#/task/fix-the-gate',
+    });
+    const said = text(page);
+    assert.match(said, /The queue is damaged/);
+    assert.match(said, /Nothing here is called fix-the-gate/);
+    assert.match(said, /may be one of the records it lost/);
+    assert.doesNotMatch(said, /done and folded away/);
+  });
+
+test('a damaged registry and a damaged log say so on their drilldowns too',
+  async (t) => {
+    const page = await opened(t, {
+      snapshot: snapshot({
+        projects: [project('siana')],
+        decisions: [decision('one-decision')],
+        sources: {
+          projects: store('projects', [project('siana')], {
+            badLines: [{ line: 2, error: 'no key' }],
+          }),
+          decisions: store('decisions', [decision('one-decision')], {
+            badLines: [{ line: 7, error: 'no key' }],
+          }),
+        },
+      }),
+      hash: '#/project/siana',
+    });
+    assert.match(text(page), /The registry is damaged/);
+    await go(page, '#/project/gone');
+    assert.match(text(page), /The registry is damaged/);
+    await go(page, '#/decision/one-decision');
+    assert.match(text(page), /The decision log is damaged/);
+    await go(page, '#/decision/gone');
+    assert.match(text(page), /The decision log is damaged/);
+    assert.match(text(page), /may be one of the records it lost/);
   });
 
 test('an unreachable herdr is unknown and never a fleet with no minions',

@@ -7,7 +7,7 @@
  * whose store failed to load, and the captain would read both as "empty".
  */
 
-import { readFleet, readStore, UNAVAILABLE } from './sources.js';
+import { DEGRADED, readFleet, readStore, UNAVAILABLE } from './sources.js';
 import { agentInPane, byId, newestFirst, oldestFirst, ownerPane } from './model.js';
 import { Age, Card, Chip, Empty, Field, Fields, List, Panel, Row, StatusChip,
   Trouble, Value } from './ui.jsx';
@@ -15,16 +15,25 @@ import { Age, Card, Chip, Empty, Field, Fields, List, Panel, Row, StatusChip,
 /** An id the store does not hold.
  *
  * Separate from `Empty` on purpose: "there is no task called this" and "this task has
- * nothing in it" are different answers and only one of them means the link was
- * wrong. */
-function Missing({ what, id }) {
+ * nothing in it" are different answers and only one of them means the link was wrong.
+ *
+ * And the store's own state comes first, because the record the captain asked for may
+ * be exactly the one a damaged line took with it. Telling them it was probably done
+ * and folded away, over a store that could not be read whole, is this console
+ * inventing the one thing it is here to report. */
+function Missing({ what, id, source, of }) {
+  const damaged = source && source.level === DEGRADED;
   return (
     <Panel title={what} tone="attention">
+      <Trouble source={source} what={of} />
       <p role="alert" className="rounded-xl bg-amber-950/40 px-3 py-3 text-sm
         text-amber-100 ring-1 ring-amber-800">
         Nothing here is called <span className="font-mono"><Value value={id} /></span>.
-        It may have been done and folded away, or the link may be from an older
-        screen.
+        {damaged
+          ? ' That store could not be read whole, so this may be one of the records'
+            + ' it lost rather than one that is gone.'
+          : ' It may have been done and folded away, or the link may be from an older'
+            + ' screen.'}
       </p>
     </Panel>
   );
@@ -98,13 +107,17 @@ export function Project({ snapshot, handle }) {
     return <Panel title="Project"><Trouble source={projects} what="The registry" />
     </Panel>;
   }
-  if (!record) return <Missing what="Project" id={handle} />;
+  if (!record) {
+    return <Missing what="Project" id={handle} source={projects}
+      of="The registry" />;
+  }
   const mine = tasks.level === UNAVAILABLE
     ? [] : tasks.records.filter((t) => t.project === handle);
   const states = ['blocked', 'doing', 'todo', 'done'];
   return (
     <div className="space-y-4">
       <Panel title={`Project ${record.handle}`}>
+        <Trouble source={projects} what="The registry" />
         <Fields>
           <Field label="Path" value={record.path} mono />
           <Field label="Ship" value={record.ship} mono />
@@ -176,13 +189,14 @@ export function Task({ snapshot, id }) {
     return <Panel title="Task"><Trouble source={tasks} what="The queue" /></Panel>;
   }
   const task = tasks.records.find((t) => t.id === id);
-  if (!task) return <Missing what="Task" id={id} />;
+  if (!task) return <Missing what="Task" id={id} source={tasks} of="The queue" />;
   const index = byId(tasks.records);
   const { kind, pane } = ownerPane(task.owner);
   const agent = fleet.level === UNAVAILABLE ? null : agentInPane(pane, fleet.agents);
   return (
     <div className="space-y-4">
       <Panel title="Task" note={<StatusChip status={task.status} />}>
+        <Trouble source={tasks} what="The queue" />
         <h1 className="text-lg leading-snug font-semibold text-slate-50">
           <Value value={task.title} missing="no title" />
         </h1>
@@ -391,13 +405,17 @@ export function Decision({ snapshot, id }) {
     </Panel>;
   }
   const record = decisions.records.find((d) => d.id === id);
-  if (!record) return <Missing what="Decision" id={id} />;
+  if (!record) {
+    return <Missing what="Decision" id={id} source={decisions}
+      of="The decision log" />;
+  }
   return (
     <div className="space-y-4">
       <Panel title="Decision" note={
         <Chip tone={record.verdict === 'proposed' ? 'warn' : 'stop'}>
           <Value value={record.verdict} missing="no verdict" />
         </Chip>}>
+        <Trouble source={decisions} what="The decision log" />
         <p className="font-mono text-sm break-all text-slate-50">
           <Value value={record.action} missing="no action recorded" />
         </p>
