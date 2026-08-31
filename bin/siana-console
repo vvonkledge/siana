@@ -1,0 +1,786 @@
+#!/usr/bin/env node
+/**
+ * Serve the fleet over loopback HTTP, so something with a browser can read what
+ * `siana-read` already answers.
+ *
+ * `siana-read` prints one JSON document per question and exits. A phone cannot run
+ * it. This is the smallest process that puts those same documents on a socket, and
+ * it is deliberately the whole of what it does: no browser, no static file, no
+ * authentication, no tunnel, no write path, and nothing here decides anything about
+ * the fleet.
+ *
+ *     siana-console          SIANA_CONSOLE_PORT names the loopback port
+ *
+ *     GET /api/state?rev=<opaque>   one snapshot of every source, or 204
+ *     GET /api/stream               server-sent events announcing a new revision
+ *
+ * **It binds `127.0.0.1` and there is no way to ask it for anything else.** Not a
+ * flag, not an environment value, not a fallback. The listener is unauthenticated,
+ * so the only thing standing between the captain's queue and the network this
+ * machine is on is the address in `HOST` below. A host that could be configured is
+ * a host that can be misconfigured once, at which point every task, obligation and
+ * decision in the home is served to the local network by a process that asks for no
+ * credential.
+ *
+ * **The fleet is read through `siana-read` and never around it.** No store is
+ * opened here, herdr is never dialled, no watcher file is parsed and no process is
+ * inspected. That command is the boundary, it already refuses everything it cannot
+ * answer, and a second reader beside it would be a second implementation of those
+ * refusals - free to drift from them in exactly the cases where being wrong is
+ * worst: an unreadable store answered as an empty one, a silent herdr answered as a
+ * fleet with no minions.
+ *
+ * So the rule that shapes the snapshot below is: **relay, never summarise.** Each
+ * source arrives with its whole document, its exit status and its own observation
+ * time, and the console adds nothing to it. In particular there is no common error
+ * field to read: `siana-read fleet` refuses with `state: "unknown"` and no top-level
+ * `error` at all, so a console that indexed one would report a healthy fleet at the
+ * moment herdr went away. The exit code is the verdict, and the document is
+ * whatever that source said.
+ *
+ * **This is not literally read-only on disk, and saying otherwise would be a lie a
+ * later security model rests on.** `siana-read` discloses that a `datafile` read may
+ * rewrite the `.idx` cache beside a store, and this process writes one file of its
+ * own: the singleton claim at `$SIANA_HOME/inbox/console`. What holds is narrower
+ * and is what matters: no HTTP request reaches anything that changes an
+ * authoritative record, and there is no endpoint here that could.
+ *
+ * Nothing in the fleet depends on this. It starts nothing and stops nothing;
+ * SIANA, the watcher, every minion and every store are unchanged by it running and
+ * unchanged by it stopping.
+ */
+
+'use strict';
+
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync, spawn } = require('node:child_process');
+
+// The only address this ever binds, written as a literal IPv4 address so that node
+// opens an AF_INET socket on that interface and nothing else. `localhost` would be
+// resolved, and resolves to `::1` as well on a dual-stack machine; an absent host
+// binds the wildcard on every interface there is. See the header for why this is a
+// constant rather than an option.
+const HOST = '127.0.0.1';
+
+// The boundary, by name on PATH rather than by path beside this file. `just init`
+// links both commands out of the same distro, so the sibling is what answers, and
+// reaching for the installed command is what `bin/siana` already does with
+// `datafile`, `tasks` and `siana-owe`.
+const READ = 'siana-read';
+
+// Every question the console asks, and all it can ask: each is a bare `siana-read`
+// subcommand taking no flags, so no part of a request ever reaches an argv.
+const SOURCES = ['tasks', 'projects', 'obligations', 'decisions', 'fleet', 'health'];
+
+// Longer than any healthy read and shorter than the 120 seconds `siana-read` gives
+// a store of its own, so a store held by a writer that stopped arrives as a named
+// failure on that one source instead of parking a browser for two minutes. The
+// snapshot still answers: the other five sources are read in parallel and are
+// unaffected.
+const READ_TIMEOUT_MS = 30_000;
+
+// How often the stream re-reads state while a client is listening. It exists only
+// to notice that the revision moved, and the client refetches `/api/state` for the
+// document itself, so this is a latency knob and never a source of truth.
+const POLL_MS = 2_000;
+
+// A comment frame on an otherwise silent stream. Without it a client that vanished
+// without closing its socket is never written to and so is never noticed, and the
+// set of connected clients grows for as long as the process runs.
+const HEARTBEAT_MS = 15_000;
+
+// Where this process records that it owns the port. `inbox/` is the mailbox
+// directory a later slice writes messages into; the claim is the one name in it
+// this slice uses.
+const CLAIM_DIR = 'inbox';
+const CLAIM = 'console';
+
+const ROUTES = { '/api/state': serveState, '/api/stream': serveStream };
+
+// Every connected stream. Derived and disposable: it holds no fleet fact, and a
+// client that drops loses nothing, because `/api/state` is complete on its own.
+const clients = new Set();
+
+let pollTimer = null;
+let beatTimer = null;
+let polling = false;
+// The last revision announced on the stream. Reset when the last client leaves, so
+// the next one to connect is told the current revision rather than being left
+// silent because a client that has gone was already told.
+let lastRevision = null;
+let stopping = false;
+
+
+// ------------------------------------------------------------------- refusals
+
+/** A refusal, in the shape every command here refuses in: what happened, then what
+ * to do about it, on stderr, and a nonzero exit. */
+function die(...lines) {
+  process.stderr.write(lines.map((l, i) => (i ? `  ${l}` : l)).join('\n') + '\n');
+  process.exit(1);
+}
+
+function stamp() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function homeDir() {
+  return process.env.SIANA_HOME || path.join(os.homedir(), '.siana');
+}
+
+/** Enough of a stream to diagnose it, and never all of it: a `siana-read` that
+ * printed a megabyte of something unparseable must not put a megabyte into every
+ * snapshot after it. */
+function clip(text, limit = 400) {
+  const trimmed = String(text).trim();
+  return trimmed.length > limit ? `${trimmed.slice(0, limit)}...` : trimmed;
+}
+
+/** The loopback port this console is to own, or a refusal naming it.
+ *
+ * Not defaulted. A port every SIANA on every machine binds is a port something
+ * else will one day be holding, and the console would then refuse to start rather
+ * than quietly serving from a fixed address the captain never chose. Naming it is
+ * a second of the captain's time and removes that entirely.
+ */
+function configuredPort() {
+  const raw = (process.env.SIANA_CONSOLE_PORT || '').trim();
+  if (!raw) {
+    die('SIANA_CONSOLE_PORT is not set',
+        'it is the loopback port this console binds and records as its own',
+        'start it as `SIANA_CONSOLE_PORT=8787 siana-console`');
+  }
+  if (!/^[0-9]+$/.test(raw)) {
+    die(`SIANA_CONSOLE_PORT is not a port number: ${JSON.stringify(raw)}`,
+        'it takes a number between 1 and 65535 and nothing else');
+  }
+  const port = Number(raw);
+  if (port === 0) {
+    // The claim is written before the socket is bound, and it exists to say which
+    // port this console owns. A port the kernel picks is not knowable until after
+    // the bind, so a claim naming 0 would answer that question with a lie.
+    die('SIANA_CONSOLE_PORT is 0, which asks the kernel for whichever port is free',
+        'this console records the port it owns before it binds one, so the port',
+        'has to be a port and not a request for any port at all');
+  }
+  if (port > 65535) {
+    die(`SIANA_CONSOLE_PORT is ${port}, which is not a port`,
+        'it takes a number between 1 and 65535');
+  }
+  return port;
+}
+
+
+// ------------------------------------------------------------- the singleton
+
+/** What `ps` says that pid is running, or "" when it says nothing.
+ *
+ * Identity, not liveness. Pids are reused, so a live pid is not a live console:
+ * the process wearing it has to still be the thing that recorded it. `bin/siana`
+ * and `bin/siana-watch` ask this of their own records and ask it the same way. */
+function processCommand(pid) {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'command='],
+                        { encoding: 'utf8', timeout: 10_000 }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function claimPath(home) {
+  return path.join(home, CLAIM_DIR, CLAIM);
+}
+
+/** The recorded claim, or null when there is none.
+ *
+ * A record that will not read refuses rather than reading as absent. "No console"
+ * and "a console whose record nobody can read" call for opposite things, and
+ * guessing the first is how a second console comes up beside a first that is still
+ * serving the port both believe they own. */
+function readClaim(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    die(`the console claim at ${file} cannot be read: ${e.message}`,
+        'nothing here can say whether a console is already holding that port;',
+        'read that file, then remove it and start again');
+  }
+  let rec = null;
+  try {
+    rec = JSON.parse(text);
+  } catch {
+    rec = null;
+  }
+  // Checked rather than trusted, and the check is what makes the reclaim below
+  // safe: everything past here has a pid to signal and a command to compare, so a
+  // record that is taken over is one this could actually prove had stopped.
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)
+      || !Number.isInteger(rec.pid) || rec.pid < 1
+      || typeof rec.command !== 'string' || !rec.command) {
+    die(`the console claim at ${file} is not a record this wrote`,
+        'it names no pid and command that could be checked against a running',
+        'process, so nothing here can say whether a console still holds that port;',
+        'read that file, then remove it and start again');
+  }
+  return rec;
+}
+
+/** Whether the recorded process is still that console, and why not when it is not.
+ *
+ * Three answers rather than two, and the third is the point. `live` and `stale` are
+ * the ones `bin/siana-watch` draws, and a watcher treats everything it cannot
+ * confirm as stale. A console must not: taking over a claim whose holder is in fact
+ * still running is the second console this record exists to prevent, and a `ps`
+ * that answers nothing about a pid that is demonstrably alive has established
+ * nothing either way. So that case is `unsure`, and `unsure` refuses. */
+function claimHolder(rec) {
+  try {
+    process.kill(rec.pid, 0);
+  } catch (e) {
+    if (e.code === 'ESRCH') {
+      return { verdict: 'stale', why: `pid ${rec.pid} is gone` };
+    }
+    if (e.code !== 'EPERM') {
+      return { verdict: 'unsure',
+               why: `pid ${rec.pid} cannot be asked about: ${e.message}` };
+    }
+    // EPERM is alive and someone else's, which the command below settles.
+  }
+  const seen = processCommand(rec.pid);
+  if (!seen) {
+    return { verdict: 'unsure',
+             why: `pid ${rec.pid} is alive and \`ps\` will not say what it is` };
+  }
+  if (seen !== rec.command) {
+    return { verdict: 'stale',
+             why: `pid ${rec.pid} is now ${seen}, not the process that recorded it` };
+  }
+  return { verdict: 'live', why: '' };
+}
+
+/** Record this process as the console, and refuse when another one holds the claim.
+ *
+ * `link` is atomic and refuses an existing destination, so two consoles started
+ * together cannot both come away believing they own the port. Two would be two
+ * listeners racing for one address, with the captain reaching whichever won and no
+ * record saying which that was.
+ *
+ * Nothing here kills or replaces a process. The worst outcome available to a
+ * recovery that guessed is a live console taken over by a second one, so every
+ * path that cannot prove the holder has stopped refuses and says what it saw. */
+function claimConsole(home, port) {
+  const dir = path.join(home, CLAIM_DIR);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    die(`${dir} cannot be made: ${e.message}`,
+        'the console records the port it owns there before it binds it');
+  }
+  const file = claimPath(home);
+  const command = processCommand(process.pid);
+  if (!command) {
+    die(`\`ps\` says nothing about this process (pid ${process.pid})`,
+        'the record names what this process is so that a later process wearing the',
+        'same pid cannot be mistaken for a live console; without it, nothing could',
+        'tell them apart, and a claim nobody can verify is worse than no claim');
+  }
+  const held = readClaim(file);
+  if (held) {
+    const { verdict, why } = claimHolder(held);
+    if (verdict === 'live') {
+      die(`a console is already running (pid ${held.pid}, port ${held.port})`,
+          'two would own the same loopback port and only one could bind it, so the',
+          `captain would reach whichever won; stop that one, or read ${file}`);
+    }
+    if (verdict === 'unsure') {
+      die(`the console claim at ${file} cannot be verified: ${why}`,
+          'a claim that cannot be proved stale is never taken over: doing that',
+          'while the recorded console is still serving is the second console this',
+          `record exists to prevent; read ${file}, then start again`);
+    }
+    // The record it left is the only account of what stopped it, so it is said
+    // here rather than quietly overwritten.
+    process.stderr.write(`replaced a console claim that had stopped: ${why}\n`);
+    try {
+      fs.unlinkSync(file);
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        die(`the stopped console claim at ${file} cannot be removed: ${e.message}`);
+      }
+    }
+  }
+  // Staged beside its destination and linked into place, so the file is never
+  // visible half-written - which a reader would take for a record it cannot parse
+  // and refuse on. Named by pid, because two consoles starting together must not
+  // stage over each other.
+  const tmp = `${file}.${process.pid}.tmp`;
+  const record = { state: 'running', pid: process.pid, command, host: HOST, port,
+                   started: stamp() };
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`);
+  } catch (e) {
+    remove(tmp);
+    die(`the console claim cannot be staged at ${tmp}: ${e.message}`);
+  }
+  let failure = null;
+  try {
+    fs.linkSync(tmp, file);
+  } catch (e) {
+    failure = e;
+  }
+  // Before the refusal and not in a `finally`, because `process.exit` does not
+  // unwind: a `die` below would leave the staged file behind for good.
+  remove(tmp);
+  if (failure) {
+    if (failure.code === 'EEXIST') {
+      die('another console claimed the record while this one was starting',
+          'nothing was started here; read the claim to see which one is running');
+    }
+    die(`the console claim at ${file} cannot be written: ${failure.message}`);
+  }
+  return file;
+}
+
+function remove(file) {
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    // Already gone, which is the state this was asking for.
+  }
+}
+
+/** Withdraw the claim, and only when it is this process's own.
+ *
+ * A claim naming another pid belongs to another console. Removing it on the way
+ * out - after losing a link race, or after failing to bind - would leave a running
+ * console with no record of the port it owns, and the next one to start would find
+ * nothing in its way. */
+function releaseClaim(file) {
+  let rec;
+  try {
+    rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return;
+  }
+  if (!rec || rec.pid !== process.pid) return;
+  remove(file);
+}
+
+
+// -------------------------------------------------------------- the snapshot
+
+/** One `siana-read` call, and everything it said.
+ *
+ * Never rejects. A source that could not be run is a fact about that source, and
+ * the other five have to arrive anyway: a snapshot that failed whole because herdr
+ * is down would hide the queue, which is the part the captain can still act on.
+ *
+ * The document is relayed whole, whatever the exit code. `siana-read` refuses in
+ * JSON too, and its refusals do not share a top-level shape - `fleet` says
+ * `state: "unknown"` with no `error` key at all - so the exit code is the verdict
+ * and no field of the document is read here. `error` below is this process's own,
+ * and is set only when there is no document to relay at all.
+ */
+function readSource(name, home) {
+  return new Promise((resolve) => {
+    const command = [READ, name];
+    const result = { source: name, command, observed: stamp(), exit: null,
+                     signal: null, document: null, stderr: null, error: null };
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    let child;
+    try {
+      child = spawn(READ, [name], {
+        // The console's own home, passed on rather than assumed, so both halves of
+        // the boundary answer about the same fleet.
+        env: { ...process.env, SIANA_HOME: home },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      result.error = { code: 'SPAWN_FAILED',
+                       message: `${command.join(' ')} could not be run: ${e.message}` };
+      finish();
+      return;
+    }
+
+    let out = '';
+    let err = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, READ_TIMEOUT_MS);
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+
+    child.on('error', (e) => {
+      // Guarded, and so is `close`: node emits both for a spawn that failed, and
+      // `result` is the object this promise already resolved with. A second
+      // handler writing to it after the fact would rewrite an answer the caller
+      // may already have read.
+      if (settled) return;
+      clearTimeout(timer);
+      result.error = e.code === 'ENOENT'
+        ? { code: 'NO_SIANA_READ',
+            message: `${READ} is not on PATH, so nothing here can read the fleet` }
+        : { code: 'SPAWN_FAILED',
+            message: `${command.join(' ')} could not be run: ${e.message}` };
+      finish();
+    });
+
+    child.on('close', (code, signal) => {
+      if (settled) return;
+      clearTimeout(timer);
+      result.exit = code;
+      result.signal = signal || null;
+      result.stderr = err.trim() ? clip(err) : null;
+      if (timedOut) {
+        result.error = {
+          code: 'TIMEOUT',
+          message: `${command.join(' ')} did not answer within `
+                   + `${READ_TIMEOUT_MS / 1000}s`,
+        };
+      } else if (signal) {
+        result.error = { code: 'KILLED',
+                         message: `${command.join(' ')} was killed by ${signal}` };
+      } else {
+        parseInto(result, command, out);
+      }
+      finish();
+    });
+  });
+}
+
+function parseInto(result, command, out) {
+  let doc;
+  try {
+    doc = JSON.parse(out);
+  } catch (e) {
+    result.error = { code: 'BAD_JSON',
+                     message: `${command.join(' ')} did not answer with JSON: `
+                              + `${e.message}`,
+                     stdout: clip(out) };
+    return;
+  }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    result.error = { code: 'NOT_A_DOCUMENT',
+                     message: `${command.join(' ')} answered with `
+                              + `${Array.isArray(doc) ? 'an array' : typeof doc}, `
+                              + 'not a document',
+                     stdout: clip(out) };
+    return;
+  }
+  result.document = doc;
+}
+
+/** JSON with every object's keys in one order, so two equal snapshots hash equal.
+ *
+ * `JSON.stringify` keeps insertion order, and the sources are read in parallel, so
+ * without this the revision would depend on which subprocess answered first. */
+function stable(value) {
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort()
+      .map((k) => `${JSON.stringify(k)}:${stable(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** The snapshot with its observation times taken out, which is what the revision is
+ * computed over.
+ *
+ * A revision is a cache validator: it answers "has anything moved", and it has to
+ * answer that the same way twice when nothing has. When it asked is not something
+ * that moved. Left in, every request would mint a new revision, `204` would be
+ * unreachable, the stream would announce a change every two seconds, and a console
+ * restarted against untouched stores would look like a fleet that had changed.
+ *
+ * Only the document's own top level is stripped, never recursively: a decision
+ * record carries an `at` of its own, and that one is the fleet's history rather
+ * than this process's clock.
+ */
+function authoritative(sources) {
+  const out = {};
+  for (const [name, r] of Object.entries(sources)) {
+    const { observed, document, ...rest } = r;
+    if (document && typeof document === 'object' && !Array.isArray(document)) {
+      const { at, ...content } = document;
+      out[name] = { ...rest, document: content };
+    } else {
+      out[name] = { ...rest, document };
+    }
+  }
+  return out;
+}
+
+function revisionOf(sources) {
+  return crypto.createHash('sha256').update(stable(authoritative(sources)))
+    .digest('hex');
+}
+
+/** Every source, read in parallel, as one versioned document.
+ *
+ * Nothing is cached between calls. The stores are the truth, `siana-read` is the
+ * only thing that reads them, and a snapshot kept in memory here would be a second
+ * account of the fleet that could disagree with the first.
+ */
+async function snapshot(home) {
+  const results = await Promise.all(SOURCES.map((name) => readSource(name, home)));
+  const sources = {};
+  for (const r of results) sources[r.source] = r;
+  return { console: 'siana-console', home, observed: stamp(),
+           revision: revisionOf(sources), sources };
+}
+
+
+// ------------------------------------------------------------------- serving
+
+function refuse(res, status, code, message, headers) {
+  const body = `${JSON.stringify({ error: message, code }, null, 2)}\n`;
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Length': Buffer.byteLength(body),
+    ...headers,
+  });
+  res.end(body);
+}
+
+async function serveState(req, res, url, home) {
+  const doc = await snapshot(home);
+  // The caller's revision, as a cache validator and never as authority. A match
+  // says only that nothing this can see has moved, so the answer is "no new body"
+  // and never "this is the state": the body it already holds is the state, and it
+  // came from here.
+  if (url.searchParams.get('rev') === doc.revision) {
+    res.writeHead(204, { 'Cache-Control': 'no-store' });
+    res.end();
+    return;
+  }
+  const body = `${JSON.stringify(doc, null, 2)}\n`;
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+/** Server-sent events, carrying revisions and never state.
+ *
+ * The stream is an optimisation and nothing else: it says a new revision exists,
+ * and the client fetches `/api/state` for it. A client that never connects, or
+ * whose connection drops and stays dropped, is not missing anything - the state
+ * endpoint is complete on its own, which is what stops this becoming a second
+ * source of fleet truth that a reconnect has to reconcile against the first.
+ *
+ * No event carries an `id`, deliberately. An id is what makes a browser send
+ * `Last-Event-ID` on reconnect, and answering that honestly would mean keeping a
+ * replay log of revisions here. There is nothing to replay: reconnecting clients
+ * are told the current revision, which is the only one that matters.
+ */
+function serveStream(req, res, url, home) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-store',
+    Connection: 'keep-alive',
+  });
+  // Sent at once so that a client is never left waiting on a fleet that is simply
+  // not changing, and so that the response head reaches it before any framing does.
+  res.write(': connected\n\n');
+  clients.add(res);
+  res.on('close', () => {
+    clients.delete(res);
+    if (!clients.size) stopWatching();
+  });
+  if (lastRevision) send(res, lastRevision);
+  startWatching(home);
+}
+
+function send(res, revision) {
+  try {
+    res.write(`event: state\ndata: ${JSON.stringify({ revision })}\n\n`);
+  } catch {
+    clients.delete(res);
+  }
+}
+
+function broadcast(text) {
+  for (const res of [...clients]) {
+    try {
+      res.write(text);
+    } catch {
+      clients.delete(res);
+    }
+  }
+}
+
+/** Poll only while somebody is listening. The console reads six subprocesses per
+ * tick, and doing that forever for nobody is a process that costs the machine
+ * something for no reader at all. */
+function startWatching(home) {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => poll(home), POLL_MS);
+  beatTimer = setInterval(() => broadcast(': heartbeat\n\n'), HEARTBEAT_MS);
+  poll(home);
+}
+
+function stopWatching() {
+  clearInterval(pollTimer);
+  clearInterval(beatTimer);
+  pollTimer = null;
+  beatTimer = null;
+  lastRevision = null;
+}
+
+async function poll(home) {
+  // One read at a time. A source held up for longer than a tick would otherwise
+  // start a second set of six subprocesses on top of the first, and a slow store
+  // would multiply them for as long as it stayed slow.
+  if (polling || !clients.size) return;
+  polling = true;
+  try {
+    const { revision } = await snapshot(home);
+    // Checked again: the last client may have gone while this was reading, and
+    // recording a revision nobody was told about would leave the next client
+    // connecting into silence.
+    if (!clients.size) return;
+    if (revision !== lastRevision) {
+      lastRevision = revision;
+      broadcast(`event: state\ndata: ${JSON.stringify({ revision })}\n\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`the state could not be read for the stream: ${e}\n`);
+  } finally {
+    polling = false;
+  }
+}
+
+async function handle(req, res, home) {
+  // Origin-form only, and checked before anything is parsed. A request target that
+  // carries its own authority makes `URL` discard the base and read the authority
+  // out of the target instead, so `//evil.com/api/state`, `/\evil.com/api/state`
+  // and the absolute form a proxy sends all arrive with pathname `/api/state` and
+  // would be routed as if that is what had been asked for. Nothing here opens a
+  // file, so today that would only mean the same snapshot under a name nobody
+  // asked for - but this table is what a later slice serves a bundle from, and a
+  // route table keyed on a path that was never in the request is not one.
+  if (!req.url.startsWith('/') || req.url[1] === '/' || req.url[1] === '\\') {
+    refuse(res, 400, 'BAD_TARGET',
+           `${req.url} is not a path; this serves origin-form requests only`);
+    return;
+  }
+  // Parsed by `URL` rather than split by hand: it resolves `.` and `..` segments
+  // before anything is compared, and it leaves percent-encoding alone, so
+  // `/%61pi/state` stays unequal to `/api/state` instead of being decoded into it.
+  // A path is one of two constants or it is a refusal, so traversal has nothing to
+  // reach even when it parses.
+  let url;
+  try {
+    url = new URL(req.url, `http://${HOST}`);
+  } catch {
+    refuse(res, 400, 'BAD_REQUEST', `${req.url} is not a path this can read`);
+    return;
+  }
+  const route = ROUTES[url.pathname];
+  if (!route) {
+    refuse(res, 404, 'NO_ROUTE',
+           `${url.pathname} is not served; this serves `
+           + `${Object.keys(ROUTES).join(' and ')}`);
+    return;
+  }
+  if (req.method !== 'GET') {
+    // Every other method, HEAD included. This console has no write endpoint, and
+    // a method it answered would be the first thing a later slice's reader assumed
+    // it could rely on.
+    refuse(res, 405, 'BAD_METHOD',
+           `${req.method} is not served; this console reads, so it serves GET`,
+           { Allow: 'GET' });
+    return;
+  }
+  await route(req, res, url, home);
+}
+
+
+// ---------------------------------------------------------------- the process
+
+function shutdown(signal, server, claim) {
+  if (stopping) return;
+  stopping = true;
+  // Accepting stops first, so nothing new arrives while the streams are being
+  // closed and the claim withdrawn.
+  server.close();
+  stopWatching();
+  for (const res of [...clients]) {
+    try {
+      res.end();
+    } catch {
+      // The client is gone, which is the state this was asking for.
+    }
+  }
+  clients.clear();
+  server.closeAllConnections();
+  // A record left behind names a port nothing is serving, and the next console to
+  // start would have to prove this one dead before it could take it.
+  releaseClaim(claim);
+  process.stdout.write(`\nstopped on ${signal}; the fleet is unchanged\n`);
+  process.exit(0);
+}
+
+function main() {
+  const home = homeDir();
+  const port = configuredPort();
+  // Claimed before the listener, because the claim is what says this port is
+  // owned: binding first would leave a window in which a second console found no
+  // record, bound nothing, and reported success.
+  const claim = claimConsole(home, port);
+
+  const server = http.createServer((req, res) => {
+    handle(req, res, home).catch((e) => {
+      process.stderr.write(`${req.method} ${req.url} failed: ${e.stack || e}\n`);
+      if (!res.headersSent) {
+        refuse(res, 500, 'CONSOLE_FAILED',
+               `the console could not answer ${req.method} ${req.url}: ${e.message}`);
+      } else {
+        res.destroy();
+      }
+    });
+  });
+
+  server.on('error', (e) => {
+    // Only this process's own claim, so a bind that lost to a console already on
+    // the port leaves that console's record exactly where it was.
+    releaseClaim(claim);
+    die(`${HOST}:${port} cannot be served: ${e.message}`,
+        'nothing is listening and the claim this start made has been released');
+  });
+
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.on(signal, () => shutdown(signal, server, claim));
+  }
+
+  server.listen(port, HOST, () => {
+    const at = server.address();
+    process.stdout.write(
+      `serving  http://${at.address}:${at.port}/api/state\n`
+      + `         http://${at.address}:${at.port}/api/stream\n`
+      + `reading  ${READ} against ${home}\n`
+      + `claim    ${claim}\n`);
+  });
+}
+
+main();

@@ -17,6 +17,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,6 +79,33 @@ class HomeTest(unittest.TestCase):
         for name in names:
             shutil.copy(os.path.join(TEMPLATE, f"schema-{name}.yaml"),
                         self.at(f"schema-{name}.yaml"))
+
+    def older_contract(self, name, field):
+        """One field taken back out of a contract this home already has.
+
+        Neither `init` nor `upgrade` ever rewrites a live contract, because a field
+        dropped from one makes every record still carrying it unreadable. So a home
+        installed before a field was added still has a contract without it after the
+        documented upgrade, and that is a state the fleet has to keep working in.
+
+        Built by removing the field from the distro's own template rather than by
+        writing a contract here, so every other field stays declared exactly as the
+        real store declares it and only the one under test is missing. The removal
+        is asserted, because a fixture that quietly stopped removing anything would
+        leave every test using it passing about nothing."""
+        path = self.at(f"schema-{name}.yaml")
+        with open(path) as fh:
+            lines = fh.read().splitlines(True)
+        keep, dropping = [], False
+        for line in lines:
+            if re.match(r"^  [a-z_]+:", line):
+                dropping = line.startswith(f"  {field}:")
+            if not dropping:
+                keep.append(line)
+        with open(path, "w") as fh:
+            fh.writelines(keep)
+        with open(path) as fh:
+            self.assertNotIn(field, fh.read())
 
     def template(self, *names):
         for name in names:
@@ -204,6 +232,13 @@ class HomeTest(unittest.TestCase):
         # one place a suite must not disagree with itself. The test of that refusal
         # sets the variable back, deliberately.
         e.pop("SIANA_TASK_ID", None)
+        # The suite's own tests run inside a worker of `tests/run.py`, which marks
+        # its workers with this. Left in, a command under test that is itself a run
+        # of the suite would start in worker mode and sit waiting on a coordinator
+        # that is never going to talk to it. `tests/test_run.py` is where that
+        # happens, and a hang there would be a hang in the runner's own tests.
+        e.pop("SIANA_TEST_WORKER", None)
+        e.pop("SIANA_TEST_SYSPATH", None)
         e.update(extra or {})
         return e
 

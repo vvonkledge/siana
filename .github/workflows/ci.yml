@@ -28,7 +28,11 @@ jobs:
     # Named for the command it runs, so a red check tells you what to run locally.
     name: just test
     runs-on: ubuntu-latest
-    # The suite takes three or four minutes. This is a hang guard, not a budget.
+    # A hang guard, not a budget, and deliberately far above what the suite costs.
+    # `tests/run.py` runs the suite across a pool sized from the runner's core
+    # count, and prints that size on its first line, so a run that got slower says
+    # how many workers it had. The serial figure this has to stay clear of is the
+    # one to reason with: 696s here, on x86_64, before there was a pool at all.
     timeout-minutes: 15
 
     env:

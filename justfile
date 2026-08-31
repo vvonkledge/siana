@@ -265,7 +265,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-semantic; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-console siana-semantic; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -329,12 +329,15 @@ upgrade: _initialized init
     done
 
     # The registry's records are the captain's data and never the distro's, so an
-    # upgrade has nothing to say about them. Neither contract is rewritten either: a
-    # field dropped from a live contract makes every record still carrying it
-    # unreadable, so a contract only ever grows, by hand, once the captain has seen
-    # what it would cost. Task-contract drift is reported by `_contract-drift`;
-    # project-contract drift announces itself, because `datafile` names the field it
-    # rejected and `siana` refuses to start on a registry it cannot read.
+    # upgrade has nothing to say about them. No contract is rewritten either: a field
+    # dropped from a live contract makes every record still carrying it unreadable,
+    # so a contract only ever grows, by hand, once the captain has seen what it would
+    # cost. `_contract-drift` reports every contract that has drifted, above, because
+    # this recipe reaches it through `init` - and it is what announces
+    # project-contract drift now that `siana` starts on a home whose contract
+    # predates `automerge` instead of refusing. `siana` says it again in a `stale`
+    # line at every start, so the captain meets it where the setting they cannot make
+    # would be made, and `datafile` still names the field it rejected at the write.
     echo "kept     $home/projects.jsonl (the captain's registry)"
     for c in schema-projects schema-obligations schema-decisions schema-semantic schema-tasks; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
@@ -438,12 +441,22 @@ _contract-drift:
 # Run the distro's tests. Pass unittest arguments through: `just test -v`, or
 # `just test -k slug` for one rule.
 #
-# Through `tests/run.py` rather than `-m unittest` directly, because unittest's own
-# progress is dots with no newline until the summary and a line-oriented reader -
-# the GitHub Actions runner is one - shows none of it. Three CI runs on this project
-# were killed by the hang guard having printed nothing at all. That file is the whole
-# of the difference: a line per test before it runs, and a watchdog that dumps every
-# thread's stack rather than letting a stall eat the job's wall clock in silence.
+# Through `tests/run.py` rather than `-m unittest` directly, for two reasons.
+#
+# unittest's own progress is dots with no newline until the summary, and a
+# line-oriented reader - the GitHub Actions runner is one - shows none of it. Three
+# CI runs on this project were killed by the hang guard having printed nothing at
+# all. So: a line per test before it runs, and a watchdog that dumps every thread's
+# stack rather than letting a stall eat the job's wall clock in silence.
+#
+# And the suite is latency-bound rather than CPU-bound - measured at 0.75 of one
+# core for its whole length - so it is run across a pool of worker processes. See
+# `tests/run.py` for how the pool is sized and why one worker is the control.
+#
+#     SIANA_TEST_WORKERS=1 just test      unittest, serially, in one process
+#
+# That is the mode to reach for when a failure looks like it might be the pool's
+# fault rather than the code's, and it is the control every timing here is against.
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -458,8 +471,9 @@ test *args:
     # directly never writes its own, and the `bin/` commands import stdlib only. What
     # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
     # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner, against a suite that already takes three or four minutes.
-    # Invisible locally, where the captain's uv cache is already warm.
+    # on a cold runner. Invisible locally, where the captain's uv cache is already
+    # warm, and worse than it looks now that a warm run is minutes rather than ten of
+    # them: the pool shortens the wall clock and changes none of that cost.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`
@@ -510,6 +524,13 @@ doctor: _contract-drift
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
     done
+    # What `siana-console` runs on, and the only thing here that needs it. Absent is
+    # a console this captain cannot start rather than a fault, and it is said in
+    # those words: reported as `missing` beside `tasks` it would read as a broken
+    # install on every machine that has never wanted a console.
+    p="$(command -v node || true)"
+    if [ -n "$p" ]; then echo "  ok      node -> $p"
+    else echo "  none    node (only siana-console needs it)"; fi
     # What `siana` can start in. A harness needs both the command and the queue
     # integration `init` wrote into this home for it, so they are reported as the
     # one fact they make: a session started with either half missing has no fleet
@@ -642,7 +663,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-semantic; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-console siana-semantic; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"
