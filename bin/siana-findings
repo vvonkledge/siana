@@ -283,6 +283,32 @@ def store_blob(home: str, source: str, sha: str) -> bool:
     return True
 
 
+# What to say when a store tool is not installed. A home without one is a state this
+# distro models - `just doctor` prints `missing datafile` for it - and every other
+# store reader in bin/ refuses it by name rather than raising.
+NOT_ON_PATH = {
+    "datafile": ("it is what enforces this store's contract; without it nothing here"
+                 " can be written or read back",
+                 "run `just init` in the distro"),
+    "tasks": ("it is what holds the queue this archive removes from",
+              "the ledger already holds whatever was written, so re-running this"
+              " plan once it is installed is safe",
+              "run `just init` in the distro"),
+}
+
+
+def run_tool(argv):
+    """Every call out to `datafile` or `tasks`, with the one refusal they share.
+
+    Written once rather than at each call site because one of them is reached after
+    the ledger writes have already landed: without a guard there, the archive's only
+    account of the step that removes queue records would end in a stack trace."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die(f"{argv[0]} is not on PATH", *NOT_ON_PATH[argv[0]])
+
+
 def git(path: str, *args: str):
     """git, run in `path`. Returns the completed process, decided by the caller:
     most of these are questions whose "no" is an ordinary answer."""
@@ -877,9 +903,7 @@ def contract_issues(store: str, schema: str):
     needs in order to go and look."""
     if not os.path.isfile(store):
         return []
-    proc = subprocess.run(
-        ["datafile", "-f", store, "-c", schema, "validate", "--strict"],
-        capture_output=True, text=True, check=False)
+    proc = run_tool(["datafile", "-f", store, "-c", schema, "validate", "--strict"])
     if proc.returncode == 0:
         return []
     out, keep = [], False
@@ -1136,15 +1160,8 @@ def write_record(store: str, schema: str, record):
     contract that the queue and the registry pass through the same code. Writing the
     JSONL line here would be a second writer, and a second writer is a second set of
     rules."""
-    try:
-        proc = subprocess.run(
-            ["datafile", "-f", store, "-c", schema, "put", json.dumps(record)],
-            capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        die("datafile is not on PATH",
-            "it is what enforces this store's contract; without it nothing is"
-            " written",
-            "run `just init` in the distro")
+    proc = run_tool(["datafile", "-f", store, "-c", schema, "put",
+                     json.dumps(record)])
     if proc.returncode != 0:
         die(f"the ledger refused {record.get('id')}",
             *(proc.stdout + proc.stderr).strip().splitlines()[:6])
@@ -1158,9 +1175,7 @@ def read_back(store: str, schema: str, record):
     it. A record the store did not keep, or kept differently, stops the archive here
     - with the queue still holding every task, which is the safe direction."""
     rid = record.get("id")
-    proc = subprocess.run(
-        ["datafile", "-f", store, "-c", schema, "get", rid, "--json"],
-        capture_output=True, text=True, check=False)
+    proc = run_tool(["datafile", "-f", store, "-c", schema, "get", rid, "--json"])
     if proc.returncode != 0:
         die(f"the ledger will not read {rid} back",
             *(proc.stdout + proc.stderr).strip().splitlines()[:6],
@@ -1186,10 +1201,8 @@ def drop(tasks_file: str, task_id: str, record_id: str):
     `tasks drop` on an absent task reports `absent` and exits 0, which is what makes
     a re-run after a partial pass converge instead of stopping on the ones it
     already removed."""
-    proc = subprocess.run(
-        ["tasks", "--file", tasks_file, "drop", task_id,
-         "--reason", f"archived to the findings ledger as {record_id}"],
-        capture_output=True, text=True, check=False)
+    proc = run_tool(["tasks", "--file", tasks_file, "drop", task_id,
+                     "--reason", f"archived to the findings ledger as {record_id}"])
     if proc.returncode != 0:
         die(f"the queue refused to drop {task_id}",
             *(proc.stdout + proc.stderr).strip().splitlines()[:6],

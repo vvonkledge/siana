@@ -831,7 +831,7 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-Those four runs are that head's, and that head had 912 tests. This tree has 1491, so
+Those four runs are that head's, and that head had 912 tests. This tree has 1494, so
 expect longer on the one you are standing on: measured here, about six minutes from the
 default pool on a quiet eleven-core box, about eight and a half with other work running
 alongside it, and about nine and a half at the three workers a four-core runner gets.

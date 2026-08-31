@@ -1127,6 +1127,44 @@ class Unverifiable(Ledger):
         self.assertNotIn("failed", out)
 
 
+class MissingTools(Ledger):
+    """A home where a store tool is not installed. `just doctor` prints `missing
+    datafile` for exactly this, and every other store reader in bin/ refuses it by
+    name rather than raising."""
+
+    def without(self, name, *args):
+        return self.run_bin("siana-findings", *args,
+                            env={"PATH": self.path_without(name)})
+
+    def test_reading_without_datafile_refuses_rather_than_raising(self):
+        self.archived()
+        out = self.assertRefused(self.without("datafile", "verify"),
+                                 "datafile is not on PATH")
+        self.assertNotIn("Traceback", out)
+
+    def test_archiving_without_datafile_refuses_before_any_write(self):
+        out = self.assertRefused(self.without("datafile", "archive", "--plan",
+                                              self.plan()),
+                                 "datafile is not on PATH")
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(self.ledger_lines(), [])
+
+    def test_archiving_without_tasks_refuses_after_the_writes_and_says_so(self):
+        # The one call reached after the ledger writes have landed, which is why a
+        # traceback there would take the place of the archive's only account of the
+        # step that removes queue records.
+        out = self.assertRefused(self.without("tasks", "archive", "--plan",
+                                              self.plan()),
+                                 "tasks is not on PATH")
+        self.assertNotIn("Traceback", out)
+        self.assertIn("re-running this plan", out)
+        self.assertEqual(len(self.ledger_lines()), 1)
+        # And the state it left is the ordinary crash window: the ledger holds the
+        # case, the queue still holds its task, and re-running clears it.
+        self.assertEqual(self.record("qa-one")["status"], "blocked")
+        self.assertIn("dropped  qa-one", self.archived())
+
+
 class Pure(unittest.TestCase):
     """The parts that are pure functions of their inputs, driven directly."""
 
