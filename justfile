@@ -561,8 +561,8 @@ doctor: _contract-drift
     # The browser application, which is built rather than committed. Absent is a
     # console that serves its API and no page, which is a real thing to be told
     # before the captain opens one on a phone and finds nothing there.
-    if [ -f "$PWD/console/dist/index.html" ]; then
-        echo "  ok      console app -> $PWD/console/dist"
+    if [ -f '{{justfile_directory()}}/console/dist/index.html' ]; then
+        echo "  ok      console app -> {{justfile_directory()}}/console/dist"
     else
         echo "  none    console app (run \`just build\`; siana-console serves the API"
         echo "                       and says it has no application to serve)"

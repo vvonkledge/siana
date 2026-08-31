@@ -163,13 +163,38 @@ class Doctor(Recipe):
         self.assertIn("none    node (only siana-console needs it)", out.stdout)
         self.assertNotIn("missing node", out.stdout)
 
+    @unittest.skipUnless(has("npm"), "the browser application is built with npm")
     def test_the_browser_application_is_reported_when_it_has_been_built(self):
-        # `just test` builds it, so any run of this suite has one. What matters is
-        # that the captain can find out from `doctor` whether the console has a page
-        # to serve, rather than by opening one on a phone and finding nothing.
+        # What matters is that the captain can find out from `doctor` whether the
+        # console has a page to serve, rather than by opening one on a phone and
+        # finding nothing.
+        #
+        # Skipped without npm, because `just build` deliberately builds nothing on a
+        # machine that has none and doctor then reports the other branch below. The
+        # rest of this distro does not need npm and must not go red for wanting one.
+        dist = os.path.join(DISTRO, "console", "dist")
+        if not os.path.isdir(dist):
+            self.fail(f"{dist} holds no build, and npm is installed on this machine,"
+                      " so `just build` should have made one. Run `just test`, which"
+                      " builds first, rather than the suite directly.")
         out = self.just("doctor").stdout
         self.assertIn("ok      console app -> ", out)
-        self.assertIn(os.path.join(DISTRO, "console", "dist"), out)
+        self.assertIn(dist, out)
+
+    def test_a_checkout_with_nothing_built_is_not_a_broken_install(self):
+        """An unbuilt application is a console with no page, not a fault.
+
+        Reported as `missing` beside `tasks` it would read as a broken install on
+        every machine that has never wanted a console, and `doctor` crying wolf once
+        is `doctor` nobody reads twice. The console itself drives this branch for
+        real - `tests/test_console.NoApplication` starts one with no bundle beside it
+        - and what is checked here is the one line doctor says about it, which no
+        machine that can run this suite through `just test` still has.
+        """
+        with open(os.path.join(DISTRO, "justfile")) as fh:
+            recipe = fh.read()
+        self.assertIn(r"none    console app (run \`just build\`", recipe)
+        self.assertNotIn("missing console app", recipe)
 
     def test_an_empty_store_is_a_zero_and_never_a_fault(self):
         # datafile writes the .jsonl on the first append, so absent-with-a-contract

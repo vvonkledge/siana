@@ -830,7 +830,9 @@ ever changed.
     SIANA_CONSOLE_PORT=8787 siana-console
 
 Then open `http://127.0.0.1:8787/` on this machine, or add it to a phone's home
-screen over the same loopback address.
+screen over the same loopback address. **That exact address, and not `localhost`:**
+the console answers to the name it binds and refuses every other one, for the reason
+below.
 
 `siana-read` answers one question and exits, which a phone cannot run. This is the
 smallest process that puts those same documents on a socket, and serves the
@@ -850,8 +852,17 @@ Read what it is before you run it:
   that moves it. Nothing else on your network can reach it.
 - **Unauthenticated.** Anything already running on this machine as you can read it.
   That is the same reach that anything running as you already has over the home
-  itself, so it adds nothing locally and would add everything remotely, which is why
-  the address is not configurable.
+  itself, and it is the whole of what it adds - which is why the address is not
+  configurable and why the name below is checked.
+- **Addressed by name.** Binding loopback stops another machine reaching it. It does
+  not stop a web page: any site you visit can point its own hostname at `127.0.0.1`,
+  have your browser connect here, and then read every task, obligation and decision
+  in your home, because the browser believes the answer came from that site. So the
+  console refuses any request whose `Host` is not the listener it bound, which is the
+  one header such a page cannot choose. `localhost` is deliberately not a second
+  accepted name: whether it even reaches this listener depends on how your machine
+  resolves it, and a second accepted name is a second thing to get wrong for no reach
+  the first does not already give.
 - **Read-only where it matters.** It has no write endpoint. Every request it serves
   reaches the fleet through `siana-read` and through nothing else, so no request can
   change an authoritative record. It writes one file of its own: the claim below.
@@ -860,7 +871,13 @@ Read what it is before you run it:
 `SIANA_CONSOLE_PORT` has no default, and the console refuses to start without it. A
 port every machine used would be a port something else is one day holding.
 
-It serves these and refuses everything else, every other method included:
+Every request is answered only if it was addressed to `127.0.0.1` at that port.
+Anything else - `localhost`, this machine's hostname, or a name a page on the
+internet resolved here - is refused with `403` and `BAD_HOST`, and the refusal says
+which address to open instead. Nothing is read before that check, so it covers the
+application and the API alike.
+
+Requests that pass it reach these and nothing else, every other method included:
 
     GET /                         the application
     GET /manifest.webmanifest     what makes it installable
