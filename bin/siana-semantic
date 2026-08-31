@@ -1340,11 +1340,17 @@ def cmd_status(args, home):
         if not os.path.exists(dispatched_marker(home, name)):
             # No claim was ever marked here. Ordinarily that is a dispatch that
             # refused before the queue claim and nothing to say anything about - but
-            # a task that has since gone terminal means either a run happened and
-            # the mark failed to be written, or the task was taken terminal by hand.
-            # Named, because the first of those is a run nobody will ever record and
-            # this is the only place it can be seen at all.
-            if status in OUTCOMES:
+            # for the live pin, a task that has since gone terminal means either a
+            # run happened and the mark failed to be written, or the task was taken
+            # terminal by hand. Named, because the first of those is a run nobody
+            # will ever record and this is the only place it can be seen at all.
+            #
+            # Only the live pin, because the queue's status is about the run that
+            # pin belongs to and a spent one belongs to an earlier attempt. An
+            # unclaimed pin gets rolled aside whenever its pack goes stale before
+            # anything is dispatched against it, which is ordinary and is not a hole
+            # in anything.
+            if name == pin["task"] and status in OUTCOMES:
                 unclaimed.append(name)
             continue
         # A spent pin - rolled aside when its task was dispatched again - is over,

@@ -1264,6 +1264,29 @@ class Status(SemanticTest):
         self.assertIn("terminal but never claimed", out)
         self.assertIn(self.TASK, out)
 
+    def test_a_spent_pin_nothing_claimed_is_not_a_hole_in_the_record(self):
+        # The ordinary roll-forward: a dispatch pinned, refused before the claim,
+        # and a later one found that pack outside its freshness window and exported
+        # afresh. No minion was ever claimed against the pin left behind, so there
+        # is no run and nothing to record - and saying otherwise would put a line on
+        # every `just doctor` from then on that nothing could ever clear.
+        self.bound()
+        self.queued()
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.plan(export=self.answer("pack export", self.export_result(
+            as_of="2026-09-02T09:00:12Z", observed_at="2026-09-02T06:00:00Z",
+            fresh_until="2026-09-03T06:00:00Z")))
+        self.assertAccepted(self.pin(as_of="2026-09-02T09:00:12Z"))
+        self.dispatched()
+        self.terminal(status="done")
+
+        out = self.sem("status")
+
+        self.assertNotIn("never claimed", out.stdout)
+        # And the two commands agree about that directory.
+        self.assertNotIn("LOST", self.sem("reconcile").stdout)
+
     def test_it_records_nothing_while_reporting(self):
         # Doctor runs this, so it has to be safe to run at any moment. It reads
         # configuration and pins, and it never asks the layer anything.
