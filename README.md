@@ -29,7 +29,7 @@ has been run on an operating system other than macOS.
 | `python3`  | 3.13.13    | every `siana-*` command that is not bash or node      |
 | `bash`     | 5.3.9      | `siana`, `siana-brief`, and the recipes in `justfile` |
 | `node`     | 26.7.0     | `siana-console` and its browser app; nothing else     |
-| `npm`      | 11.19.0    | `just build`, which builds that app; nothing else      |
+| `npm`      | 11.19.0    | `just build`, which builds that app; nothing else     |
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
 | `datafile` | 0.1.1      | every record store: queue, registry, obligations      |

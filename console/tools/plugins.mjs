@@ -84,6 +84,19 @@ function write(root, name, body) {
   writeFileSync(file, body);
 }
 
+/** One emitted file, rewritten, and whatever remote origin it still names. */
+function polish(outDir, name) {
+  const dot = name.lastIndexOf('.');
+  if (!TEXT.has(name.slice(dot))) return [];
+  const file = join(outDir, name);
+  let text = readFileSync(file, 'utf8');
+  for (const [pattern, replacement] of REWRITES) {
+    text = text.replace(pattern, replacement);
+  }
+  writeFileSync(file, text);
+  return remoteOrigins(text).map((origin) => `  ${name}: ${origin}`);
+}
+
 /** Every remote origin a file still names, after the rewrites above. */
 function remoteOrigins(text) {
   const found = new Set();
@@ -113,6 +126,13 @@ export function bundleTail() {
         write(outDir, name, drawIcon(size, options));
       }
 
+      // The remote-origin pass runs before the worker is written, not after: it
+      // rewrites bytes, and the worker's cache name is a hash of the bytes that are
+      // actually served. Reversed, the name would be computed over files the build
+      // was about to change.
+      const offenders = [];
+      for (const name of walk(outDir)) offenders.push(...polish(outDir, name));
+
       const files = walk(outDir);
       // The shell is what has to be there with no console to ask: the one application
       // path, the manifest, the icons, and the generated assets. `sw.js` is not in it
@@ -122,26 +142,24 @@ export function bundleTail() {
                      ...files.filter((f) => f.startsWith('assets/')
                        || f.startsWith('icons/')).map((f) => `/${f}`)];
       const source = readFileSync(join(root, 'src', 'sw.js'), 'utf8');
-      const cache = `siana-console-${createHash('sha256')
-        .update(shell.join('\n')).update(source).digest('hex').slice(0, 12)}`;
+      // Over the bytes of everything precached, and not only over their names. The
+      // script, the stylesheet and the icons carry content hashes in their names, but
+      // `index.html` and `manifest.webmanifest` do not: a change to a title, a meta
+      // tag or a manifest field would leave every name identical, leave `sw.js`
+      // byte-identical, and so never be installed by a browser - which would go on
+      // answering `/` cache-first out of the old cache, online as well as off.
+      const digest = createHash('sha256').update(source);
+      for (const path of shell) {
+        digest.update(path);
+        digest.update(readFileSync(join(outDir, path === '/' ? 'index.html'
+          : path.slice(1))));
+      }
+      const cache = `siana-console-${digest.digest('hex').slice(0, 12)}`;
       write(outDir, 'sw.js', source
         .replace("'__SIANA_SHELL__'", JSON.stringify(shell))
         .replace("'__SIANA_CACHE__'", JSON.stringify(cache)));
+      offenders.push(...polish(outDir, 'sw.js'));
 
-      const offenders = [];
-      for (const name of walk(outDir)) {
-        const dot = name.lastIndexOf('.');
-        if (!TEXT.has(name.slice(dot))) continue;
-        const file = join(outDir, name);
-        let text = readFileSync(file, 'utf8');
-        for (const [pattern, replacement] of REWRITES) {
-          text = text.replace(pattern, replacement);
-        }
-        writeFileSync(file, text);
-        for (const origin of remoteOrigins(text)) {
-          offenders.push(`  ${name}: ${origin}`);
-        }
-      }
       if (offenders.length) {
         throw new Error(
           'this build names an origin that is not this console:\n'

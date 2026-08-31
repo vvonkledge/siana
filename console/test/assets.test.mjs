@@ -19,11 +19,12 @@
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { DIST, built, go, load, opened, text, until } from './harness.mjs';
+import { DIST, ROOT, built, go, load, opened, text, until } from './harness.mjs';
 import { decision, obligation, project, snapshot, task } from './fixtures.mjs';
 
 /** XML namespace names. Identifiers that are spelled like URLs and compared as
@@ -224,4 +225,25 @@ test('the worker precaches the assets that were actually built', async (t) => {
   assert.ok(shell.includes(jsPath), 'the worker caches a script that is not this one');
   assert.ok(shell.includes(cssPath));
   assert.match(sw.match(/const CACHE = "([^"]*)";/)[1], /^siana-console-[0-9a-f]{12}$/);
+});
+
+test('the cache name follows every byte the worker precaches', async (t) => {
+  // A browser reinstalls a worker whose bytes changed and no other. `index.html` and
+  // the manifest have fixed names, so a cache named after the file names alone would
+  // never move when one of them was edited, and an installed console would go on
+  // answering the old shell cache-first - online as well as offline.
+  //
+  // Recomputed here rather than restated: this test knows what the name has to be
+  // from the files themselves, and it can only match a build that folded the same
+  // bytes in.
+  const { sw } = built();
+  const shell = JSON.parse(sw.match(/const SHELL = (\[[^\]]*\]);/)[1]);
+  const digest = createHash('sha256')
+    .update(readFileSync(join(ROOT, 'src', 'sw.js'), 'utf8'));
+  for (const path of shell) {
+    digest.update(path);
+    digest.update(readFileSync(join(DIST, path === '/' ? 'index.html' : path.slice(1))));
+  }
+  assert.equal(sw.match(/const CACHE = "([^"]*)";/)[1],
+               `siana-console-${digest.digest('hex').slice(0, 12)}`);
 });

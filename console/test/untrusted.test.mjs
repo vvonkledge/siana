@@ -91,25 +91,25 @@ test('no fleet string reaches an attribute that could fetch or navigate',
     }
   });
 
-test('a task id full of route characters cannot rewrite the route', async (t) => {
-  const page = await opened(t, {
-    snapshot: snapshot({
-      tasks: [task('a-task', { title: 'ordinary' })],
-    }),
+test('a task id full of route characters cannot steer the router', async (t) => {
+  // An id is what a link is built from, so the encoding around it is what stops a
+  // record from deciding which screen the captain lands on.
+  const nasty = snapshot({
+    tasks: [task('a-task')],
+    decisions: [decision('a-real-decision')],
   });
-  // The id here is what a link is built from, so the encoding is what stops a record
-  // from steering the router.
-  const nasty = snapshot({ tasks: [task('a-task')] });
   nasty.sources.tasks.document.records[0].id = '../../decisions';
-  nasty.revision = 'rev-2';
-  page.answer = async () => new Response(JSON.stringify(nasty),
-    { status: 200, headers: { 'content-type': 'application/json' } });
-  page.streams[0].connect();
-  page.streams[0].announce('rev-2');
-  await go(page, '#/');
-  const hrefs = [...page.document.querySelectorAll('main a')]
-    .map((node) => node.getAttribute('href'));
-  for (const href of hrefs) {
-    assert.doesNotMatch(href, /\.\./, `a record steered the router: ${href}`);
-  }
+  const page = await opened(t, { snapshot: nasty });
+  const href = [...page.document.querySelectorAll('main a')]
+    .map((node) => node.getAttribute('href'))
+    .find((found) => found.startsWith('#/task/'));
+  assert.ok(href, 'the record never reached the screen, so nothing was exercised');
+  assert.equal(href, '#/task/..%2F..%2Fdecisions');
+  await go(page, href);
+  // One segment, so it names that record and nothing else. The decision log is a
+  // screen away and stays there.
+  assert.equal(page.document.querySelector('header h1').textContent, 'Task');
+  const said = text(page);
+  assert.match(said, /\.\.\/\.\.\/decisions/, 'the id is shown, as the text it is');
+  assert.doesNotMatch(said, /a-real-decision/);
 });
