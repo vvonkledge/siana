@@ -578,6 +578,30 @@ class Status(Facts):
         self.assertIn("BROKEN  demo/x", out.stdout)
         self.assertIn("control character", out.stdout)
 
+    def test_a_record_that_would_forge_output_is_shown_and_cannot(self):
+        # This report is where a dispatch's refusal sends the captain, so the
+        # records it displays are exactly the ones that may have been hand-edited.
+        # A newline in a slug printed raw would write a second line that reads as
+        # another record's `ok`, or an escape sequence erasing the BROKEN lines.
+        self.store("facts.jsonl", {"id": "demo/x\ny", "project": "demo",
+                                   "slug": "x\ny", "kind": "text", "value": "ok",
+                                   "recorded": "2026-08-31T00:00:00Z"})
+        out = self.status()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("BROKEN  demo/x\\x0ay", out.stdout)
+        # One line for one record, still. The whole point.
+        self.assertEqual(len([line for line in out.stdout.splitlines()
+                              if line.startswith("  ")]), 1)
+
+    def test_the_list_cannot_be_forged_by_a_record_either(self):
+        self.store("facts.jsonl", {"id": "demo/x\ny", "project": "demo",
+                                   "slug": "x\ny", "kind": "text", "value": "ok",
+                                   "recorded": "2026-08-31T00:00:00Z"})
+        out = self.assertAccepted(self.fact("list"))
+        self.assertIn("demo/x\\x0ay", out)
+        self.assertEqual(len([line for line in out.splitlines()
+                              if line.startswith("  ")]), 1)
+
     def test_a_record_no_reader_can_deliver_is_named(self):
         self.store("facts.jsonl", {"id": "demo/half", "project": "demo",
                                    "slug": "half", "kind": "url",

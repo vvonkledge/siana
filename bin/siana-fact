@@ -468,10 +468,28 @@ def resolve_fact(facts: dict, project: str, reference: str) -> str:
     """The same reference, and the fact it names has to be there."""
     rid = fact_reference(project, reference)
     if rid not in facts:
-        here = sorted(f["slug"] for f in facts.values() if f.get("project") == project)
-        die(f"no fact called {rid.partition('/')[2]} in {project}",
+        here = sorted(safe(f.get("slug")) for f in facts.values()
+                      if f.get("project") == project)
+        die(f"no fact called {safe(rid.partition('/')[2])} in {project}",
             f"{project} has: {', '.join(here) or '(nothing recorded)'}")
     return rid
+
+
+def safe(text) -> str:
+    """A value out of a store, rendered so a terminal reads it as text.
+
+    Every report here is written to a terminal, and the records it reports on are
+    exactly the ones that may have been hand-edited: this is where a dispatch sends
+    the captain when it refuses one. So the command whose job is to display a
+    corrupt record was the one place a corrupt record could still forge output - a
+    newline in a slug printing a second line that reads as another record's `ok`,
+    or an escape sequence erasing the BROKEN lines above it.
+
+    Only control characters are escaped. Anything else is what the captain wrote and
+    is theirs to read back unchanged.
+    """
+    return "".join(ch if ch >= " " and ch != "\x7f" else f"\\x{ord(ch):02x}"
+                   for ch in str(text))
 
 
 def show(fact: dict) -> str:
@@ -514,11 +532,11 @@ def cmd_list(args, home: Home) -> None:
     for handle in projects:
         here = project_facts(facts, handle)
         if not here:
-            print(f"  {handle}: nothing recorded")
+            print(f"  {safe(handle)}: nothing recorded")
             continue
-        wid = max(len(str(f.get("slug"))) for f in here)
+        wid = max(len(safe(f.get("slug"))) for f in here)
         for fact in here:
-            print(f"  {handle}/{str(fact.get('slug')):<{wid}}  {show(fact)}")
+            print(f"  {safe(handle)}/{safe(fact.get('slug')):<{wid}}  {show(fact)}")
 
 
 def cmd_get(args, home: Home) -> None:
@@ -648,7 +666,7 @@ def cmd_rm(args, home: Home) -> None:
     rid = resolve_fact(facts, args.project, args.slug)
     fact = facts[rid]
     drop(home.facts, home.facts_schema, rid)
-    print(f"dropped  {rid}")
+    print(f"dropped  {safe(rid)}")
     standing = [g for g in home.read_grants().values()
                 if g.get("fact") == rid and g.get("status") == "granted"]
     if standing:
@@ -658,7 +676,7 @@ def cmd_rm(args, home: Home) -> None:
         # to keep disappears.
         print(f"  {len(standing)} grant(s) still name it, and now authorise nothing:")
         for g in sorted(standing, key=lambda g: str(g.get("id"))):
-            print(f"    siana-fact revoke {g.get('task')} {rid}")
+            print(f"    siana-fact revoke {safe(g.get('task'))} {safe(rid)}")
     if fact.get("kind") == "credential":
         print("  its keychain item is untouched, because the value may be the only")
         print("  copy. Remove it yourself if you mean to:")
@@ -798,36 +816,36 @@ def cmd_status(args, home: Home) -> None:
     command = keychain_command()
 
     print(f"facts    {len(facts)} recorded")
-    wid = max((len(r) for r in facts), default=0)
+    wid = max((len(safe(r)) for r in facts), default=0)
     for rid in sorted(facts):
-        fact = facts[rid]
+        fact, shown = facts[rid], safe(rid)
         problem = malformed(fact)
         if problem:
             bad.append(rid)
-            print(f"  BROKEN  {rid}: {problem}")
+            print(f"  BROKEN  {shown}: {problem}")
             continue
         if fact["project"] not in projects:
             bad.append(rid)
-            print(f"  BROKEN  {rid}: {fact['project']} is not in the registry")
+            print(f"  BROKEN  {shown}: {safe(fact['project'])} is not in the registry")
             continue
         if fact["kind"] != "credential":
-            print(f"  ok      {rid:<{wid}}  {fact['kind']}")
+            print(f"  ok      {shown:<{wid}}  {fact['kind']}")
             continue
         if not command:
-            print(f"  unknown {rid:<{wid}}  credential, and this platform has no"
+            print(f"  unknown {shown:<{wid}}  credential, and this platform has no"
                   f" keychain to ask")
             continue
         proc = keychain(command, ["find-generic-password", "-s", fact["service"],
                                   "-a", fact["account"]], capture=True)
         if proc.returncode == 0:
-            print(f"  ok      {rid:<{wid}}  credential, item present")
+            print(f"  ok      {shown:<{wid}}  credential, item present")
         elif proc.returncode == ITEM_NOT_FOUND:
             bad.append(rid)
-            print(f"  MISSING {rid:<{wid}}  credential, the keychain has no item for"
-                  f" {fact['service']}")
+            print(f"  MISSING {shown:<{wid}}  credential, the keychain has no item"
+                  f" for {safe(fact['service'])}")
         else:
             bad.append(rid)
-            print(f"  unknown {rid:<{wid}}  credential, the keychain answered"
+            print(f"  unknown {shown:<{wid}}  credential, the keychain answered"
                   f" {proc.returncode} rather than yes or no")
 
     try:
@@ -842,7 +860,7 @@ def cmd_status(args, home: Home) -> None:
     print(f"grants   {len(live)} standing of {len(grants)}")
     for gid, state in standing.items():
         grant = grants[gid]
-        where = f"{grant.get('task')} -> {grant.get('fact')}"
+        where = f"{safe(grant.get('task'))} -> {safe(grant.get('fact'))}"
         if state == "granted":
             print(f"  ok      {where}")
         elif state == "revoked":
@@ -851,8 +869,8 @@ def cmd_status(args, home: Home) -> None:
             task = tasks.get(str(grant.get("task"))) or {}
             print(f"  stale   {where}  the task is {task.get('status')}, so this"
                   f" authorises nothing")
-            print(f"          withdraw it: siana-fact revoke {grant.get('task')}"
-                  f" {grant.get('fact')}")
+            print(f"          withdraw it: siana-fact revoke"
+                  f" {safe(grant.get('task'))} {safe(grant.get('fact'))}")
         elif state == "orphan":
             bad.append(gid)
             print(f"  BROKEN  {where}  names a task or a fact that is not there")
