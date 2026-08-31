@@ -313,9 +313,17 @@ def resolve(projects: dict, handle: str, store: str):
 
 # Which fields a fact of each kind has to carry. `schema-facts.yaml` cannot say
 # this: no one kind uses all three, so all three are optional there and which of
-# them a kind needs is checked by every reader. `siana-fact` holds the same rule,
-# and `siana-fact status` is what reports every record failing it at once.
-FACT_KINDS = {"url": ("value",), "text": ("value",), "credential": ("account",)}
+# them a kind needs is checked by every reader. `siana-fact`'s `REQUIRED` is the
+# same list and has to stay the same list, and `siana-fact status` is what reports
+# every record failing it at once.
+#
+# `service` is here even though nothing in this file prints it. It is what
+# `siana-fact exec` finds the keychain item by, so a credential without one is a
+# credential no minion can spend - and delivering it anyway wrote a usable-looking
+# `siana-fact exec` line into the orders of a minion that would then be refused by
+# the command those orders told it to run.
+FACT_KINDS = {"url": ("value",), "text": ("value",),
+              "credential": ("account", "service")}
 
 # What a `url` fact's value has to be, and the same answer `siana-fact` gives. The
 # contract bounds the value and forbids a control character in it and can say

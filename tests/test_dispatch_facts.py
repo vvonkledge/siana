@@ -246,6 +246,17 @@ class Refusals(Section):
                                    "recorded": "2026-08-31T00:00:00Z"})
         self.assertIn("control character in its slug", self.refusal())
 
+    def test_a_credential_with_no_service_is_not_delivered_as_a_usable_one(self):
+        # Nothing in the section prints the service, but it is what `siana-fact
+        # exec` finds the keychain item by. Delivered, this wrote a usable-looking
+        # `siana-fact exec` line into the orders of a minion that would then be
+        # refused by the command those orders told it to run.
+        record = dict(CREDENTIAL)
+        record.pop("service")
+        self.store("facts.jsonl", record)
+        self.store("grants.jsonl", grant("ship-it"))
+        self.assertIn("with no service", self.refusal())
+
     def test_a_grant_recording_a_different_project_than_the_task_works_in(self):
         # The one record that could hand a minion the keys to somewhere it is not
         # working, so nothing here picks whichever project it likes.

@@ -254,6 +254,16 @@ class Credentials(Facts):
         self.assertRefused(out, "an account is 1 to 200 characters")
         self.assertEqual(self.keychain.calls(), [])
 
+    def test_a_note_the_contract_will_refuse_is_refused_before_the_prompt_too(self):
+        # Every field the refused record would have carried, and not only the two
+        # that name the keychain item: a note the contract rejects fails the write
+        # just as completely and leaves the same orphan behind.
+        out = self.fact("credential", "demo", "test-user", "--account", ACCOUNT,
+                        "--note", "x" * 201, stdin=f"{SECRET}\n{SECRET}\n")
+        self.assertRefused(out, "a note is 1 to 200 characters")
+        self.assertEqual(self.keychain.calls(), [])
+        self.assertEqual(self.store_text("facts.jsonl"), "")
+
     def test_a_keychain_that_will_not_open_records_nothing(self):
         # The record is written after the keychain accepts the value, never before:
         # a reference to an item that does not exist is the one state `exec` cannot
@@ -347,6 +357,18 @@ class Grants(Facts):
         self.assertAccepted(self.fact("revoke", "ship-it", "test-user"))
         self.assertIn("already", self.assertAccepted(
             self.fact("revoke", "ship-it", "test-user")))
+
+    def test_a_grant_outliving_the_fact_it_names_can_still_be_withdrawn(self):
+        # `rm` leaves the grant standing on purpose and says which tasks still hold
+        # one. A revoke that first demanded the fact exist made exactly those
+        # impossible to withdraw, and `status` called them broken for as long as
+        # they stood, with nothing on the command surface to fix it.
+        self.task("ship-it")
+        self.assertAccepted(self.fact("grant", "ship-it", "test-user"))
+        out = self.assertAccepted(self.fact("rm", "demo", "test-user"))
+        self.assertIn("siana-fact revoke ship-it demo/test-user", out)
+        self.assertAccepted(self.fact("revoke", "ship-it", "test-user"))
+        self.assertAccepted(self.fact("status"))
 
     def test_revoking_something_never_granted_is_refused(self):
         # A revocation that matched nothing would read as one that worked, which is
