@@ -9,8 +9,8 @@
 
 import { readFleet, readStore, UNAVAILABLE } from './sources.js';
 import { agentInPane, byId, newestFirst, oldestFirst, ownerPane } from './model.js';
-import { Age, Chip, Empty, Field, Fields, List, Panel, Row, StatusChip, Trouble,
-  Value } from './ui.jsx';
+import { Age, Card, Chip, Empty, Field, Fields, List, Panel, Row, StatusChip,
+  Trouble, Value } from './ui.jsx';
 
 /** An id the store does not hold.
  *
@@ -307,7 +307,7 @@ export function Obligations({ snapshot }) {
         ? <Empty>{empty}</Empty> : null}
       <List>
         {list.map((record) => (
-          <Row key={record.id} to="/obligations">
+          <Card key={record.id} id={record.id}>
             <p className="text-sm text-slate-100">
               <Value value={record.body} missing="no body" />
             </p>
@@ -326,7 +326,7 @@ export function Obligations({ snapshot }) {
                 </span>
                 : null}
             </p>
-          </Row>
+          </Card>
         ))}
       </List>
     </Panel>

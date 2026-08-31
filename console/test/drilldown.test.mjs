@@ -113,8 +113,11 @@ test('open obligations are oldest first, with an age', async (t) => {
     }),
     hash: '#/obligations',
   });
-  const bodies = [...page.document.querySelectorAll('main a')]
-    .map((node) => node.textContent)
+  // Cards rather than links: there is no screen under an obligation, so a row here
+  // is not tappable and does not pretend to be.
+  const cards = [...page.document.querySelectorAll('main [data-record]')];
+  assert.equal(page.document.querySelectorAll('main [data-record] > a').length, 0);
+  const bodies = cards.map((node) => node.textContent)
     .filter((said) => /promise/.test(said));
   assert.deepEqual(bodies.map((said) => said.match(/the \w+ promise/)[0]),
                    ['the oldest promise', 'the middle promise', 'the newer promise']);

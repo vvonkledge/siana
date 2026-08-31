@@ -213,6 +213,21 @@ export function Go({ to, children, className = '' }) {
   return <a href={`#${to}`} className={className}>{children}</a>;
 }
 
+/** A record with nowhere to go.
+ *
+ * The same card as `Row` and deliberately not a link: there is no screen under an
+ * obligation, and an anchor pointing at the screen the captain is already on reads as
+ * tappable and does nothing. That is the same thing this app refuses to do with a
+ * button - a control that implies an action it cannot perform. */
+export function Card({ id, children }) {
+  return (
+    <div data-record={id} className="rounded-xl bg-slate-950/60 px-3 py-3
+      ring-1 ring-slate-800">
+      {children}
+    </div>
+  );
+}
+
 /** A tappable row, sized for a thumb. */
 export function Row({ to, children }) {
   return (
