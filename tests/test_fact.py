@@ -167,6 +167,22 @@ class Nonsecret(Facts):
         self.store("facts.jsonl", "{not json")
         self.assertRefused(self.fact("list"), "is not JSON")
 
+    def test_a_scoped_listing_counts_what_it_lists(self):
+        # The header used to count the whole store, so `list demo` over a store
+        # holding another project's facts reported a number it then did not show.
+        self.project("other", path=self.home)
+        self.assertAccepted(self.fact("url", "demo", "staging", "https://x.example.test"))
+        self.assertAccepted(self.fact("url", "other", "elsewhere", "https://y.example.test"))
+        out = self.assertAccepted(self.fact("list", "demo"))
+        self.assertIn("facts    1 in 1 project(s)", out)
+        self.assertNotIn("elsewhere", out)
+
+    def test_a_project_with_nothing_recorded_says_so_once(self):
+        self.project("other", path=self.home)
+        self.assertAccepted(self.fact("url", "other", "elsewhere", "https://y.example.test"))
+        out = self.assertAccepted(self.fact("list", "demo"))
+        self.assertIn("nothing recorded in demo", out)
+
     def test_the_list_never_shows_a_credential_value(self):
         self.assertAccepted(self.record_credential())
         out = self.assertAccepted(self.fact("list"))
@@ -302,6 +318,20 @@ class Credentials(Facts):
         self.assertIn("the record named no service", out)
         self.assertNotIn("Traceback", out)
 
+    def test_rm_prints_no_command_it_cannot_make_safe(self):
+        # `shlex.quote` is shell-safe and not terminal-safe. Escaping the control
+        # character instead would print a command that no longer names the item, so
+        # there is no command to print at all.
+        self.store("facts.jsonl", {"id": "demo/odd", "project": "demo",
+                                   "slug": "odd", "kind": "credential",
+                                   "account": ACCOUNT, "service": "siana/x\ny",
+                                   "recorded": "2026-08-31T00:00:00Z"})
+        out = self.assertAccepted(self.fact("rm", "demo", "odd"))
+        self.assertNotIn("delete-generic-password", out)
+        self.assertIn("siana/x\\x0ay", out)
+        self.assertEqual(len(out.splitlines()),
+                         len([line for line in out.splitlines() if line.strip()]))
+
     def test_rm_leaves_the_keychain_item_and_says_how_to_remove_it(self):
         self.assertAccepted(self.record_credential())
         out = self.assertAccepted(self.fact("rm", "demo", "test-user"))
@@ -369,6 +399,23 @@ class Grants(Facts):
         self.assertIn("siana-fact revoke ship-it demo/test-user", out)
         self.assertAccepted(self.fact("revoke", "ship-it", "test-user"))
         self.assertAccepted(self.fact("status"))
+
+    def test_a_grant_on_a_task_that_left_the_queue_can_still_be_withdrawn(self):
+        # SIANA drops a task it decides not to run. Its grant is exactly the record
+        # that most needs withdrawing, `status` calls it broken, and nothing else
+        # deletes a grant - so a revoke that insisted on the task left a
+        # permanently red report with no command to clear it.
+        self.task("ship-it")
+        self.assertAccepted(self.fact("grant", "ship-it", "test-user"))
+        self.run_cmd(["datafile", "-f", self.at("tasks.jsonl"), "-c",
+                      self.at("schema-tasks.yaml"), "delete", "ship-it"])
+        out = self.assertAccepted(self.fact("revoke", "ship-it", "test-user"))
+        self.assertIn("revoked  demo/test-user from ship-it", out)
+        self.assertAccepted(self.fact("status"))
+
+    def test_a_revoke_naming_neither_a_task_nor_a_grant_is_still_refused(self):
+        self.assertRefused(self.fact("revoke", "never-existed", "test-user"),
+                           "nothing grants anything to never-existed")
 
     def test_revoking_something_never_granted_is_refused(self):
         # A revocation that matched nothing would read as one that worked, which is

@@ -525,15 +525,18 @@ def cmd_list(args, home: Home) -> None:
         projects = [args.project]
     else:
         projects = sorted({str(f.get("project")) for f in facts.values()})
-    if not facts or not projects:
-        print("facts    nothing recorded")
+    # Counted over what is about to be listed and never over the store, so a
+    # listing scoped to one project cannot report another project's facts in its
+    # header and then not show them.
+    listed = {handle: project_facts(facts, handle) for handle in projects}
+    total = sum(len(here) for here in listed.values())
+    if not total:
+        where = f" in {safe(args.project)}" if args.project else ""
+        print(f"facts    nothing recorded{where}")
         return
-    print(f"facts    {len(facts)} in {len(projects)} project(s)")
+    print(f"facts    {total} in {len(listed)} project(s)")
     for handle in projects:
-        here = project_facts(facts, handle)
-        if not here:
-            print(f"  {safe(handle)}: nothing recorded")
-            continue
+        here = listed[handle]
         wid = max(len(safe(f.get("slug"))) for f in here)
         for fact in here:
             print(f"  {safe(handle)}/{safe(fact.get('slug')):<{wid}}  {show(fact)}")
@@ -685,13 +688,20 @@ def cmd_rm(args, home: Home) -> None:
         # the natural answer to, so this is reachable - and a traceback here would
         # leave the captain unable to tell whether the record had already gone.
         service, account = fact.get("service"), fact.get("account")
-        if service and account:
-            print(f"    security delete-generic-password"
-                  f" -s {shlex.quote(service)} -a {shlex.quote(account)}")
-        else:
+        if not service or not account:
             print(f"    the record named no {'service' if not service else 'account'},")
             print("    so nothing here can say which item it was; look for one under")
             print(f"    siana/{args.project}/{args.slug}")
+        elif safe(service) != service or safe(account) != account:
+            # `shlex.quote` makes these shell-safe and not terminal-safe: quoting a
+            # control character prints it. Escaping one instead would print a
+            # command that no longer names the item, so there is no command here.
+            print(f"    it names {safe(service)} / {safe(account)}, and a control")
+            print("    character in either means there is no command to print that")
+            print("    would still name the item; find it in your keychain by hand")
+        else:
+            print(f"    security delete-generic-password"
+                  f" -s {shlex.quote(service)} -a {shlex.quote(account)}")
 
 
 def cmd_grant(args, home: Home) -> None:
@@ -729,13 +739,30 @@ def cmd_revoke(args, home: Home) -> None:
     refusal on a pair that was never granted: the second is a typo, and a revocation
     that silently succeeded against one would read as the credential being safe."""
     home.require_contracts()
-    task = home.read_task(args.task)
-    handle = task.get("project")
+    grants = home.read_grants()
+    # The queue is asked and never required. SIANA drops a task it decides not to
+    # run, and a grant on a dropped task is exactly the record that most needs
+    # withdrawing: `status` calls it broken and nothing else deletes a grant, so a
+    # revoke that insisted on the task left the captain a permanently red report
+    # with no command to clear it. `rm` printing this very command as the remedy
+    # made that worse.
+    handle = (fold(home.tasks, "id").get(args.task) or {}).get("project")
     if not handle:
-        die(f"{args.task} carries no project")
+        held = {str(g.get("project")) for g in grants.values()
+                if g.get("task") == args.task}
+        if not held:
+            die(f"nothing grants anything to {args.task}",
+                "no task by that id is in the queue and no grant names it either;",
+                "check the id, because a revocation that matched nothing would read",
+                "as one that worked")
+        if len(held) > 1:
+            die(f"{args.task} holds grants in more than one project: "
+                f"{', '.join(sorted(safe(h) for h in held))}",
+                "the task is not in the queue to say which was meant, so name the",
+                "fact in full: siana-fact revoke <task> <project>/<slug>")
+        handle = held.pop()
     rid = fact_reference(handle, args.fact)
     gid = grant_id(args.task, rid)
-    grants = home.read_grants()
     grant = grants.get(gid)
     if grant is None:
         die(f"nothing grants {rid} to {args.task}",
