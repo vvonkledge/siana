@@ -135,12 +135,18 @@ twice records nothing twice, and running it when there is nothing to do says so 
 changes nothing. Refusals are per pin and stay visible, so a pin it could not record
 is named again on the next run rather than lost.
 
-One consequence for re-dispatching. A task that came back `blocked` and is given to
-a new minion runs a second time, and that is a second run rather than a replay of
-the first. Dispatch refuses while the first one is still unrecorded, because the
-queue keeps one instant per task and resetting the task loses when that run ended.
-So reconcile before you re-dispatch. If you were woken and reconciled first, which
-is the ordinary order, this never comes up.
+One consequence for re-dispatching, and it is a sequence rather than a warning.
+A task that came back `blocked` and is given to a new minion runs a second time,
+and that is a second run rather than a replay of the first. **Reconcile before you
+reset it**, not before you dispatch it again: `reset` overwrites the instant that
+task last changed at, and that instant is the only record of when the blocked run
+ended, so after it nothing can record that run and nothing ever will. Dispatch
+refuses while a finished run is still unrecorded, but only while the queue still
+holds it, so the refusal is a backstop for the order and not a substitute for it.
+
+`siana-semantic reconcile` names a run this lost as `LOST` every time it runs. It
+is not a failure, because nothing clears it; it is a hole in the record, and the
+only thing that prevents the next one is reconciling first.
 
 **What a run holds is structure, and never a word of anything else.** One span saying
 a fleet task ran, when it started, when it ended, and how it came out. No title, no
@@ -601,8 +607,12 @@ is working.
 **A task that came back `blocked` can be given to a new minion.** Its branch still
 holds whatever the last one committed, and a worktree cut from an existing branch
 starts at that branch's own head, so the work is in front of the new minion rather
-than lost. The sequence is `reset <id>`, `siana-retire <id>`, then dispatch as
-normal. Dispatch refuses while that worktree is still there, and it is right to:
+than lost. The sequence is `siana-semantic reconcile`, `reset <id>`,
+`siana-retire <id>`, then dispatch as normal. Reconciling comes first because
+`reset` overwrites the instant that task last changed at, which is the only record
+of when the blocked run ended; see "Semantic context". It costs a line of output on
+a project with no binding. Dispatch refuses while that worktree is still there, and
+it is right to:
 that is the one place uncommitted work could be sitting. `siana-retire` refuses for
 the same reason and names what it found, so the looking is done for you.
 If the minion that blocked is still alive, telling it is cheaper than replacing it,

@@ -931,10 +931,45 @@ class Reconciling(SemanticTest):
 
         out = self.assertAccepted(self.sem("reconcile"))
 
-        self.assertIn("1 recorded, 0 already, 0 not terminal yet, 1 abandoned", out)
+        self.assertIn("LOST    make-a-thing.1", out)
+        self.assertIn("1 recorded, 0 already, 0 not terminal yet, 1 never recorded",
+                      out)
         self.assertEqual(len(self.calls("trace record")), 1)
         self.assertEqual(json.loads(self.calls("trace record")[0]["stdin"])
                          ["run"]["trace_id"], self.pinned()["trace_id"])
+
+    def test_a_run_reset_before_it_was_recorded_is_named_and_never_invented(self):
+        # The one loss this cannot prevent, so the one it must never hide. The queue
+        # keeps a single instant per task, so `reset` overwrites when that run ended
+        # and nothing can build a run from what is left. Reported by name every time
+        # rather than counted with work that is merely waiting, and never a refusal:
+        # nothing clears it, and this command runs on every wake.
+        self.ready_to_record(status="blocked")
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "reset", self.TASK,
+             "--reason", "given to a new minion"]))
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertIn(f"LOST    {self.TASK}", out)
+        self.assertIn("1 never recorded", out)
+        self.assertIn("reconcile before you", out)
+        self.assertEqual(self.calls("trace record"), [])
+
+    def test_work_a_minion_still_holds_is_waiting_and_never_lost(self):
+        # `doing` is the ordinary in-flight state and reads the same way as a reset
+        # from the pin alone. It is the task's status that tells them apart.
+        self.bound()
+        self.queued()
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.dispatched()
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "start", self.TASK,
+             "--owner", "claude@w1:p1"]))
+        out = self.assertAccepted(self.sem("reconcile"))
+        self.assertIn("1 not terminal yet", out)
+        self.assertNotIn("LOST", out)
 
     def test_a_pin_whose_task_left_the_queue_is_kept_and_not_recorded(self):
         self.ready_to_record()

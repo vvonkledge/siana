@@ -1050,7 +1050,7 @@ def cmd_reconcile(args, home):
         return 0
 
     print(f"semantic  {len(found)} pinned")
-    recorded = already = waiting = spent = failed = 0
+    recorded = already = waiting = lost = failed = 0
     for name in found:
         try:
             state, detail = reconcile_one(home, name, tasks)
@@ -1065,12 +1065,17 @@ def cmd_reconcile(args, home):
             print(f"  ok      {name} -> {detail}")
         elif state == "already":
             already += 1
-        elif state == "spent":
-            spent += 1
+        elif state == "lost":
+            lost += 1
+            print(f"  LOST    {name}: {detail}")
         else:
             waiting += 1
     print(f"          {recorded} recorded, {already} already, "
-          f"{waiting} not terminal yet, {spent} abandoned, {failed} refused")
+          f"{waiting} not terminal yet, {lost} never recorded, {failed} refused")
+    if lost:
+        print("          a run is unrecordable once its task has been reset: the")
+        print("          queue keeps one instant per task, so reconcile before you")
+        print("          reset one, not before you dispatch it again")
     return REFUSED if failed else 0
 
 
@@ -1096,12 +1101,9 @@ def reconcile_one(home, name, tasks):
         already = read_recorded(home, name)
         if already is not None:
             return "already", already["trace_id"]
-        # Never recorded, and never will be. Either a claim landed on it and the
-        # task was dispatched again while that run was still in flight, so no
-        # terminal instant of its own was ever written down, or no claim ever landed
-        # and there was no run at all.
-        return "spent", ("abandoned before it ended"
-                         if dispatched_at(home, name) else "never claimed")
+        if dispatched_at(home, name) is None:
+            return "waiting", "never claimed"
+        return "lost", "claimed, and the queue kept no terminal record of it"
     started = dispatched_at(home, name)
     if started is None:
         # Pinned and never claimed. The task may well be terminal - it can be
@@ -1115,7 +1117,19 @@ def reconcile_one(home, name, tasks):
         # longer holds the task is not a reason to throw them away.
         return "waiting", "no such task"
     if task.get("status") not in OUTCOMES:
-        return "waiting", str(task.get("status"))
+        if task.get("status") == "doing":
+            return "waiting", "doing"
+        # Claimed, and the queue holds no terminal record to build a run from. The
+        # task was reset after the claim, and `updated` names the reset rather than
+        # whatever it did before it: a run that ended here can no longer be recorded
+        # by anything, because when it ended is not written down anywhere.
+        #
+        # Named rather than counted with the ordinary waiting, because it is a hole
+        # in the record and the only thing that can prevent the next one is
+        # reconciling before a task is reset. It is not a refusal: nothing clears
+        # it, so a nonzero exit here would be permanent noise on a command SIANA
+        # runs on every wake.
+        return "lost", "reset before anything was recorded"
 
     # The binding as it is now, not only as the pin remembers it. Everything a
     # recording writes to comes out of that record - the store it lands in, the
@@ -1248,7 +1262,7 @@ def cmd_status(args, home):
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(
         home, "tasks.jsonl")
     tasks = fold(tasks_file, "id")
-    waiting = []
+    waiting, lost = [], []
     for name in pins:
         try:
             pin = read_pin(home, name)
@@ -1256,26 +1270,32 @@ def cmd_status(args, home):
             print(f"  stale   {name}: {r.message}")
             stale += 1
             continue
-        # A spent pin - rolled aside when its task was dispatched again - is over,
-        # and reconcile will never write anything for it. Reporting it as waiting
-        # would ask for a command that cannot help.
-        if pin is None or name != pin["task"]:
-            continue
-        if not os.path.exists(dispatched_marker(home, name)):
+        if pin is None or not os.path.exists(dispatched_marker(home, name)):
             continue
         if os.path.exists(os.path.join(pin_path(home, name), "recorded.json")):
             continue
-        if (tasks.get(pin["task"]) or {}).get("status") in OUTCOMES:
+        # A spent pin - rolled aside when its task was dispatched again - is over,
+        # and so is a live one whose task has been reset: the queue keeps one
+        # instant per task, so there is no terminal record left to build a run from
+        # and reconcile will never write one. Counted rather than called stale,
+        # because nothing clears it and a permanent fault here would be a doctor
+        # that can never come back green. `waiting` is only what reconciling fixes.
+        status = (tasks.get(pin["task"]) or {}).get("status")
+        if name != pin["task"] or status not in OUTCOMES:
+            if status != "doing":
+                lost.append(name)
+        else:
             waiting.append(name)
+    tail = f", {len(lost)} never recorded" if lost else ""
     if not pins:
         print("  ok      no pins yet")
     elif waiting:
         print(f"  stale   {len(pins)} pins, {len(waiting)} terminal and unrecorded: "
-              f"{', '.join(waiting)}")
+              f"{', '.join(waiting)}{tail}")
         print("          `siana-semantic reconcile` records them")
         stale += 1
     else:
-        print(f"  ok      {len(pins)} pins, none waiting to be recorded")
+        print(f"  ok      {len(pins)} pins, none waiting to be recorded{tail}")
     return REFUSED if stale else 0
 
 
