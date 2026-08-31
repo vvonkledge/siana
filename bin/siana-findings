@@ -524,19 +524,26 @@ def check_record(rec, case, world, stage: str):
                                                f" {shown.stdout.strip()[:12]}, not at"
                                                f" {str(rec.get('head'))[:12]}"))
 
-        # 9. Containment, and containment only. That a merge holds the repair is
-        #    evidence the work was published; it is never evidence the finding was
-        #    closed, and this check is written so it cannot be read as the latter.
-        landed, head = rec.get("landed"), rec.get("resolver_head")
-        commit = last_commit(landed)
-        if commit and head:
+        # 9. Two facts, and only the second is about the repair. That the named
+        #    commit exists is asked wherever `landed` names one at all: for a review
+        #    of a document, which rejects no branch and whose repair produced no
+        #    commit, that line is the record's only pointer to where the work went,
+        #    and it is the record whose other evidence is already known to be
+        #    unrecoverable. Containment is asked on top, where there is a repair
+        #    commit to contain - and it is containment only. That a merge holds the
+        #    repair is evidence the work was published; it is never evidence the
+        #    finding was closed, and this is written so it cannot be read as the
+        #    latter.
+        head = rec.get("resolver_head")
+        commit = last_commit(rec.get("landed"))
+        if commit:
             named = git(path, "rev-parse", "--verify", "--quiet",
                         f"{commit}^{{commit}}")
             if named.returncode:
                 out.append(Problem(rid, "landed", f"{commit} is not a commit in"
                                                   f" {path}"))
-            elif git(path, "merge-base", "--is-ancestor", head,
-                     commit).returncode:
+            elif head and git(path, "merge-base", "--is-ancestor", head,
+                              commit).returncode:
                 out.append(Problem(rid, "landed", f"{commit[:12]} does not contain"
                                                   f" {head[:12]}"))
 
@@ -802,8 +809,30 @@ def show(world, rid):
         else:
             state += ", source gone"
         print(f"    {sha[:12]}  {rest}  ({state})")
+    for missing in lost(rec, "evidence"):
+        print(f"    lost          {missing}: it applied here and was never archived")
+    for name in rec.get("unknown") or []:
+        head, _, qualifier = name.partition(":")
+        if qualifier and head != "evidence":
+            print(f"  unknown  {name}")
     print(f"  resolved {rec.get('resolution')}")
     print(f"    by     {rec.get('resolved_by')} (judgment, not checked here)")
+
+
+def lost(rec, field):
+    """What `unknown` says is missing from one list field, as bare qualifiers.
+
+    A record can say that one member of its evidence applied and was never archived,
+    and until this was printed the fact sat in the store unreadable from the command
+    that exists to read the store: `show` listed the files that were archived, with
+    nothing to say that the artifact actually rejected is not among them. A reader
+    would have taken a knowingly partial evidence set for a complete one."""
+    out = []
+    for name in rec.get("unknown") or []:
+        head, _, qualifier = name.partition(":")
+        if head == field and qualifier:
+            out.append(qualifier)
+    return out
 
 
 def absent(rec, field):
@@ -831,6 +860,8 @@ def case_view(world, name):
         print(f"    cost     {rec.get('consequence')}")
         print(f"    repaired {rec.get('resolver') or absent(rec, 'resolver')}")
         print(f"    accepted {rec.get('acceptance') or absent(rec, 'acceptance')}")
+        for missing in lost(rec, "evidence"):
+            print(f"    lost     {missing}: it applied here and was never archived")
         print(f"    resolved {rec.get('resolution')}")
     print(f"  judgment above is {rounds[0].get('resolved_by')}'s and is not checked"
           " here; `siana-findings verify` checks the mechanics")

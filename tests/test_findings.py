@@ -335,6 +335,16 @@ class Unknown(Ledger):
         self.archived(self.round_one(unknown=["evidence:rejected-handoff"]))
         self.assertAccepted(self.findings("verify"))
 
+    def test_a_lost_member_of_the_evidence_is_printed_where_evidence_is_read(self):
+        # The whole point of recording it. Without this the reader sees the files
+        # that were archived and nothing saying the artifact actually rejected is
+        # not among them, which is a knowingly partial set read as a complete one.
+        self.archived(self.round_one(unknown=["evidence:rejected-handoff"]))
+        for out in (self.assertAccepted(self.findings("show", "qa-one")),
+                    self.assertAccepted(self.findings("case", "demo-case"))):
+            self.assertIn("rejected-handoff: it applied here and was never archived",
+                          out)
+
     def test_qualifying_a_field_that_is_not_a_list_is_refused(self):
         self.assertRefused(self.archive(self.round_one(unknown=["head:something"])),
                            "is not a list")
@@ -487,6 +497,17 @@ class AncestryIsNotProof(Ledger):
         self.assertRefused(
             self.archive(self.round_one(landed=f"demo#1 {self.rejected}")),
             "does not contain")
+
+    def test_a_landed_commit_is_resolved_even_where_there_is_no_repair_commit(self):
+        # A review of a document rejects no branch and its repair produces no commit
+        # of its own, so `landed` is that record's only pointer to where the work
+        # went - and it is the record whose other evidence is already known to be
+        # unrecoverable. A truncated or mistyped sha there must not pass unread.
+        self.assertRefused(
+            self.archive(self.round_one(
+                kind="review", branch=None, head=None, resolver_head=None,
+                unknown=["head"], landed="demo#1 " + "0" * 40)),
+            "is not a commit in")
 
     def test_a_case_may_be_archived_with_nothing_published_yet(self):
         # Merged is evidence and never proof, so its absence is not a fault either.
