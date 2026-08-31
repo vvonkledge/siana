@@ -434,6 +434,67 @@ class Pinning(SemanticTest):
         out = self.assertAccepted(self.pin(as_of="2026-08-30T18:00:00Z"))
         self.assertTrue(json.loads(out)["reused"])
 
+    def test_a_task_dispatched_again_after_a_run_gets_its_own_pin_and_trace(self):
+        # The ordinary re-dispatch: a task comes back blocked, is reset, retired and
+        # given to a new minion under the same id. `siana-retire` leaves the pin
+        # alone, so the second dispatch finds it. That second execution is a
+        # different run, not a replay of the first, and carrying the first trace id
+        # into it would make the store refuse a conflict this had manufactured.
+        self.exporting()
+        self.assertAccepted(self.pin())
+        first = self.pinned()
+        self.dispatched()
+        # Recorded, so nothing is waiting on this pin.
+        with open(self.at("semantic", self.TASK, "recorded.json"), "w") as fh:
+            json.dump({"trace_id": first["trace_id"]}, fh)
+
+        self.assertAccepted(self.pin())
+
+        second = self.pinned()
+        self.assertNotEqual(second["trace_id"], first["trace_id"])
+        self.assertNotEqual(second["span_id"], first["span_id"])
+        self.assertEqual(len(self.calls("pack export")), 2)
+        # The first pin is kept, not thrown away: its bytes are what a minion was
+        # briefed from and the record beside them is what it did.
+        self.assertTrue(os.path.exists(
+            self.at("semantic", f"{self.TASK}.1", "pin.json")))
+        with open(self.at("semantic", f"{self.TASK}.1", "pin.json")) as fh:
+            self.assertEqual(json.load(fh)["trace_id"], first["trace_id"])
+
+    def test_a_finished_run_nobody_recorded_stops_the_next_dispatch(self):
+        # The queue keeps one instant per task, so the moment a blocked task is
+        # reset, when that run ended is gone. Dispatching over it would lose the run
+        # with nothing anywhere saying so, and the fix is one command.
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.dispatched()
+        self.store("tasks.jsonl", {"id": self.TASK, "title": "make a thing",
+                                   "status": "blocked", "verify": "true",
+                                   "verify_kind": "cmd", "deps": [], "context": [],
+                                   "project": "proj",
+                                   "updated": "2026-08-30T10:00:00Z"})
+
+        text = self.assertRefused(self.pin(), "nobody has recorded yet")
+
+        self.assertIn("siana-semantic reconcile", text)
+        self.assertEqual(len(self.calls("pack export")), 1)
+        self.assertFalse(os.path.exists(self.at("semantic", f"{self.TASK}.1")))
+
+    def test_a_claim_that_landed_on_work_still_running_is_not_reused(self):
+        # Claimed, and the task never went terminal: an abandoned dispatch that got
+        # as far as the claim, or a task the captain reset while it was live. There
+        # is no run to lose, and the pin belongs to an execution that already began.
+        self.exporting()
+        self.assertAccepted(self.pin())
+        first = self.pinned()
+        self.dispatched()
+
+        self.assertAccepted(self.pin())
+
+        self.assertNotEqual(self.pinned()["trace_id"], first["trace_id"])
+        self.assertTrue(os.path.exists(
+            self.at("semantic", f"{self.TASK}.1", "pin.json")))
+
     def test_a_task_with_no_project_cannot_have_a_binding(self):
         self.task("unowned", project=None)
         self.plan()
@@ -797,6 +858,56 @@ class Reconciling(SemanticTest):
         self.assertIn("has moved since", out.stdout)
         self.assertEqual(self.calls("trace record"), [])
 
+    def test_both_runs_of_a_re_dispatched_task_are_recorded_once_each(self):
+        # Two pins for one task, each its own run. The rolled-aside one is still
+        # scanned, and it is found by the task its own record names rather than by
+        # the directory it sits in.
+        self.ready_to_record(status="blocked")
+        self.assertAccepted(self.sem("reconcile"))
+        first = self.pinned()["trace_id"]
+
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "reset", self.TASK,
+             "--reason", "given to a new minion"]))
+        self.exporting()
+        self.assertAccepted(self.pin())
+        second = self.pinned()["trace_id"]
+        self.dispatched(at="2026-08-30T09:30:00Z")
+        self.terminal(status="done")
+        self.plan(export=self.answer("pack export", self.export_result()),
+                  **self.recording())
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertIn("1 recorded, 1 already", out)
+        self.assertNotEqual(first, second)
+        recorded = [json.loads(c["stdin"])["run"]["trace_id"]
+                    for c in self.calls("trace record")]
+        self.assertEqual(recorded, [first, second])
+
+    def test_a_pin_abandoned_mid_run_is_never_filled_in_from_a_later_one(self):
+        # Claimed, then the task was dispatched again while it was still in flight,
+        # so this pin was rolled aside with no ending of its own ever written down.
+        # The queue keeps one instant per task and that instant now belongs to the
+        # run after this one: filing it here would invent an ending.
+        self.bound()
+        self.queued()
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.dispatched()
+        self.assertAccepted(self.pin())          # rolls the first aside
+        self.dispatched()
+        self.terminal(status="done")
+        self.plan(export=self.answer("pack export", self.export_result()),
+                  **self.recording())
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertIn("1 recorded, 0 already, 0 not terminal yet, 1 abandoned", out)
+        self.assertEqual(len(self.calls("trace record")), 1)
+        self.assertEqual(json.loads(self.calls("trace record")[0]["stdin"])
+                         ["run"]["trace_id"], self.pinned()["trace_id"])
+
     def test_a_pin_whose_task_left_the_queue_is_kept_and_not_recorded(self):
         self.ready_to_record()
         self.assertAccepted(self.run_cmd(
@@ -951,6 +1062,19 @@ class Status(SemanticTest):
         self.assertIn("disabled (no bindings)", out.stdout)
         self.assertIn("terminal and unrecorded", out.stdout)
         self.assertIn(self.TASK, out.stdout)
+
+    def test_a_spent_pin_is_never_reported_as_waiting_to_be_recorded(self):
+        # It is over, and `reconcile` will never write anything for it. Naming it
+        # here would ask the captain for a command that cannot help.
+        self.ready_to_record(status="blocked")
+        self.assertAccepted(self.sem("reconcile"))
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "reset", self.TASK,
+             "--reason", "given to a new minion"]))
+        self.exporting()
+        self.assertAccepted(self.pin())
+        out = self.assertAccepted(self.sem("status"))
+        self.assertIn("2 pins, none waiting", out)
 
     def test_it_records_nothing_while_reporting(self):
         # Doctor runs this, so it has to be safe to run at any moment. It reads

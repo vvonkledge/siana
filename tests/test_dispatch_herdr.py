@@ -867,10 +867,6 @@ class Transport(HerdrTest):
         self.assertIn("cannot reach herdr", cm.exception.message)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SemanticContext(DispatchTest):
     """Dispatch's half of the semantic exchange.
 
@@ -1027,3 +1023,7 @@ class SemanticContext(DispatchTest):
         self.assertIsNotNone(result.refusal)
         self.assertTrue(os.path.exists(self.at("semantic", task_id, "pin.json")))
         self.assertFalse(os.path.exists(self.at("semantic", task_id, "dispatched")))
+
+
+if __name__ == "__main__":
+    unittest.main()

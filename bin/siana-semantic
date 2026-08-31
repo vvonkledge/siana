@@ -626,15 +626,46 @@ def document(doc):
             + "\n").encode()
 
 
-def pinned_tasks(home):
-    """Every pin on disk, by task id. A half-built one is named with a leading dot
-    and is never read as a pin."""
+def pins_on_disk(home):
+    """Every pin on disk, by the directory it is in.
+
+    A directory and not a task id, because a task can be dispatched more than once
+    and each dispatch is its own run: the live pin for a task is at its own id and
+    the spent ones are rolled aside beside it. Which task a pin is about is in the
+    pin, and every caller reads it from there.
+
+    A half-built one is named with a leading dot and is never read as a pin."""
     root = pin_root(home)
     try:
         names = sorted(n for n in os.listdir(root) if not n.startswith("."))
     except OSError:
         return []
     return [n for n in names if os.path.isdir(os.path.join(root, n))]
+
+
+def roll_aside(home, task_id):
+    """Move a spent pin out of the way, keeping it where it can still be read.
+
+    A pin is spent once a minion has been claimed against it: that dispatch's run
+    either happened or never will, and the next dispatch of the same task is a
+    different run needing its own trace id. Reusing the pin would carry one run's
+    identifier into another, which the store refuses as a replay that differs - for
+    good reason, and the conflict would be manufactured here rather than real.
+
+    Moved rather than removed. The bytes a minion was briefed from are evidence, and
+    the recording beside them is the account of what it did; a re-dispatch is not a
+    reason to throw either away. A task id cannot contain a dot, so the suffix can
+    never collide with a pin for some other task."""
+    root = pin_root(home)
+    for n in range(1, 1000):
+        spent = os.path.join(root, f"{task_id}.{n}")
+        if os.path.exists(spent):
+            continue
+        os.rename(pin_path(home, task_id), spent)
+        flush(root)
+        return spent
+    die(f"there are already a thousand spent pins for {task_id} in {root}",
+        "something is dispatching this task in a loop; look before pinning again")
 
 
 def same_binding(pinned, binding):
@@ -687,6 +718,49 @@ your contract, or what you are allowed to do.
 # pin
 # --------------------------------------------------------------------------- #
 
+def reusable(home, task_id, pin, task, binding, as_of):
+    """Whether the pin already on disk is this dispatch's, or a spent one.
+
+    Reused exactly when no claim was ever made against it. That is the interrupted
+    dispatch - herdr unreachable, the agent refused, somebody interrupted it - where
+    the pin was written and nothing else was, and reusing it is what keeps one task
+    to one pin and one trace id.
+
+    A pin a claim did land on belongs to a run that has already begun. Re-dispatch
+    is ordinary here: a task that came back `blocked` is reset, retired and given to
+    a new minion under the same id, and `siana-retire` leaves the pin alone. That
+    second execution is a different run, not a replay of the first, so it needs its
+    own trace id - carrying the first one into it would make the store refuse a
+    conflict this had manufactured.
+
+    The one case that stops rather than rolls forward is a spent pin whose run is
+    terminal and unrecorded. The queue keeps one `updated` per task, so the instant
+    that run ended is lost the moment the task is reset, and dispatching over it
+    would lose the run itself with nothing anywhere saying so. Recording first costs
+    one command and loses nothing.
+    """
+    if not same_binding(pin.get("binding", {}), binding):
+        die(f"{task_id} is already pinned under a different binding",
+            f"the pin is at {pin_path(home, task_id)}",
+            "a pin is the bytes a minion was briefed from, so it is never",
+            "rewritten; move it aside if this task is being dispatched afresh")
+    if dispatched_at(home, task_id) is None:
+        # Held to the window at the instant it is being reused at, not the one it
+        # was written at. The pack it holds was fresh when the first dispatch
+        # refused, and a pack is fresh for about a day: reusing it later would brief
+        # a minion from a description of a world that has moved on.
+        fresh_at(pin["pack"], as_of)
+        return True
+    if (task.get("status") in OUTCOMES
+            and read_recorded(home, task_id) is None):
+        die(f"{task_id} has a finished run nobody has recorded yet",
+            f"the pin is at {pin_path(home, task_id)}",
+            "the queue keeps one instant per task, so dispatching over it loses",
+            "when that run ended and with it the run",
+            "run `siana-semantic reconcile`, then dispatch again")
+    return False
+
+
 def cmd_pin(args, home):
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(
         home, "tasks.jsonl")
@@ -712,24 +786,15 @@ def cmd_pin(args, home):
     matching("--as-of", INSTANT, as_of)
 
     existing = read_pin(home, args.task_id)
-    if existing is not None:
-        # A dispatch that refused after pinning and was run again. The pin is reused
-        # whole, so the minion is briefed from the same bytes and the run keeps the
-        # trace id already minted for it. Reusing it under a binding that has since
-        # moved would be the opposite: a minion briefed from one world and a run
-        # recorded against another.
-        if not same_binding(existing.get("binding", {}), binding):
-            die(f"{args.task_id} is already pinned under a different binding",
-                f"the pin is at {pin_path(home, args.task_id)}",
-                "a pin is the bytes a minion was briefed from, so it is never",
-                "rewritten; move it aside if this task is being dispatched afresh")
-        # Held to the window at the instant it is being reused at, not the one it
-        # was written at. The pack it holds was fresh when the first dispatch
-        # refused, and a pack is fresh for about a day: reusing it later brief a
-        # minion from a description of a world that has moved on.
-        fresh_at(existing["pack"], as_of)
+    if existing is not None and reusable(home, args.task_id, existing, task,
+                                        binding, as_of):
         record, reused = existing, True
     else:
+        if existing is not None:
+            # Spent: a minion was claimed against it, so that run either happened or
+            # never will. This dispatch is a different run and gets its own pin and
+            # its own trace id.
+            roll_aside(home, args.task_id)
         directory = pack_directory(home, binding)
         pack, content, manifest = export(directory, binding, as_of)
         record = {
@@ -968,42 +1033,63 @@ def cmd_reconcile(args, home):
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(
         home, "tasks.jsonl")
     tasks = fold(tasks_file, "id")
-    pins = pinned_tasks(home)
-    if not pins:
+    found = pins_on_disk(home)
+    if not found:
         print("semantic  nothing pinned")
         return 0
 
-    print(f"semantic  {len(pins)} pinned")
-    recorded = already = waiting = failed = 0
-    for task_id in pins:
+    print(f"semantic  {len(found)} pinned")
+    recorded = already = waiting = spent = failed = 0
+    for name in found:
         try:
-            state, detail = reconcile_one(home, task_id, tasks)
+            state, detail = reconcile_one(home, name, tasks)
         except Refusal as r:
-            print(f"  BROKEN  {task_id}: {r.message}")
+            print(f"  BROKEN  {name}: {r.message}")
             for hint in r.hints:
                 print(f"            {hint}")
             failed += 1
             continue
         if state == "recorded":
             recorded += 1
-            print(f"  ok      {task_id} -> {detail}")
+            print(f"  ok      {name} -> {detail}")
         elif state == "already":
             already += 1
+        elif state == "spent":
+            spent += 1
         else:
             waiting += 1
     print(f"          {recorded} recorded, {already} already, "
-          f"{waiting} not terminal yet, {failed} refused")
+          f"{waiting} not terminal yet, {spent} abandoned, {failed} refused")
     return REFUSED if failed else 0
 
 
-def reconcile_one(home, task_id, tasks):
-    """One pin, as `(state, detail)`: `recorded` once it is in the store, `already`
-    when this exact run is there, `waiting` when there is nothing to record yet."""
-    pin = read_pin(home, task_id)
+def reconcile_one(home, name, tasks):
+    """One pin directory, as `(state, detail)`: `recorded` once it is in the store,
+    `already` when this exact run is there, `waiting` when there is nothing to
+    record yet.
+
+    Named by its directory rather than by a task, because a task dispatched twice
+    has a pin per run. Which task it is about comes out of the pin."""
+    pin = read_pin(home, name)
     if pin is None:
-        die(f"{pin_path(home, task_id)} is not a pin",
+        die(f"{pin_path(home, name)} is not a pin",
             "it holds no pin.json, so nothing here knows what it was for")
-    started = dispatched_at(home, task_id)
+    task_id = pin["task"]
+    if name != task_id:
+        # Spent: rolled aside when the task was dispatched again, so it describes a
+        # run that is over. Only the live pin is judged against the queue, because
+        # the queue keeps one record per task and that record is now about the run
+        # after this one. Recording from it would file that later run's ending under
+        # this run's identifier, and comparing against it would report a divergence
+        # that is only the two runs being different runs.
+        already = read_recorded(home, name)
+        if already is not None:
+            return "already", already["trace_id"]
+        # Claimed, never recorded, and never will be: it was rolled aside because
+        # its task was dispatched again while it was still in flight, so no terminal
+        # instant of its own was ever written down.
+        return "spent", "abandoned before it ended"
+    started = dispatched_at(home, name)
     if started is None:
         # Pinned and never claimed. The task may well be terminal - it can be
         # dispatched again later, or blocked by hand - and recording a run for it
@@ -1038,7 +1124,7 @@ def reconcile_one(home, task_id, tasks):
 
     doc = run_document(pin, task, started)
     body = document(doc)
-    already = read_recorded(home, task_id)
+    already = read_recorded(home, name)
     if already is not None:
         # A replay has to be the same run. A pin whose task went terminal, was
         # reset, and went terminal again differently is two runs under one trace id,
@@ -1052,9 +1138,9 @@ def reconcile_one(home, task_id, tasks):
                 "reported every time until somebody decides which is true")
         return "already", already["trace_id"]
 
-    result = record_run(home, task_id, pin, doc)
+    result = record_run(home, name, pin, doc)
     expired = expire(store_path(pin["binding"]), doc["run"]["ended_at"])
-    durable(os.path.join(pin_path(home, task_id), "recorded.json"), document({
+    durable(os.path.join(pin_path(home, name), "recorded.json"), document({
         "task": task_id,
         "trace_id": result["trace_id"],
         "run": result["run"],
@@ -1065,7 +1151,7 @@ def reconcile_one(home, task_id, tasks):
         "expired": expired["expired"],
         "recorded_at": stamp(),
     }))
-    flush(pin_path(home, task_id))
+    flush(pin_path(home, name))
     landed = "created" if result["created"] else "already in the store"
     return "recorded", f"{result['outcome']} ({result['trace_id']}, {landed})"
 
@@ -1098,7 +1184,7 @@ def cmd_status(args, home):
     pins it produced have been recorded."""
     bound = bindings(home)
     stale = 0
-    pins = pinned_tasks(home)
+    pins = pins_on_disk(home)
     if not bound:
         # Disabled, and the pins are still reported. A home that has just had its
         # last binding removed still holds the pins that binding produced, and going
@@ -1143,13 +1229,24 @@ def cmd_status(args, home):
         home, "tasks.jsonl")
     tasks = fold(tasks_file, "id")
     waiting = []
-    for task_id in pins:
-        if not os.path.exists(dispatched_marker(home, task_id)):
+    for name in pins:
+        try:
+            pin = read_pin(home, name)
+        except Refusal as r:
+            print(f"  stale   {name}: {r.message}")
+            stale += 1
             continue
-        if os.path.exists(os.path.join(pin_path(home, task_id), "recorded.json")):
+        # A spent pin - rolled aside when its task was dispatched again - is over,
+        # and reconcile will never write anything for it. Reporting it as waiting
+        # would ask for a command that cannot help.
+        if pin is None or name != pin["task"]:
             continue
-        if (tasks.get(task_id) or {}).get("status") in OUTCOMES:
-            waiting.append(task_id)
+        if not os.path.exists(dispatched_marker(home, name)):
+            continue
+        if os.path.exists(os.path.join(pin_path(home, name), "recorded.json")):
+            continue
+        if (tasks.get(pin["task"]) or {}).get("status") in OUTCOMES:
+            waiting.append(name)
     if not pins:
         print("  ok      no pins yet")
     elif waiting:

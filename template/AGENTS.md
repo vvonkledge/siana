@@ -135,6 +135,13 @@ twice records nothing twice, and running it when there is nothing to do says so 
 changes nothing. Refusals are per pin and stay visible, so a pin it could not record
 is named again on the next run rather than lost.
 
+One consequence for re-dispatching. A task that came back `blocked` and is given to
+a new minion runs a second time, and that is a second run rather than a replay of
+the first. Dispatch refuses while the first one is still unrecorded, because the
+queue keeps one instant per task and resetting the task loses when that run ended.
+So reconcile before you re-dispatch. If you were woken and reconciled first, which
+is the ordinary order, this never comes up.
+
 **What a run holds is structure, and never a word of anything else.** One span saying
 a fleet task ran, when it started, when it ended, and how it came out. No title, no
 reason, no brief, no prompt, no report, no diff, no path, no environment. That is not
