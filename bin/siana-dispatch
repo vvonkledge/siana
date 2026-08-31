@@ -333,12 +333,18 @@ FACT_KINDS = {"url": ("value",), "text": ("value",),
 # handed it over as somewhere to go.
 URL_SCHEME = "https"
 
-# Every field of a fact that is printed into a minion's orders. The slug is one of
-# them - it names the fact on its own line and again in the `siana-fact exec`
-# invocation - so leaving it out left the one field an id check cannot catch: `id`
-# and `slug` are both hand-editable, so a newline in both agrees with itself and
-# passes. `siana-fact`'s `malformed` holds the twin of this list.
-PRINTED = ("slug", "value", "account", "note")
+# Every field of a fact that has to survive being read: written into a minion's
+# orders, printed to a terminal, or handed to the keychain. The slug is one of them
+# - it names the fact on its own line and again in the `siana-fact exec` invocation
+# - so leaving it out left the one field an id check cannot catch, since `id` and
+# `slug` are both hand-editable and a newline in both agrees with itself.
+#
+# `service` is here for the reason it is in `FACT_KINDS` above and nothing in this
+# file prints it: a credential whose service `siana-fact exec` cannot use is one
+# this must not deliver a `siana-fact exec` line for.
+#
+# `siana-fact`'s `SCREENED` is the twin of this list and has to stay the twin.
+SCREENED = ("slug", "value", "account", "service", "note")
 
 # The two names `siana-fact exec` puts into the authorised child, repeated here
 # because this is where a minion reads them. It is told rather than left to
@@ -415,7 +421,7 @@ def check_fact(fact: dict, handle: str, store: str) -> None:
                 "a minion is handed this as somewhere to go, and anything on the",
                 f"path can rewrite somewhere that is not {URL_SCHEME}",
                 "run `siana-fact status` to see every record in this state")
-    for field in PRINTED:
+    for field in SCREENED:
         if any(ch < " " or ch == "\x7f" for ch in str(fact.get(field) or "")):
             die(f"{store} records {rid} with a control character in its {field}",
                 "a fact is appended to a minion's orders as data, and a newline in",

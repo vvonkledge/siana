@@ -257,6 +257,14 @@ class Refusals(Section):
         self.store("grants.jsonl", grant("ship-it"))
         self.assertIn("with no service", self.refusal())
 
+    def test_a_credential_whose_service_is_unusable_is_not_delivered_either(self):
+        # The same consequence as a credential with no service at all: an orders
+        # section carrying a `siana-fact exec` line that the command those orders
+        # name would then refuse.
+        self.store("facts.jsonl", dict(CREDENTIAL, service="siana/demo/x\ny"))
+        self.store("grants.jsonl", grant("ship-it"))
+        self.assertIn("control character in its service", self.refusal())
+
     def test_a_grant_recording_a_different_project_than_the_task_works_in(self):
         # The one record that could hand a minion the keys to somewhere it is not
         # working, so nothing here picks whichever project it likes.

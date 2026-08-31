@@ -111,12 +111,13 @@ MAX_VALUE = 400
 SLUG = re.compile(r"[a-z][a-z0-9-]{1,47}")
 MAX_META = 200
 
-# Every field of a fact that is printed, handed to the keychain, or written into a
-# minion's orders. A control character in one of them is a fact that can forge the
-# section around it, and the contract refuses one on the way in - so a record
-# carrying one was written around this command, and both readers of the store have
-# to say the same thing about it. `siana-dispatch`'s `check_fact` holds the twin.
-PRINTED = ("slug", "value", "account", "service", "note")
+# Every field of a fact that has to survive being read: printed to a terminal,
+# handed to the keychain, or written into a minion's orders. A control character in
+# one of them is a fact that can forge whatever it is printed into, and the contract
+# refuses one on the way in - so a record carrying one was written around this
+# command, and both readers of the store have to say the same thing about it.
+# `siana-dispatch`'s `SCREENED` is the twin of this list and has to stay the twin.
+SCREENED = ("slug", "value", "account", "service", "note")
 
 
 class Refusal(SystemExit):
@@ -286,7 +287,7 @@ def malformed(fact: dict) -> str:
         parsed = urlparse(str(fact["value"]))
         if parsed.scheme != URL_SCHEME or not parsed.netloc:
             return f"value is not an {URL_SCHEME} URL"
-    for field in PRINTED:
+    for field in SCREENED:
         if any(ch < " " or ch == "\x7f" for ch in str(fact.get(field) or "")):
             return f"{field} carries a control character"
     if not fact.get("project") or not fact.get("slug"):
@@ -927,11 +928,11 @@ def cmd_status(args, home: Home) -> None:
         if state == "granted":
             print(f"  ok      {where}")
         elif state == "revoked":
-            print(f"  ok      {where}  revoked at {grant.get('revoked')}")
+            print(f"  ok      {where}  revoked at {safe(grant.get('revoked'))}")
         elif state == "stale":
             task = tasks.get(str(grant.get("task"))) or {}
-            print(f"  stale   {where}  the task is {task.get('status')}, so this"
-                  f" authorises nothing")
+            print(f"  stale   {where}  the task is {safe(task.get('status'))}, so"
+                  f" this authorises nothing")
             print(f"          withdraw it: siana-fact revoke"
                   f" {safe(grant.get('task'))} {safe(grant.get('fact'))}")
         elif state == "orphan":

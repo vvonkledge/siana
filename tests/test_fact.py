@@ -692,6 +692,22 @@ class Status(Facts):
         self.assertEqual(len([line for line in out.stdout.splitlines()
                               if line.startswith("  ")]), 1)
 
+    def test_the_grants_half_of_the_report_cannot_be_forged_either(self):
+        # The facts half was protected and the grants half was not, and a grant is
+        # the record most worth forging an `ok` line for: a revoked one is not
+        # counted as a fault, so the report still exits 0 around the forgery.
+        self.store("grants.jsonl",
+                   {"id": "ship-it/demo/test-user", "task": "ship-it",
+                    "fact": "demo/test-user", "project": "demo", "status": "revoked",
+                    "granted": "2026-08-31T00:00:00Z",
+                    "revoked": "2026-08-31T00:00:00Z\n  ok      forged -> demo/x"})
+        out = self.assertAccepted(self.status())
+        # One line for one grant. The forged text is still in it, escaped and
+        # visibly part of the record it came from, which is the whole difference.
+        self.assertIn("\\x0a  ok      forged", out)
+        self.assertEqual(len([line for line in out.splitlines()
+                              if line.startswith("  ")]), 1)
+
     def test_the_list_cannot_be_forged_by_a_record_either(self):
         self.store("facts.jsonl", {"id": "demo/x\ny", "project": "demo",
                                    "slug": "x\ny", "kind": "text", "value": "ok",
