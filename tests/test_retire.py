@@ -15,7 +15,7 @@ import os
 import shutil
 import unittest
 
-from helpers import HomeTest, script
+from helpers import BIN, HomeTest, script
 
 r = script("siana-retire")
 
@@ -587,12 +587,25 @@ class WhatItSays(Retire):
         self.assertIn("kept   siana/make-thing", text)
 
     def test_it_names_the_herdr_workspace_it_did_not_close(self):
-        # Closing it kills that agent, which is judgment. Saying nothing would
-        # leave a pane whose directory has gone with no sign of why.
+        # Closing it kills the agent in it, so it stays a separate step. Saying
+        # nothing would leave a pane whose directory has gone with no sign of why,
+        # and naming no command would leave the reader to find one.
         self.finished()
         text = self.assertAccepted(self.retire())
         self.assertIn("claude@w1:p1", text)
-        self.assertIn("yours to decide", text)
+        self.assertIn("siana-close-workspace make-thing", text)
+
+    def test_it_closes_nothing_itself(self):
+        # The ordering is retire then close, and this is the first half of it: what
+        # this command knows is git, and every discriminator a close needs - linked
+        # or source, whose pane, what is running - is herdr's. A retirement that
+        # reached for herdr would be taking that decision with none of the evidence.
+        self.finished()
+        self.assertAccepted(self.retire())
+        with open(os.path.join(BIN, "siana-retire")) as fh:
+            body = fh.read()
+        for reached in ("socket", "workspace.close", "HERDR_SOCKET_PATH"):
+            self.assertNotIn(reached, body, reached)
 
 
 if __name__ == "__main__":

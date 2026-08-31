@@ -18,12 +18,30 @@ This only makes those two facts durable, and refuses the three ways they go wron
 Reads fold the log directly; every write goes through `datafile`, so what lands has
 already passed the contract.
 
+A `decision` carries more than the question, and that is the second thing this
+records. The obligation holds the question, the status and the captain's answer; the
+reasoning behind it - the situation, the options, what each one costs, which SIANA
+would choose and why - goes to `attended.jsonl`, keyed by the same id. Two stores and
+one fact each: the answer lives only in the obligation, the reasoning lives only
+beside it, and `history` is the join. A copy of the answer here would be the one that
+goes stale.
+
+That store is a learning corpus and a reporting foundation. Nothing reads
+`recommendation` as permission, and no command in this distro turns a row of it into
+an action. It exists so that "how often did SIANA and the captain agree, and about
+what" is a question with an answer, which is the only ground an argument for more
+autonomy could ever stand on.
+
 Usage:
     siana-owe                                  what is still open
     siana-owe closed                           what was answered, and by what
+    siana-owe history [--json]                 every attended decision, joined
     siana-owe promise <text> [--task <id>]     something SIANA owes the captain
-    siana-owe decision <text> [--task <id>]    something only the captain can answer
+    siana-owe decision <text>                  something only the captain can answer
+        --situation <text> --option <text> --consequence <text>
+        --recommend <text> --because <text> [--task <id>] [--project <handle>]
     siana-owe close <id> --answer <text>       retire one, naming what answered it
+    siana-owe outcome <id> --outcome <text>    what happened, once it was carried out
 """
 
 import argparse
@@ -112,8 +130,12 @@ def fold(store: str, key: str):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                # The store being folded, not the one this used to be the only reader
+                # of. `joined` folds `attended.jsonl` too, and a recovery naming the
+                # wrong file quarantines nothing and leaves the reader where it was.
                 die(f"{store} has a line that is not JSON",
-                    "run `datafile -f obligations.jsonl repair` to quarantine it")
+                    f"run `datafile -f {os.path.basename(store)} repair` to"
+                    " quarantine it")
             rid = rec.get(key)
             if rid is None:
                 continue
@@ -169,6 +191,135 @@ def write(store: str, schema: str, record: dict) -> None:
             *(proc.stdout + proc.stderr).strip().splitlines()[:6])
 
 
+def need_attended(schema: str) -> None:
+    """A decision without its reasoning contract is a stop, for the reason a missing
+    obligations contract is: the corpus is the point of recording the reasoning at
+    all, and one written nowhere is worse than one refused. An older home reaches
+    this after an upgrade rather than before, because `just init` writes a contract
+    it does not find and never rewrites one it does."""
+    if not os.path.isfile(schema):
+        die(f"no attended-decision contract at {schema}",
+            "it is what makes the captain's decisions a corpus rather than a memory",
+            "run `just upgrade` in the distro")
+
+
+def check_reasoning(args) -> dict:
+    """The reasoning half of a decision, refused rather than defaulted.
+
+    Every field here is required, and that is a deliberate cost at the moment SIANA
+    writes one down. A decision recorded as a bare question is one the captain has to
+    reconstruct the state of the world for before they can answer it, and a corpus
+    of those teaches nothing at all: "the captain said yes" is not a policy unless
+    what they were choosing between is beside it.
+
+    The two structural refusals are the ones a reader cannot recover from later:
+    a single option is a notification wearing a decision's clothes, and a consequence
+    list of a different length is a list read against the wrong option, which is
+    worse than having none.
+    """
+    missing = [name for name, value in (
+        ("--situation", args.situation), ("--recommend", args.recommend),
+        ("--because", args.rationale)) if not (value or "").strip()]
+    if missing:
+        die(f"a decision needs {', '.join(missing)}",
+            "the obligation holds the question; this holds what the captain needs in",
+            "order to answer it, and what a later SIANA would learn a policy from")
+    options = [o.strip() for o in args.option if o.strip()]
+    costs = [c.strip() for c in args.consequence if c.strip()]
+    if len(options) < 2:
+        die("a decision needs at least two --option values",
+            "one option is a notification, and recording it as a decision teaches",
+            "the corpus that the captain agreed to something they were never",
+            "offered an alternative to")
+    if len(costs) != len(options):
+        die(f"{len(options)} options and {len(costs)} consequences",
+            "give one --consequence per --option, in the same order; a consequence",
+            "read against the wrong option is worse than none")
+    if not args.recommend.strip() in options:
+        die(f"--recommend is not one of the options: {args.recommend}",
+            "recommending something the captain was not offered is how a corpus",
+            "records agreement with a choice that was never on the table",
+            *(f"  option: {o}" for o in options))
+    rec = {"situation": args.situation.strip(), "options": options,
+           "consequences": costs, "recommendation": args.recommend.strip(),
+           "rationale": args.rationale.strip()}
+    if args.task:
+        rec["task"] = args.task
+    if args.project:
+        rec["project"] = args.project
+    return rec
+
+
+def history_view(items, as_json: bool) -> None:
+    """The corpus, one row per attended decision: what was asked, what was offered,
+    what SIANA would have chosen and why, what the captain actually said, and how it
+    turned out.
+
+    Joined at read time from the two stores rather than assembled at write time into
+    one. That is what keeps `answer` in exactly one place: this reads it out of the
+    obligation every time it is printed, so it cannot disagree with `siana-owe closed`
+    and there is nothing here for a later edit to leave stale.
+
+    `--json` because this is the learning corpus, and the thing that will one day be
+    asked how often SIANA and the captain agreed is a program rather than a reader.
+    """
+    if as_json:
+        print(json.dumps(items, indent=2))
+        return
+    if not items:
+        print("decided  nothing")
+        return
+    print(f"decided  {len(items)}")
+    for rec in items:
+        stamp = rec.get("closed") or rec.get("opened") or ""
+        print(f"  {rec['id']}  {age(stamp):>3}  {rec['status']}")
+        print(f"    asked      {rec['body']}")
+        if rec.get("situation"):
+            print(f"    situation  {rec['situation']}")
+        for option, cost in zip(rec.get("options", []), rec.get("consequences", [])):
+            print(f"    option     {option}")
+            print(f"      costs    {cost}")
+        if rec.get("recommendation"):
+            print(f"    siana      {rec['recommendation']}")
+            print(f"      because  {rec.get('rationale', '')}")
+        # Absent rather than "(unrecorded)": an open decision has no answer because
+        # nobody has been asked yet, which is a different fact from one recorded
+        # without its answer, and the corpus must never blur the two.
+        if rec["status"] == "closed":
+            print(f"    captain    {answered(rec)}")
+        if rec.get("outcome"):
+            print(f"    outcome    {rec['outcome']}")
+
+
+def joined(store: str, attended: str):
+    """Every attended decision, newest activity first.
+
+    Driven from the reasoning store rather than from the obligations: an obligation
+    of kind `decision` written before this store existed has no reasoning to report,
+    and inventing empty options for it would put a row in the corpus saying the
+    captain was offered nothing. Those stay readable through `siana-owe` and
+    `siana-owe closed`, which is what "existing records remain unambiguous" means -
+    they are simply not part of the corpus, because they never carried what a corpus
+    is made of.
+    """
+    obligations = fold(store, "id")
+    rows = []
+    for rid, reasoning in fold(attended, "id").items():
+        rec = dict(reasoning)
+        ob = obligations.get(rid)
+        if ob is None:
+            # The reasoning outlived its obligation: a tombstoned or hand-deleted
+            # record. Reported rather than dropped, because a corpus that quietly
+            # loses rows is one nobody can count.
+            rec.update(body="(the obligation for this is gone)", status="orphan")
+        else:
+            rec.update(body=ob.get("body", ""), status=ob.get("status", ""),
+                       answer=ob.get("answer"), closed=ob.get("closed"))
+        rows.append(rec)
+    return sorted(rows, key=lambda r: str(r.get("closed") or r.get("opened") or ""),
+                  reverse=True)
+
+
 def view(items) -> None:
     """The open view, in the shape siana-dispatch reports in: aligned plain text,
     outcomes first. Nothing owed is the ordinary state and never a fault, so it
@@ -217,19 +368,37 @@ def main() -> None:
     home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
     store = os.path.join(home, "obligations.jsonl")
     schema = os.path.join(home, "schema-obligations.yaml")
+    attended = os.path.join(home, "attended.jsonl")
+    attended_schema = os.path.join(home, "schema-attended.yaml")
 
     ap = argparse.ArgumentParser(
         prog="siana-owe", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter, add_help=True)
     sub = ap.add_subparsers(dest="cmd")
-    for kind in ("promise", "decision"):
-        p = sub.add_parser(kind)
-        p.add_argument("body")
-        p.add_argument("--task", help="the queue task this is about, if it is about one")
+    pr = sub.add_parser("promise")
+    pr.add_argument("body")
+    pr.add_argument("--task", help="the queue task this is about, if it is about one")
+    d = sub.add_parser("decision")
+    d.add_argument("body")
+    d.add_argument("--task", help="the queue task this is about, if it is about one")
+    d.add_argument("--project", help="the project handle this is about, if it is one")
+    d.add_argument("--situation", help="what made this a decision, in the captain's terms")
+    d.add_argument("--option", action="append", default=[],
+                   help="one thing the captain may choose; give it at least twice")
+    d.add_argument("--consequence", action="append", default=[],
+                   help="what follows from the option in the same position")
+    d.add_argument("--recommend", help="which option SIANA would choose")
+    d.add_argument("--because", dest="rationale", help="why SIANA would choose it")
     sub.add_parser("closed")
+    h = sub.add_parser("history")
+    h.add_argument("--json", action="store_true", dest="as_json",
+                   help="the corpus as records, for a program rather than a reader")
     c = sub.add_parser("close")
     c.add_argument("id")
     c.add_argument("--answer", help="the durable event that answered this")
+    o = sub.add_parser("outcome")
+    o.add_argument("id")
+    o.add_argument("--outcome", help="what actually happened once it was carried out")
     args = ap.parse_args()
 
     # The contract is what says the store exists, because a store with no
@@ -246,6 +415,40 @@ def main() -> None:
 
     if args.cmd == "closed":
         closed_view(closed_items(store))
+        return
+
+    if args.cmd == "history":
+        # The contract first, for the reason `fold` gives: it is what says the store
+        # exists. Without it a home that has not been upgraded reported `decided
+        # nothing`, which is what a home with an empty corpus reports, while
+        # `siana-owe` and `siana-owe closed` went on listing real decisions.
+        need_attended(attended_schema)
+        history_view(joined(store, attended), args.as_json)
+        return
+
+    if args.cmd == "outcome":
+        # The outcome goes on the reasoning record, and only there. It is the one
+        # field of a decision that has no meaning until long after the answer, and
+        # the obligation is closed by then and must not be reopened to hold it.
+        need_attended(attended_schema)
+        rec = fold(attended, "id").get(args.id)
+        if rec is None:
+            die(f"no attended decision under that id: {args.id}",
+                "`siana-owe history` lists the ones there are")
+        ob = fold(store, "id").get(args.id)
+        if ob is None or ob.get("status") != "closed":
+            die(f"{args.id} has not been answered yet",
+                "an outcome recorded before the captain answers is a guess, and a",
+                "guess in a learning corpus teaches the wrong thing",
+                f"close it first: siana-owe close {args.id} --answer <what answered it>")
+        if not args.outcome:
+            die(f"what happened after {args.id}?",
+                "usage: siana-owe outcome <id> --outcome <text>")
+        rec = dict(rec)
+        rec.update(outcome=args.outcome, outcome_at=now())
+        write(attended, attended_schema, rec)
+        print(f"outcome  {args.id}")
+        print(f"  was    {args.outcome}")
         return
 
     if args.cmd == "close":
@@ -277,11 +480,24 @@ def main() -> None:
     body = args.body.strip()
     if not body:
         die("an obligation needs a body", "what is it that is owed?")
+    reasoning = None
+    if args.cmd == "decision":
+        need_attended(attended_schema)
+        reasoning = check_reasoning(args)
     rid = slug(body, fold(store, "id"))
     rec = {"id": rid, "kind": args.cmd, "body": body, "status": "open", "opened": now()}
     if args.task:
         rec["task"] = args.task
+    # The obligation first, and the reasoning second. Both orders lose something on a
+    # crash between them and this loses the less bad half: an obligation with no
+    # reasoning is a decision the captain is still asked, which is the fleet working;
+    # reasoning with no obligation is a row nobody will ever be asked about, and the
+    # captain would never find out the question existed.
     write(store, schema, rec)
+    if reasoning is not None:
+        reasoning["id"] = rid
+        reasoning["opened"] = rec["opened"]
+        write(attended, attended_schema, reasoning)
     print(f"owed     {rid} ({args.cmd})")
     print(f"  close  siana-owe close {rid} --answer <what answered it>")
 
