@@ -520,11 +520,23 @@ because a run killed by a hang guard printed dots that no line-oriented reader e
 showed.
 
 Driving real commands is also what makes the suite slow, and slow in a particular
-way: it waits rather than computes. Measured on an eleven-core M3 Pro, a serial run
-was 619s and spent 465s of CPU doing it - three quarters of one core, with ten
-sitting idle. So `tests/run.py` hands whole test classes to a pool of worker
-processes and the same suite comes back in a bit over three minutes. The first line
-of a run says how many workers it got.
+way: it waits rather than computes. A serial run spends about three quarters of one
+core for its whole length, with the rest of the machine idle. So `tests/run.py`
+hands whole test classes to a pool of worker processes, and the first line of a run
+says how many workers it got.
+
+Measured on an eleven-core M3 Pro, 901 tests, interleaving the two modes:
+
+    one worker      1070s and 1073s
+    five workers    428s to 553s, median 447s
+
+That is a 58% cut, and the spread is the machine rather than the runner. The
+serial figures agree to within 0.3% because a run using less than one core barely
+notices what else is happening; the pool, at three and a half cores, does. Those
+runs were taken with the load average between 10 and 27, and on a quiet machine the
+same pool finishes in a little over three minutes. Expect somewhere between three
+and nine minutes depending on what else the machine is doing, and take the
+one-worker figure as the thing that does not move.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like

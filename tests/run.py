@@ -620,6 +620,7 @@ class Emit(unittest.TextTestResult):
         self.showAll = False
         self.events = events
         self.mark = ()
+        self.subs = []
 
     def send(self, **event):
         self.events.write(json.dumps(event) + "\n")
@@ -633,6 +634,7 @@ class Emit(unittest.TextTestResult):
         # under the test that registered it instead of arriving after its `end`.
         self.mark = (len(self.failures), len(self.errors), len(self.skipped),
                      len(self.expectedFailures), len(self.unexpectedSuccesses))
+        self.subs = []
         self.send(e="start", id=test.id())
         # `exit=False` here, where the serial path uses `exit=True`, and the
         # difference is the whole of how a stall gets cleaned up. A worker that took
@@ -643,10 +645,34 @@ class Emit(unittest.TextTestResult):
         # can therefore still walk its tree - is what kills it, GRACE_S later.
         faulthandler.dump_traceback_later(STALL_S, exit=False)
 
+    def addSubTest(self, test, subtest, err):
+        """A failing `subTest` block, reported as its own entry.
+
+        unittest gives a test with three failing subtests three entries in
+        `failures` and says `failures=3`, and this suite drives whole tables of
+        bad input through `subTest` - six modules do. Folded into the single
+        outcome `stopTest` sends, a regression in one of those tables would report
+        one failure and show only the last bad input, while the serial control
+        showed every one of them. The two modes have to say the same thing.
+        """
+        super().addSubTest(test, subtest, err)
+        if err is None:
+            return
+        failed = issubclass(err[0], test.failureException)
+        detail = (self.failures if failed else self.errors)[-1][1]
+        self.subs.append(("fail" if failed else "error"))
+        self.send(e="sub", id=test.id(), sub=subtest.id(),
+                  o="fail" if failed else "error", t=detail)
+
     def stopTest(self, test):
         faulthandler.cancel_dump_traceback_later()
         super().stopTest(test)
         failures, errors, skipped, expected, unexpected = self.mark
+        # What the subtests contributed is taken back out, so that a test whose
+        # only failures were in `subTest` blocks is not also reported a second time
+        # under its own id with the last of them attached.
+        failures += self.subs.count("fail")
+        errors += self.subs.count("error")
         if len(self.errors) > errors:
             self.send(e="end", id=test.id(), o="error", t=self.errors[-1][1])
         elif len(self.failures) > failures:
@@ -658,6 +684,10 @@ class Emit(unittest.TextTestResult):
                       t=self.expectedFailures[-1][1])
         elif len(self.unexpectedSuccesses) > unexpected:
             self.send(e="end", id=test.id(), o="uxsuccess", t="")
+        elif self.subs:
+            # Its own outcome is clean; the failures were the subtests', and they
+            # have been sent already.
+            self.send(e="end", id=test.id(), o="subs", t="")
         else:
             self.send(e="end", id=test.id(), o="ok", t="")
 
@@ -749,22 +779,34 @@ SEPARATOR2 = "-" * 70
 LABEL = {"error": "ERROR", "fail": "FAIL", "uxsuccess": "UNEXPECTED SUCCESS"}
 
 
-def report(ids, outcomes, wall, verbosity, stream):
+def report(ids, outcomes, subs, wall, verbosity, stream):
     """unittest's summary, rebuilt from what the workers said.
 
     Walked in discovery order rather than in the order results arrived, so the
     report of a given head is the same text every time however the pool happened to
     schedule it. That is the property that makes two runs comparable at all.
+
+    `subs` holds the failing `subTest` blocks, keyed by the test that ran them.
+    unittest counts one entry per failing subtest rather than one per test, and
+    prints each; so does this, and each is printed under its parent so the order is
+    still discovery order.
     """
     counts = {}
     for tid in ids:
         outcome, detail = outcomes[tid]
-        counts[outcome] = counts.get(outcome, 0) + 1
+        # A test whose only failures were its subtests' is not itself an outcome to
+        # count: unittest counts the subtests, which are added just below.
+        if outcome != "subs":
+            counts[outcome] = counts.get(outcome, 0) + 1
         if outcome in LABEL:
             stream.write(f"{SEPARATOR1}\n{LABEL[outcome]}: {tid}\n{SEPARATOR2}\n")
             stream.write(f"{detail.rstrip()}\n\n" if detail else "\n")
         elif outcome == "skip" and verbosity > 1:
             stream.write(f"SKIP: {tid}: {detail}\n")
+        for sub, kind, text in subs.get(tid, ()):
+            counts[kind] = counts.get(kind, 0) + 1
+            stream.write(f"{SEPARATOR1}\n{LABEL[kind]}: {sub}\n{SEPARATOR2}\n")
+            stream.write(f"{text.rstrip()}\n\n" if text else "\n")
     stream.write(f"{SEPARATOR2}\nRan {len(ids)} test"
                  f"{'' if len(ids) == 1 else 's'} in {wall:.3f}s\n\n")
     bad = counts.get("fail", 0) + counts.get("error", 0) + counts.get("uxsuccess", 0)
@@ -804,6 +846,7 @@ def coordinate(ids, pool, verbosity, failfast, stream):
     root = short_tmp()
     workers, started = [], time.monotonic()
     survivors, stalled, orphans = [], None, []
+    subs = {}
 
     def cleanup():
         return reap(workers, root)
@@ -948,6 +991,11 @@ def coordinate(ids, pool, verbosity, failfast, stream):
                             stream.write("          " + (
                                 f"skipped: {event['t']}" if event["o"] == "skip"
                                 else event["o"]) + "\n")
+                    elif event["e"] == "sub":
+                        subs.setdefault(event["id"], []).append(
+                            (event["sub"], event["o"], event["t"]))
+                        stream.write(f"          {LABEL[event['o']]}: "
+                                     f"{event['sub']}\n")
                     elif event["e"] == "left":
                         # A worker could not kill something it started. Held here
                         # so it reaches the report and the exit code, exactly as
@@ -1001,7 +1049,8 @@ def coordinate(ids, pool, verbosity, failfast, stream):
             outcomes.setdefault(tid, ("error", (
                 "no worker reported this test; it was discovered and never ran\n")))
     reported = [t for t in ids if t in outcomes]
-    ok = report(reported, outcomes, time.monotonic() - started, verbosity, stream)
+    ok = report(reported, outcomes, subs, time.monotonic() - started,
+                verbosity, stream)
     leftover = sorted(set(survivors) | set(orphans))
     if leftover:
         stream.write(f"\nleft running after SIGKILL: {leftover}\n")

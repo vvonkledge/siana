@@ -365,6 +365,70 @@ class Equivalence(Fixture):
             self.assertIn("Ran 6 tests", out.stdout)
             self.assertIn("FAILED (failures=1, errors=1, skipped=1)", out.stdout)
 
+    def test_every_failing_subtest_is_reported_in_both_modes(self):
+        """Bad-input tables are driven through `subTest` in six modules here.
+
+        unittest counts one entry per failing subtest and prints each, so a pool
+        that folded them into the single outcome it sends per test would say
+        `failures=1` and show only the last bad input, while the serial control
+        showed every one. The exit code would still be red; the diagnostics would
+        not survive, and that is the half a developer actually reads.
+        """
+        where = self.suite(test_subs="""
+            import unittest
+
+            class Table(unittest.TestCase):
+                def test_each_bad_input(self):
+                    for value in ("one", "two", "three"):
+                        with self.subTest(value=value):
+                            self.fail(f"rejected {value}")
+
+                def test_fine(self): pass
+        """)
+        serial = self.go(where, workers=1)
+        parallel = self.go(where, workers=2)
+        for out in (serial, parallel):
+            self.assertNotEqual(out.returncode, 0, out.stdout)
+            self.assertIn("Ran 2 tests", out.stdout)
+            self.assertIn("FAILED (failures=3)", out.stdout)
+            for value in ("one", "two", "three"):
+                self.assertIn(f"rejected {value}", out.stdout,
+                              f"the {value} subtest was not reported")
+
+    def test_a_test_whose_subtests_all_pass_is_an_ordinary_pass(self):
+        where = self.suite(test_subs="""
+            import unittest
+
+            class Table(unittest.TestCase):
+                def test_each_good_input(self):
+                    for value in (1, 2, 3):
+                        with self.subTest(value=value):
+                            self.assertTrue(value)
+        """)
+        for workers in (1, 2):
+            out = self.go(where, workers=workers)
+            self.assertEqual(out.returncode, 0, out.stdout)
+            self.assertIn("Ran 1 test", out.stdout)
+            self.assertIn("OK", out.stdout)
+
+    def test_a_subtest_failure_beside_a_real_one_counts_both(self):
+        # The accounting `stopTest` has to get right: the test's own failure is
+        # not the subtests', and neither may swallow the other.
+        where = self.suite(test_subs="""
+            import unittest
+
+            class Mixed(unittest.TestCase):
+                def test_a_subtest_then_the_test(self):
+                    with self.subTest(step="inner"):
+                        self.fail("inner failed")
+                    self.fail("outer failed")
+        """)
+        for workers in (1, 2):
+            out = self.go(where, workers=workers)
+            self.assertIn("FAILED (failures=2)", out.stdout)
+            self.assertIn("inner failed", out.stdout)
+            self.assertIn("outer failed", out.stdout)
+
     def test_a_green_suite_is_green_in_both_modes(self):
         where = self.suite(test_green="""
             import unittest
