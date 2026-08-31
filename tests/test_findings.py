@@ -827,6 +827,28 @@ class Plan(Ledger):
                 self.assertRefused(self.archive(self.round_one(**{field: value})),
                                    f"sets {field}, which the archive fills in")
 
+    def test_a_record_the_contract_would_refuse_writes_nothing_at_all(self):
+        # The contract used to be applied first by the `datafile put`, which is after
+        # the blobs are copied and after `git update-ref` has written into the
+        # captain's own checkout. An abbreviated head reaches that far, because
+        # `git cat-file -e` resolves an abbreviation and only the contract's pattern
+        # does not - so the archive wrote outside itself and then refused.
+        sha = self.digest(self.report)
+        out = self.assertRefused(self.archive(self.round_one(head=self.rejected[:7])),
+                                 "would not accept")
+        self.assertIn("head", out)
+        self.assertIn("nothing has been written", out)
+        self.assertFalse(os.path.exists(self.blob(sha)))
+        self.assertFalse(os.path.exists(self.at("findings", "refs.log")))
+        self.assertEqual(self.run_cmd(
+            ["git", "-C", self.repo, "rev-parse", "--verify", "--quiet",
+             f"{f.REF_NAMESPACE}/qa-one"]).stdout.strip(), "")
+        self.assertEqual(self.ledger_lines(), [])
+
+    def test_a_required_field_the_plan_left_out_is_refused_by_the_contract(self):
+        self.assertRefused(self.archive(self.round_one(resolution=_OMIT)),
+                           "would not accept", "resolution")
+
     def test_a_plan_naming_a_field_the_contract_does_not_have_is_refused(self):
         self.assertRefused(self.archive(self.round_one(note="a stray key")),
                            "fields this contract does not have: note")
@@ -968,6 +990,17 @@ class Unverifiable(Ledger):
         self.assertIn("unverifiable", out)
         self.assertIn("could not be checked", out)
         self.assertNotIn("ok            every check", out)
+
+    def test_an_acceptance_removed_from_the_queue_is_unverifiable_not_failed(self):
+        # The highest round's acceptance is a task in the queue, and the queue is
+        # not this store's to keep: the design recommends `datafile roll` if it ever
+        # gets too big, and a record whose acceptance went that way is a record
+        # nothing is wrong with. Failing it would report an intact ledger as broken.
+        self.archived()
+        self.assertAccepted(self.tasks("drop", "qa-fix-one", "--reason", "by hand"))
+        out = self.assertAccepted(self.findings("verify"))
+        self.assertIn("unverifiable  qa-one  acceptance", out)
+        self.assertNotIn("failed", out)
 
 
 class Pure(unittest.TestCase):

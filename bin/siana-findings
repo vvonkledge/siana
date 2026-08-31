@@ -471,9 +471,15 @@ def check_record(rec, case, world, stage: str):
                                                       f" {nxt.get('id')}"))
         task, where = world.task_or_archived(acceptance)
         if task is None:
+            # Below the highest round the acceptance is another round of this case,
+            # so a missing one is a hole in the ledger and a real failure. At the
+            # highest round it is a `done` task in the queue, and the queue is not
+            # this store's to keep: one removed by other means is the world having
+            # lost what the check reads, which is neither a fault here nor something
+            # a green may be claimed over.
             out.append(Problem(rid, "acceptance", f"{acceptance} is neither in the"
                                                   " queue nor in this ledger",
-                               verifiable=nxt is None))
+                               verifiable=nxt is not None))
         else:
             if nxt is None and where == "queue" and task.get("status") != "done":
                 # The highest round present names an acceptance that has not
@@ -810,24 +816,18 @@ def case_view(world, name):
           " here; `siana-findings verify` checks the mechanics")
 
 
-def contract_problems(world):
-    """Check 1: every line of the ledger still passes the contract.
+def contract_issues(store: str, schema: str):
+    """What the contract says is wrong with a file of records, one line each.
 
-    Asked of `datafile --strict`, which is the code that enforces it at the write,
-    rather than re-implemented here. A second validator would be a second opinion
-    about what this store accepts, and the one that matters is the one the store
-    uses. Its exit code is the answer and its issue lines are the message: they
-    name the line and the field, which is what a reader needs in order to go and
-    look.
-
-    A record that violates the contract fails every check below as well, because
-    the fields those read are the ones it is missing. Naming the contract violation
-    is what says why: a record with no `source` is a record nobody wrote through
-    this command, not a case somebody archived badly."""
-    if not os.path.isfile(world.store):
+    Asked of `datafile --strict`, which is the code that enforces this contract at
+    the write, rather than re-implemented here. A second validator would be a second
+    opinion about what this store accepts, and the one that matters is the one the
+    store uses. Its issue lines name the line and the field, which is what a reader
+    needs in order to go and look."""
+    if not os.path.isfile(store):
         return []
     proc = subprocess.run(
-        ["datafile", "-f", world.store, "-c", world.schema, "validate", "--strict"],
+        ["datafile", "-f", store, "-c", schema, "validate", "--strict"],
         capture_output=True, text=True, check=False)
     if proc.returncode == 0:
         return []
@@ -839,10 +839,44 @@ def contract_problems(world):
         if line.startswith("help["):
             break
         if keep and line.strip():
-            out.append(Problem("(the log)", "contract", line.strip()))
-    return out or [Problem("(the log)", "contract",
-                           "datafile refused this store and said nothing this could"
-                           " relay; run `datafile -f findings.jsonl validate`")]
+            out.append(line.strip())
+    return out or ["datafile refused this store and said nothing this could relay;"
+                   f" run `datafile -f {store} validate`"]
+
+
+def contract_problems(world):
+    """Check 1: every line of the ledger still passes the contract.
+
+    A record that violates the contract fails every check below it as well, because
+    the fields those read are the ones it is missing. Naming the contract violation
+    is what says why: a record with no `source` is a record nobody wrote through
+    this command, not a case somebody archived badly."""
+    return [Problem("(the log)", "contract", issue)
+            for issue in contract_issues(world.store, world.schema)]
+
+
+def contract_refusals(records, schema: str):
+    """The contract's verdict on a plan's records, before anything has been written.
+
+    The archive's first step is to validate everything, and until this existed the
+    contract was first applied by the `datafile put` at step 4 - after the blobs had
+    been copied and after `git update-ref` had created a ref in the captain's own
+    checkout. A plan abbreviating a `head` reaches that far: `git cat-file -e`
+    resolves an abbreviation, so the head check passes and only the store refuses
+    it, by which time this command has already written outside itself.
+
+    Validated by writing the candidates to a scratch store and asking `datafile`, for
+    the reason `contract_issues` gives: the contract is what the store enforces, and
+    a copy of its rules here would be a second opinion that drifts towards accepting
+    what the store rejects."""
+    fd, tmp = tempfile.mkstemp(prefix="findings-plan-", suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
+        return contract_issues(tmp, schema)
+    finally:
+        os.unlink(tmp)
 
 
 def verify(world, only=None):
@@ -1160,6 +1194,15 @@ def archive(world, plan_path: str):
     named = {r["id"] for r in plan}
     records.extend(rec for rid, rec in sorted(world.ledger.items())
                    if rec.get("case") == case_name and rid not in named)
+
+    # 1. The contract first, and on its own. Every check below reads fields the
+    #    contract has not yet approved, so a record it will refuse produces a page
+    #    of consequential complaints about the one thing that is actually wrong.
+    refused = contract_refusals(records, world.schema)
+    if refused:
+        die(f"{case_name} has a record this store would not accept",
+            *refused,
+            "nothing has been written and nothing dropped")
 
     problems = check_case(records, world, "archive")
     superseded = [p for rec in records for p in check_superseded(rec, world)]
