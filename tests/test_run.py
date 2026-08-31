@@ -498,6 +498,36 @@ class Filters(Fixture):
         self.assertIn("          FAIL", out.stdout)
         self.assertIn("          ERROR", out.stdout)
 
+    def test_buffered_output_does_not_kill_the_workers(self):
+        """unittest's `-b`, which the watchdog used to be unable to survive.
+
+        `-b` swaps `sys.stderr` for an `io.StringIO` around each test, and the
+        watchdog is armed just after that. A `StringIO` has no file descriptor, so
+        arming it raised - and the traceback saying so went into the buffer that
+        caused it and was thrown away. The worker exited silently on its first
+        test and the coordinator reported the whole chunk as a worker death, so a
+        green suite came back as errors that never happened.
+        """
+        where = self.suite(test_quiet="""
+            import sys, unittest
+
+            class Noisy(unittest.TestCase):
+                def test_one(self): print("chatter one")
+                def test_two(self): print("chatter two")
+
+            class AlsoNoisy(unittest.TestCase):
+                def test_three(self): print("chatter three", file=sys.stderr)
+        """)
+        for workers in (1, 2):
+            out = self.go(where, "-b", workers=workers)
+            self.assertEqual(out.returncode, 0, out.stdout)
+            self.assertIn("Ran 3 tests", out.stdout)
+            self.assertIn("OK", out.stdout)
+            self.assertNotIn("died", out.stdout)
+            self.assertNotIn("never ran", out.stdout)
+            # And the point of `-b`: a passing test's chatter is swallowed.
+            self.assertNotIn("chatter", out.stdout)
+
     def test_a_skip_is_counted_without_being_verbose(self):
         out = self.go(self.where, workers=3)
         self.assertIn("skipped=1", out.stdout)

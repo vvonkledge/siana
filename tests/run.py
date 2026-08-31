@@ -89,6 +89,16 @@ STALL_S = int(os.environ.get("SIANA_TEST_STALL_S") or 480)
 # faulthandler should have fired and did not is the coordinator's to kill.
 GRACE_S = 10
 
+# Where the watchdog writes, and it has to be named rather than defaulted. The
+# default is whatever `sys.stderr` is when the timer is armed, and unittest's `-b`
+# swaps that for an `io.StringIO` for the duration of each test - which has no file
+# descriptor, so arming the timer raises, and the traceback saying so is written
+# into the buffer that caused it and then thrown away. In a worker that was a
+# silent exit on the first test and a run of fabricated worker deaths in its place.
+# `sys.__stderr__` is the real one: the terminal in the coordinator, and its own log
+# in a worker.
+WATCHDOG = sys.__stderr__
+
 # The suite's size, for the progress line. Set by the runner below, which is the
 # only thing that has counted the tests before they start.
 TOTAL = 0
@@ -119,7 +129,7 @@ class Progress(unittest.TextTestResult):
     def startTest(self, test):
         super().startTest(test)
         self._line(f"{self.testsRun:4d}/{TOTAL} {test.id()}")
-        faulthandler.dump_traceback_later(STALL_S, exit=True)
+        faulthandler.dump_traceback_later(STALL_S, exit=True, file=WATCHDOG)
 
     def stopTest(self, test):
         faulthandler.cancel_dump_traceback_later()
@@ -667,7 +677,7 @@ class Emit(unittest.TextTestResult):
         # gone nothing can say whose it was. So the stack is dumped and the worker
         # stays alive, and the coordinator - which is still holding this worker and
         # can therefore still walk its tree - is what kills it, GRACE_S later.
-        faulthandler.dump_traceback_later(STALL_S, exit=False)
+        faulthandler.dump_traceback_later(STALL_S, exit=False, file=WATCHDOG)
 
     def addSubTest(self, test, subtest, err):
         """A failing `subTest` block, reported as its own entry.
@@ -751,7 +761,7 @@ def work():
             # discovery for exactly that reason; moving the import into workers
             # moved the hazard with it, and a hang here has no test to name and no
             # timer to end it.
-            faulthandler.dump_traceback_later(STALL_S, exit=False)
+            faulthandler.dump_traceback_later(STALL_S, exit=False, file=WATCHDOG)
             loaded, why = {}, ""
             # Per class rather than per chunk. An ordinary chunk is one class, but
             # a solo chunk is every test matching a prefix, and a prefix naming a
@@ -1132,7 +1142,7 @@ def main():
     # import: the wake tests probe for a node that runs TypeScript by running one. A
     # stall there is the one this would otherwise miss entirely, having printed
     # nothing yet.
-    faulthandler.dump_traceback_later(STALL_S, exit=True)
+    faulthandler.dump_traceback_later(STALL_S, exit=True, file=WATCHDOG)
     if pool == 1:
         # The control, and deliberately not this file's pool with one worker in it:
         # a mode meant for deciding whether a failure is the runner's fault has to
