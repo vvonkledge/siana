@@ -106,6 +106,17 @@ path would be outside it. What actually holds is that the destructive mechanics 
 in commands that fail closed on their own inputs; the guard is what keeps the cleaner
 from reaching for them by mistake, and what makes that fact testable.
 
+**A guard it cannot build whole, it does not start.** Each shim needs the real
+command behind it, and one that is not installed can only be written as a refusal.
+For a command the run was refused anyway that is right; for one its grant named it
+is a lie, and the run would proceed with that authority silently inert. So a
+granted command that cannot be found refuses the run before the cleaner exists,
+naming each one. `siana-clean` is the exception that makes the rest safe: it is
+resolved beside the copy that is running rather than on `PATH`, because a checkout
+that is not installed yet has no `siana-clean` on `PATH`, and a run whose own `ask`
+compiled to a refusal is a run that cannot stop - which is how one exited 0 having
+done none of its work.
+
 The same caveat covers the runbook, and it is worth stating rather than leaving to be
 discovered. Nothing but `answer` *writes* it, so a guess cannot be recorded through
 this command - but the cleaner runs with a shell, and a shell redirection reaches any
@@ -143,6 +154,11 @@ GRACE_S = 5
 
 GRANTS = ("inventory", "retire", "reap-report", "close-workspace")
 
+# This command's own name, spelled once. It is guarded below like everything else,
+# and it is also the one entry `resolve` looks up differently, so the two places that
+# have to agree about it agree by construction.
+SELF = "siana-clean"
+
 # What each shim refuses, and the whole of it. A command absent from this table is a
 # command the child reaches unchanged, which is the right default: the cleaner has to
 # read the world, and a guard that had to enumerate every reader would go stale
@@ -158,8 +174,8 @@ GRANTS = ("inventory", "retire", "reap-report", "close-workspace")
 # worktree remove` and `git -C x worktree remove` are the same call and only the
 # words tell them apart.
 GUARDS = {
-    "siana-clean": (("only:ask,runbook",
-                     "a cleaner asks; it never answers, starts, resumes or aborts"),),
+    SELF: (("only:ask,runbook",
+            "a cleaner asks; it never answers, starts, resumes or aborts"),),
     "siana-retire": (("grant:retire",
                       "this run's grant does not include retiring"),),
     "siana-close-workspace": (("grant:close-workspace",
@@ -553,6 +569,52 @@ def clean_path() -> str:
                            if not p.startswith(root))
 
 
+def resolve(name: str, path: str):
+    """Where a guarded command really is, or None if it is nowhere.
+
+    Everything is looked up on the run's own PATH, with one exception: this command
+    is looked up beside the copy that is running.
+
+    The exception is the ask protocol, and without it the protocol does not exist. A
+    checkout that is not installed yet - which is every checkout before it merges -
+    has no `siana-clean` on PATH at all, so a run started from one compiled its own
+    `ask` into a refusal. A live cleaner then met an inventory disagreement it was
+    right to stop on, was refused the one command it had been told to stop with, and
+    the round reported nothing outstanding and exited 0.
+
+    The running copy is the file that is certainly there, certainly executable, and
+    certainly the same code the cleaner was told to call. Nothing else is resolved
+    this way, deliberately: pointing `siana-retire` at an unmerged checkout would
+    change which copy removes a captain's worktree, and that is a decision for
+    whoever installs the fleet rather than for a lookup.
+    """
+    if name == SELF:
+        own = os.path.abspath(__file__)
+        if os.access(own, os.X_OK):
+            return own
+    return shutil.which(name, path=path)
+
+
+def promised(name: str, clauses, grants) -> bool:
+    """Whether this run was told it could call this command.
+
+    A `grant:` clause the run satisfies is authority the cleaner's brief states it
+    has, and `SELF` is how any run stops safely. Both are promises made before the
+    cleaner starts, which is why `guard_dir` refuses to start one it cannot keep.
+
+    The readers - `git`, `herdr`, `tasks`, `datafile` - are deliberately not
+    promises. Nothing told the cleaner they were there, their absence costs it a
+    source of inventory rather than an authority it was told it had, and refusing to
+    start on a machine with no `herdr` would stop cleanup runs that never needed one.
+    """
+    for rule, _ in clauses:
+        if rule == "always":
+            return False
+        if rule.startswith("grant:") and rule.split(":", 1)[1] not in grants:
+            return False
+    return name == SELF or any(r.startswith("grant:") for r, _ in clauses)
+
+
 def sq(text: str) -> str:
     """One shell word, single-quoted, so that nothing in it is ever interpreted.
 
@@ -574,6 +636,25 @@ def refusal_lines(name: str, instead: str):
     """
     said = [f"refused: {name} is not this cleanup run's to call",
             f"  {instead}",
+            "  stop and record what you found. siana-clean ask is how you put",
+            "  a question in front of SIANA"]
+    return [f"printf '%s\\n' {sq(line)} >&2" for line in said] + ["exit 1"]
+
+
+def absent_lines(name: str):
+    """What a shim says when the command it guards is not on this machine.
+
+    Apart from `refusal_lines` because the two are different facts and an agent acts
+    on the difference. A live run holding `close-workspace` was handed the
+    grant-denied wording for a command that was simply not installed, read it as the
+    boundary it was shaped like, and stopped: the grant was inert and nothing said
+    so. `guard_dir` now refuses to start a run whose grant names a command it cannot
+    find, so what reaches here is a reader the machine does not have - and for that
+    the true cause is the only useful thing to say.
+    """
+    said = [f"refused: {name} is not installed on this machine",
+            "  this is not a grant boundary: the command was not on PATH when",
+            "  this run's guard was built, so there is nothing to call",
             "  stop and record what you found. siana-clean ask is how you put",
             "  a question in front of SIANA"]
     return [f"printf '%s\\n' {sq(line)} >&2" for line in said] + ["exit 1"]
@@ -680,7 +761,14 @@ def shim(name: str, clauses, real, grants, question: str) -> str:
             # Nothing to fall through to. Written anyway rather than skipped: a
             # command absent today and installed tomorrow must not become reachable
             # to a run that was already refused it.
-            return "\n".join(["#!/bin/sh", *refuse]) + "\n"
+            #
+            # In its own words rather than the clause's. This branch is past every
+            # refusal above it, so the run was *not* refused this command - it was
+            # promised it, or handed it as a reader - and repeating the clause's
+            # `instead` text tells the cleaner the opposite of what happened. That
+            # is not hypothetical: `close-workspace` was granted, absent, and
+            # reported as "this run's grant does not include closing a workspace".
+            return "\n".join(["#!/bin/sh", *absent_lines(name)]) + "\n"
         if rule.startswith("grant:"):
             continue                       # granted, so this clause has nothing to say
         kind, values = rule.split(":", 1)
@@ -714,13 +802,31 @@ def guard_dir(run_dir: str, grants) -> str:
 
     The one thing the shims read at call time is this run's pending question, because
     that is the one thing that changes while the run is going.
+
+    A guard that cannot be built whole is a refusal here rather than a run, because
+    every way of proceeding lies to the cleaner about what it may do. That is the
+    failure this was found by: two of the three commands a live run's grants named
+    were not installed, so both compiled to refusals, the `close-workspace` grant
+    was inert, `ask` was unreachable, and the run exited 0 saying nothing was
+    outstanding.
     """
-    guard = os.path.join(run_dir, "guard")
-    os.makedirs(guard, exist_ok=True)
     path = clean_path()
     question = os.path.join(run_dir, "question.json")
+    real = {name: resolve(name, path) for name in GUARDS}
+    missing = [name for name, clauses in GUARDS.items()
+               if real[name] is None and promised(name, clauses, grants)]
+    if missing:
+        die("this run cannot build a usable guard",
+            *[f"  {name} is not on PATH" for name in missing],
+            "a grant names the command it unlocks, and `siana-clean` is how a",
+            "cleaner stops to ask. A guard that cannot reach one of those hands the",
+            "cleaner a refusal where it was promised authority, and a cleaner that",
+            "cannot ask cannot stop safely",
+            "install them, or start without the grants that name them")
+    guard = os.path.join(run_dir, "guard")
+    os.makedirs(guard, exist_ok=True)
     for name, clauses in GUARDS.items():
-        body = shim(name, clauses, shutil.which(name, path=path), grants, question)
+        body = shim(name, clauses, real[name], grants, question)
         target = os.path.join(guard, name)
         with open(target, "w") as fh:
             fh.write(body)

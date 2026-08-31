@@ -105,6 +105,65 @@ class Shims(unittest.TestCase):
         self.assertIn("refused", body)
         self.assertNotIn("exec", body)
 
+    def test_a_granted_command_that_is_absent_never_blames_the_grant(self):
+        # The live failure. The run held `close-workspace`, the command shipped only
+        # in an unmerged branch, and the shim it was handed said its grant did not
+        # include closing a workspace. The cleaner read that as the safety boundary
+        # it is shaped like and stopped, with nothing anywhere saying the command
+        # was simply not on the machine.
+        body = c.shim("siana-close-workspace", c.GUARDS["siana-close-workspace"],
+                      None, ["inventory", "close-workspace"], self.QUESTION)
+        self.assertIn("is not installed on this machine", body)
+        self.assertNotIn("does not include closing a workspace", body)
+        self.assertNotIn("exec", body)
+
+    def test_an_absent_command_the_run_was_refused_anyway_still_says_the_grant(self):
+        # The other side of it, and the reason this is not one message for both: a
+        # run without the grant was refused this command whether or not it is
+        # installed, and the grant is the true thing to say about that.
+        body = c.shim("siana-close-workspace", c.GUARDS["siana-close-workspace"],
+                      None, ["inventory"], self.QUESTION)
+        self.assertIn("does not include closing a workspace", body)
+        self.assertNotIn("is not installed", body)
+
+    def test_an_absent_reader_says_so_rather_than_claiming_a_boundary(self):
+        # `herdr` is not installed on a clean CI runner, and its clause is about
+        # words rather than grants, so its refusal used to read as the guard
+        # stopping a call the machine could never have made.
+        body = c.shim("herdr", c.GUARDS["herdr"], None, ["inventory"], self.QUESTION)
+        self.assertIn("herdr is not installed on this machine", body)
+        self.assertNotIn("not this cleanup run's to call", body)
+
+    def test_this_command_resolves_beside_the_copy_that_is_running(self):
+        # Not through PATH, which is the whole fix: a checkout that is not installed
+        # yet has no `siana-clean` on PATH, so `ask` compiled to a refusal and the
+        # one command a stuck cleaner is told to reach for was the one it could not.
+        self.assertEqual(os.path.realpath(c.resolve("siana-clean", "/nowhere")),
+                         os.path.realpath(os.path.join(BIN, "siana-clean")))
+
+    def test_nothing_else_resolves_beside_this_command(self):
+        # Deliberately narrow. Resolving `siana-retire` beside an unmerged checkout
+        # would change which copy removes a captain's worktree, which is a decision
+        # for whoever installs the fleet and not for a lookup.
+        self.assertIsNone(c.resolve("siana-retire", "/nowhere"))
+
+    def test_a_held_grant_is_a_promise_the_guard_has_to_keep(self):
+        clauses = c.GUARDS["siana-close-workspace"]
+        self.assertTrue(c.promised("siana-close-workspace", clauses,
+                                   ["inventory", "close-workspace"]))
+        self.assertFalse(c.promised("siana-close-workspace", clauses, ["inventory"]))
+
+    def test_the_ask_protocol_is_a_promise_and_a_reader_is_not(self):
+        # `siana-clean` because a cleaner that cannot ask cannot stop safely. Not
+        # `herdr`: nothing promised it, its absence costs the run a source of
+        # inventory rather than an authority, and refusing to start without one
+        # would stop cleanup runs that never needed herdr at all.
+        self.assertTrue(c.promised("siana-clean", c.GUARDS["siana-clean"],
+                                   ["inventory"]))
+        self.assertFalse(c.promised("herdr", c.GUARDS["herdr"], ["inventory"]))
+        self.assertFalse(c.promised("siana-publish", c.GUARDS["siana-publish"],
+                                    ["inventory"]))
+
     def test_the_git_pair_rule_reads_the_word_after_the_verb(self):
         body = self.shim("git", (("words:push", "no"),), )
         self.assertIn("'worktree') SAW=1 ;;", body)
@@ -418,6 +477,58 @@ class Run(HomeTest):
         env.update(extra or {})
         return self.run_cmd([os.path.join(BIN, "siana-clean"), *args], env=env,
                             timeout=timeout)
+
+    def uninstalled_path(self, *installed):
+        """A PATH with no SIANA command on it except the ones named.
+
+        The configuration this checkout can actually be run in, and the only one the
+        suite never built. `distro_path` puts `bin/` on the front, so every SIANA
+        command always answered; the live fleet had `siana-clean` and
+        `siana-close-workspace` in an unmerged branch and nowhere else, and that is
+        where the guard compiled two of a run's three granted commands into
+        unconditional refusals.
+
+        What is installed is named rather than inherited. This has to build the same
+        world on a captain's laptop, where `siana-retire` is on PATH, and on a clean
+        runner, where nothing is - a fixture that read the machine would exercise a
+        different configuration on each.
+        """
+        here = self.at("installed")
+        os.makedirs(here, exist_ok=True)
+        for name in installed:
+            link = os.path.join(here, name)
+            if not os.path.lexists(link):
+                os.symlink(os.path.join(BIN, name), link)
+        return os.pathsep.join(
+            [self.fakebin, here,
+             self.path_without(*[n for n in os.listdir(BIN)
+                                 if os.path.isfile(os.path.join(BIN, n))])])
+
+    def stand_in(self, name):
+        """A command the child can reach by that name, whatever this machine has.
+
+        The two tests below are about the guard's rule and not about `herdr`, and
+        they were reading the machine to say so: with `herdr` installed the shim
+        refused with the rule's text, and with it absent the shim refuses because
+        there is nothing to call. A clean runner has no `herdr`, so both would have
+        gone red there while passing on a laptop that happens to have one - and
+        neither would have shown what it is named for, since a command the machine
+        does not have is refused whatever the guard says.
+
+        It prints rather than acts, and the tests assert it was never reached, so
+        the stand-in is also the proof that the rule fired rather than the absence.
+        """
+        path = os.path.join(self.fakebin, name)
+        with open(path, "w") as fh:
+            fh.write(f"#!/bin/sh\necho 'the real {name} ran'\n")
+        os.chmod(path, 0o755)
+
+    def stream(self, run_id, round_no=1):
+        """A round's whole event stream. `clean` only ever prints the cleaner's last
+        report, so a script that ran several commands can be read no other way."""
+        with open(self.at("cleanup", "runs", run_id,
+                          f"round-{round_no}.jsonl")) as fh:
+            return fh.read()
 
     def runs(self):
         return sorted(os.listdir(self.at("cleanup", "runs")))
@@ -1297,10 +1408,12 @@ class Run(HomeTest):
         self.assertIn("not this cleanup run's to call", out.stdout)
 
     def test_raw_herdr_closing_is_refused_inside_a_run_that_holds_the_grant(self):
+        self.stand_in("herdr")
         self.write_script({"steps": [
             {"run": ["herdr", "workspace", "close", "w9"]}], "exit": 0})
         out = self.clean("start", "--grant", "close-workspace")
         self.assertIn("not this cleanup run's to call", out.stdout)
+        self.assertNotIn("the real herdr ran", out.stdout)
 
     def test_reap_under_its_grant_still_refuses_the_flag(self):
         # Report-only first, and the flag is refused however it is spelled.
@@ -1356,9 +1469,11 @@ class Run(HomeTest):
                              argv)
 
     def test_herdr_removal_and_closing_are_refused(self):
+        self.stand_in("herdr")
         said = self.probe("herdr", "workspace", "close", "w1")
         self.assertIn("not this cleanup run's to call", said)
         self.assertIn("siana-retire", said)
+        self.assertNotIn("the real herdr ran", said)
 
     def test_writing_the_queue_is_refused_and_reading_it_is_not(self):
         # `start` is the one that mattered and was open: it dispatches a task and
@@ -1484,6 +1599,78 @@ class Run(HomeTest):
                            "exit": 0})
         out = self.assertAccepted(self.clean("start"))
         self.assertNotIn("not this cleanup run's to call", out)
+
+    # -- the guard, built where nothing is installed -------------------------
+    #
+    # The live pre-merge fleet, which every fixture above hides: `distro_path` puts
+    # this checkout's `bin/` on the front, and `Shims.shim` substitutes a resolvable
+    # command for every `real`, so the one configuration the branch could actually be
+    # run in was the one nothing built.
+
+    def test_a_granted_command_that_is_not_installed_refuses_the_whole_run(self):
+        # A grant names the command it unlocks. If that command cannot be found the
+        # shim can only be written as a refusal, the run proceeds with the authority
+        # silently inert, and the cleaner is told its grant was withheld. Refusing
+        # before the cleaner exists is the only answer that is true.
+        out = self.clean("start", "--grant", "retire", "--grant", "close-workspace",
+                         extra={"PATH": self.uninstalled_path()})
+        self.assertRefused(out, "cannot build a usable guard",
+                           "siana-retire is not on PATH",
+                           "siana-close-workspace is not on PATH")
+        self.assertEqual(self.calls(), [])
+
+    def test_a_run_starts_where_only_its_granted_commands_are_installed(self):
+        # The other side of the refusal above: it is a check on the grant, not a
+        # demand that the whole distro be installed. `siana-clean` is absent here
+        # and the run still starts.
+        self.assertAccepted(self.clean(
+            "start", "--grant", "retire", "--grant", "close-workspace",
+            extra={"PATH": self.uninstalled_path("siana-retire",
+                                                 "siana-close-workspace")}))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_the_cleaner_can_still_ask_with_this_command_uninstalled(self):
+        # The defect at its sharpest. `siana-clean` was not on PATH, so its own
+        # `ask` compiled to a refusal whose last line told the cleaner to use
+        # `siana-clean ask`. The cleaner stopped on a real inventory disagreement,
+        # could not file the question, and the run exited 0 as "nothing outstanding"
+        # - a run that did none of its work reporting success.
+        self.write_script(self.ask_script())
+        out = self.clean("start", "--grant", "retire", "--grant", "close-workspace",
+                         extra={"PATH": self.uninstalled_path(
+                             "siana-retire", "siana-close-workspace")})
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+        self.assertNotIn("nothing outstanding", out.stdout)
+        run_id = self.only_run()
+        self.assertEqual(self.record(run_id)["status"], "question")
+        with open(self.at("cleanup", "runs", run_id, "question.json")) as fh:
+            self.assertIn("disposable", json.load(fh)["body"])
+        # And it was reached beside the running copy rather than off PATH: the
+        # child's PATH is the guard and then the world, and the world has no
+        # `siana-clean` on it at all.
+        world = os.pathsep.join(
+            self.calls()[0]["path"].split(os.pathsep)[1:])
+        self.assertIsNone(shutil.which("siana-clean", path=world))
+
+    def test_no_destructive_substitute_becomes_reachable_in_that_configuration(self):
+        # The guard resolves differently now, so the thing to prove is that it is
+        # still a guard. These four are the reaches a stopped cleaner makes, and
+        # every one of them stays refused where nothing is installed.
+        self.write_script({"steps": [
+            {"run": ["rm", "-rf", "/nowhere"]},
+            {"run": ["git", "worktree", "remove", "/nowhere"]},
+            {"run": ["siana-reap", "siana"]},
+            {"run": ["siana-clean", "answer", "$RUN", "--text", "mine"]},
+        ], "exit": 0})
+        self.assertAccepted(self.clean(
+            "start", "--grant", "retire", "--grant", "close-workspace",
+            extra={"PATH": self.uninstalled_path("siana-retire",
+                                                 "siana-close-workspace")}))
+        said = self.stream(self.only_run())
+        self.assertIn("removes nothing itself", said)
+        self.assertIn("changes neither a repository's history", said)
+        self.assertIn("does not include reaping", said)
+        self.assertIn("a cleaner asks; it never answers", said)
 
     def test_the_child_looks_pi_up_past_its_own_guard(self):
         # `pi` is refused to the child, so a run that resolved its own pi through

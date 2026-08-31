@@ -112,6 +112,13 @@ their own inputs.
 **pi is missing, or the model is unavailable.** The run fails at round one and
 nothing was done. Install pi, or do the cleanup by hand with `siana-retire`.
 
+**A granted command is not installed.** The run refuses before a cleaner starts and
+names each one. A grant names the command it unlocks, so a grant whose command
+cannot be found is inert, and the shim standing in for it can only be a refusal -
+which a cleaner reads as a boundary it must respect rather than as a command this
+machine does not have. Install them, or start the run without the grants that name
+them.
+
 **The child died, or was aborted.** `siana-clean status` reports it interrupted
 rather than running, because the recorded pid is checked against the operating
 system every time it is read. Start a new run; the runbook keeps what was learned.
