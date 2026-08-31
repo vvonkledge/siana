@@ -374,6 +374,11 @@ class Worker:
         self.number = number
         self.outstanding = []
         self.running = None                       # (test id, monotonic start)
+        # When this worker was last heard from. The stall check runs off this
+        # rather than off `running`, because a worker holding work and announcing
+        # nothing is the stall with no test to name - and it is the one that would
+        # otherwise reach CI's guard in silence.
+        self.since = time.monotonic()
         self.buffer = b""
         self.finished = False
         self.tmp = os.path.join(root, str(number))
@@ -421,6 +426,7 @@ class Worker:
             # which is the one place that turns it into a named failure.
             pass
         self.outstanding = list(chunk)
+        self.since = time.monotonic()
 
     def output(self):
         try:
@@ -738,6 +744,14 @@ def work():
             if not line:
                 break
             wanted = json.loads(line)
+            # Armed around the load as well as around each test. Loading
+            # re-imports the module in this worker, and a module here can do real
+            # work at import - `tests/test_wake.py` runs a real `node` to find out
+            # whether one is available. The serial path arms its watchdog around
+            # discovery for exactly that reason; moving the import into workers
+            # moved the hazard with it, and a hang here has no test to name and no
+            # timer to end it.
+            faulthandler.dump_traceback_later(STALL_S, exit=False)
             loaded, why = {}, ""
             # Per class rather than per chunk. An ordinary chunk is one class, but
             # a solo chunk is every test matching a prefix, and a prefix naming a
@@ -768,6 +782,7 @@ def work():
                                 t=f"{tid} was discovered but could not be loaded "
                                   f"in worker {os.getpid()}\n{why}")
             suite = unittest.TestSuite(loaded[t] for t in wanted if t in loaded)
+            faulthandler.cancel_dump_traceback_later()
             suite(result)
             result.send(e="idle")
             if result.failfast and not result.wasSuccessful():
@@ -991,6 +1006,7 @@ def coordinate(ids, pool, verbosity, failfast, stream):
                 if events is None:
                     finish(worker, "exited" if worker.finished else "died")
                     continue
+                worker.since = time.monotonic()
                 for event in events:
                     if event["e"] == "start":
                         worker.running = (event["id"], time.monotonic())
@@ -1021,6 +1037,14 @@ def coordinate(ids, pool, verbosity, failfast, stream):
                             (event["sub"], event["o"], event["t"]))
                         stream.write(f"          {LABEL[event['o']]}: "
                                      f"{event['sub']}\n")
+                        # A failing subtest is a failure like any other, and
+                        # unittest stops the worker on one under failfast. Missed
+                        # here, the coordinator went on believing the run was
+                        # clean, handed that worker a fresh chunk, and then
+                        # reported every test in it as one a worker "died" before
+                        # reaching - a pile of errors naming tests that were fine.
+                        if failfast:
+                            stopping = True
                     elif event["e"] == "left":
                         # A worker could not kill something it started. Held here
                         # so it reaches the report and the exit code, exactly as
@@ -1048,16 +1072,32 @@ def coordinate(ids, pool, verbosity, failfast, stream):
             # holds the worker and can still walk the tree under it.
             now = time.monotonic()
             for worker in workers:
-                if worker.running and now - worker.running[1] > STALL_S + GRACE_S:
+                # Silence while holding work, not just a long-running test. A
+                # worker that hangs between tests - in the import its next chunk
+                # needs, say - has nothing in `running`, so a check that only
+                # looked there would wait for CI's guard instead.
+                if worker.outstanding and now - worker.since > STALL_S + GRACE_S:
                     stalled = worker
                     break
             if stalled:
                 break
 
         if stalled:
-            outcomes.setdefault(stalled.running[0], ("error", (
-                f"worker {stalled.number} spent more than {STALL_S + GRACE_S}s on "
-                f"this test and was killed\n\n{stalled.output()}\n")))
+            quiet = f"{STALL_S + GRACE_S}s"
+            if stalled.running:
+                outcomes.setdefault(stalled.running[0], ("error", (
+                    f"worker {stalled.number} spent more than {quiet} on this test "
+                    f"and was killed\n\n{stalled.output()}\n")))
+            else:
+                # Between tests, so there is no one test to blame. Every test it
+                # was still holding is named instead: one of them is the reason,
+                # and a stall that named nothing would be the silence this whole
+                # arrangement exists to break.
+                for tid in stalled.outstanding:
+                    outcomes.setdefault(tid, ("error", (
+                        f"worker {stalled.number} was silent for more than {quiet} "
+                        f"while holding this test, without starting it, and was "
+                        f"killed\n\n{stalled.output()}\n")))
         # Anything left in flight when the loop ends. Under failfast that is
         # expected and unittest does not report it either; otherwise a test with no
         # outcome is a hole in the run and is named as one.

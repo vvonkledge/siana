@@ -566,6 +566,91 @@ class Failfast(Fixture):
         self.assertIn("FAILED (failures=1)", parallel.stdout)
 
 
+    def test_a_failing_subtest_stops_the_run_like_any_other_failure(self):
+        """The arm that made failfast invent errors for tests that were fine.
+
+        unittest stops a worker on a failing `subTest` under failfast, so the
+        worker abandons the rest of its chunk. A coordinator that did not treat
+        the subtest as a failure went on believing the run was clean, handed that
+        worker a fresh chunk, and then reported every test in it - and every test
+        in the abandoned remainder - as one nobody ran. Six modules here drive
+        bad-input tables through `subTest`, so `just test -f` over any of them
+        printed one real failure surrounded by a pile of invented ones.
+        """
+        # More chunks than workers, and the failing one handed out first: chunks
+        # go out largest first, so `Table` leads and there is still work pending
+        # when it fails. That is what makes the coordinator hand its worker a
+        # fresh chunk, which is where the invented errors came from.
+        where = self.suite(test_ffsub="""
+            import unittest
+
+            class Table(unittest.TestCase):
+                def test_a(self): pass
+                def test_b(self): pass
+                def test_c(self): pass
+
+                def test_d_each_bad_input(self):
+                    for value in ("one", "two"):
+                        with self.subTest(value=value):
+                            self.fail(f"rejected {value}")
+
+            class Second(unittest.TestCase):
+                def test_a(self): pass
+
+            class Third(unittest.TestCase):
+                def test_a(self): pass
+
+            class Fourth(unittest.TestCase):
+                def test_a(self): pass
+
+            class Fifth(unittest.TestCase):
+                def test_a(self): pass
+        """)
+        out = self.go(where, "-f", workers=2)
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("rejected one", out.stdout)
+        self.assertNotIn("never ran", out.stdout)
+        self.assertNotIn("no worker reported this test", out.stdout)
+        self.assertNotIn("died", out.stdout)
+
+
+class Silence(Fixture):
+    """A worker holding work and announcing nothing is still a stall.
+
+    The watchdog inside a worker is armed per test, and the coordinator used to
+    look only at the test a worker said it had started. Between the two, a worker
+    is loading - which re-imports the module in that process, and a module here
+    can do real work at import. A hang there had no test to name and no timer to
+    end it, so the run would have reached CI's fifteen-minute guard in silence,
+    which is the exact failure `tests/run.py` exists to prevent.
+    """
+
+    def test_a_worker_that_hangs_before_starting_a_test_is_named(self):
+        # The import hangs only in a worker, so the coordinator's own discovery -
+        # which the serial path guards deliberately - gets through and the hang
+        # lands where it used to be invisible.
+        where = self.suite(test_slowimport="""
+            import os, time, unittest
+
+            if os.environ.get("SIANA_TEST_WORKER") == "1":
+                time.sleep(300)
+
+            class Never(unittest.TestCase):
+                def test_one(self): pass
+                def test_two(self): pass
+        """)
+        out = self.go(where, workers=2, timeout=180,
+                      env={"SIANA_TEST_STALL_S": "3"})
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("was silent for more than", out.stdout)
+        self.assertIn("without starting it", out.stdout)
+        # Both tests it was holding are named: one of them is the reason, and
+        # neither may be lost.
+        self.assertIn("test_slowimport.Never.test_one", out.stdout)
+        self.assertIn("test_slowimport.Never.test_two", out.stdout)
+        self.assertIn("Ran 2 tests", out.stdout)
+
+
 class WorkerDeath(Fixture):
     """A worker that disappears is a named failure, never a shorter green run."""
 
