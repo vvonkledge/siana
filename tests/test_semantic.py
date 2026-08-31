@@ -421,12 +421,40 @@ class Pinning(SemanticTest):
         # fresh for about a day. Reusing it later would brief a minion from a
         # description of a world that has moved on, and nothing downstream would
         # ever say so: the pack still verifies against the instant it was pinned at.
+        # Nothing stands behind an unclaimed pin, so it is replaced rather than
+        # refused: refusing would make the task undispatchable with no message
+        # anywhere saying which directory had to be moved.
         self.exporting()
         self.assertAccepted(self.pin())
+        first = self.pinned()
+
+        self.plan(export=self.answer("pack export", self.export_result(
+            as_of="2026-09-02T09:00:12Z", observed_at="2026-09-02T06:00:00Z",
+            fresh_until="2026-09-03T06:00:00Z")))
+        out = self.assertAccepted(self.pin(as_of="2026-09-02T09:00:12Z"))
+
+        self.assertFalse(json.loads(out)["reused"])
+        self.assertNotEqual(self.pinned()["trace_id"], first["trace_id"])
+        self.assertEqual(self.pinned()["as_of"], "2026-09-02T09:00:12Z")
+        self.assertTrue(os.path.exists(
+            self.at("semantic", f"{self.TASK}.1", "pin.json")))
+
+    def test_a_refused_export_leaves_the_pin_that_is_already_there_alone(self):
+        # The pin on disk is only disturbed once a replacement has really been
+        # exported. Rolling it aside first would leave the task with no pin at all
+        # every time the provider said no.
+        self.exporting()
+        self.assertAccepted(self.pin())
+        first = self.pinned()
+
+        self.plan(export={"doc": fs.response(
+            "pack export", error={"kind": "pack", "message": "the pack is stale"}),
+            "exit": 1})
         self.assertRefused(self.pin(as_of="2026-09-02T09:00:12Z"),
-                           "freshness window")
-        # And nothing was exported a second time to find that out.
-        self.assertEqual(len(self.calls("pack export")), 1)
+                           "the pack is stale")
+
+        self.assertEqual(self.pinned()["trace_id"], first["trace_id"])
+        self.assertFalse(os.path.exists(self.at("semantic", f"{self.TASK}.1")))
 
     def test_a_pin_reused_inside_the_window_is_still_reused(self):
         self.exporting()
@@ -1032,6 +1060,16 @@ class Status(SemanticTest):
         out = self.sem("status")
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("unknown project: nowhere", out.stdout)
+
+    def test_a_store_beside_the_pins_is_not_called_stale_before_the_first_pin(self):
+        # The path the contract file documents. The directory holding it is the one
+        # this command makes for its own pins, and the store is only ever written
+        # from a reconciliation, which only runs against a pin - so by the time
+        # anything writes there it exists. Calling it stale would tell a captain
+        # who bound a project exactly as documented that they had got it wrong.
+        self.bound(store=self.at("semantic", "trace.sqlite3"))
+        out = self.assertAccepted(self.sem("status"))
+        self.assertIn("proj -> prov:packs/p", out)
 
     def test_a_trace_store_with_nothing_to_hold_it_is_stale(self):
         # `trace record` creates the file and never the directories above it, so a

@@ -470,6 +470,13 @@ def export(directory, binding, as_of):
     return pack, content, manifest
 
 
+def within_window(pack, as_of):
+    """Whether a pack is inside its own freshness window at a given instant."""
+    return (moment("the pack observed_at", pack["observed_at"])
+            <= moment("the instant asked about", as_of)
+            <= moment("the pack fresh_until", pack["fresh_until"]))
+
+
 def fresh_at(pack, as_of):
     """A pack inside its own freshness window at the instant being asked about.
 
@@ -477,16 +484,12 @@ def fresh_at(pack, as_of):
     same reason the expectations are: the window is in the answer, so a provider that
     returned one it had not honoured says so in its own words.
 
-    It is also the check a reused pin has to pass. A pin outlives the dispatch that
-    wrote it - that is the whole point of reusing one - and a pack that was fresh
-    when it was written can be a day stale by the time the task is dispatched again.
-    A minion briefed from that is briefed from a description of a world that has
-    moved, which is exactly what the window exists to prevent.
+    A reuse asks the same question through `within_window` rather than through this,
+    because a stale pin is a reason to export afresh and not a reason to stop: the
+    hint below is about the provider, and refreshing the provider does nothing for
+    bytes already sitting on disk.
     """
-    observed = moment("the pack observed_at", pack["observed_at"])
-    fresh_until = moment("the pack fresh_until", pack["fresh_until"])
-    asked = moment("the instant asked about", as_of)
-    if not observed <= asked <= fresh_until:
+    if not within_window(pack, as_of):
         die(f"the pack was observed at {pack['observed_at']} and is fresh until "
             f"{pack['fresh_until']}, and this asked as of {as_of}",
             "a pack outside its own freshness window is not one to brief a minion",
@@ -749,8 +752,13 @@ def reusable(home, task_id, pin, task, binding, as_of):
         # was written at. The pack it holds was fresh when the first dispatch
         # refused, and a pack is fresh for about a day: reusing it later would brief
         # a minion from a description of a world that has moved on.
-        fresh_at(pin["pack"], as_of)
-        return True
+        #
+        # A stale one is replaced rather than refused. Nothing stands behind an
+        # unclaimed pin - no minion, no claim, no recorded run - so there is nothing
+        # to lose by exporting afresh, and refusing instead would make the task
+        # undispatchable until somebody moved the directory by hand, which no
+        # message here would have asked them to do.
+        return within_window(pin["pack"], as_of)
     if (task.get("status") in OUTCOMES
             and read_recorded(home, task_id) is None):
         die(f"{task_id} has a finished run nobody has recorded yet",
@@ -790,13 +798,16 @@ def cmd_pin(args, home):
                                         binding, as_of):
         record, reused = existing, True
     else:
-        if existing is not None:
-            # Spent: a minion was claimed against it, so that run either happened or
-            # never will. This dispatch is a different run and gets its own pin and
-            # its own trace id.
-            roll_aside(home, args.task_id)
         directory = pack_directory(home, binding)
+        # Exported before anything on disk is disturbed, so a refusal here leaves
+        # the pin that is already there exactly as it was.
         pack, content, manifest = export(directory, binding, as_of)
+        if existing is not None:
+            # Either spent - a minion was claimed against it, so that run either
+            # happened or never will - or unclaimed and no longer fresh. Both are
+            # rolled aside rather than removed, and this dispatch gets its own pin
+            # and its own trace id.
+            roll_aside(home, args.task_id)
         record = {
             "task": args.task_id,
             "project": project,
@@ -1085,10 +1096,12 @@ def reconcile_one(home, name, tasks):
         already = read_recorded(home, name)
         if already is not None:
             return "already", already["trace_id"]
-        # Claimed, never recorded, and never will be: it was rolled aside because
-        # its task was dispatched again while it was still in flight, so no terminal
-        # instant of its own was ever written down.
-        return "spent", "abandoned before it ended"
+        # Never recorded, and never will be. Either a claim landed on it and the
+        # task was dispatched again while that run was still in flight, so no
+        # terminal instant of its own was ever written down, or no claim ever landed
+        # and there was no run at all.
+        return "spent", ("abandoned before it ended"
+                         if dispatched_at(home, name) else "never claimed")
     started = dispatched_at(home, name)
     if started is None:
         # Pinned and never claimed. The task may well be terminal - it can be
@@ -1207,9 +1220,16 @@ def cmd_status(args, home):
         if not os.path.isdir(directory):
             notes.append(f"no pack at {directory}")
         store = store_path(binding)
+        holder = os.path.dirname(store) or "."
         if os.path.exists(store) and not os.path.isfile(store):
             notes.append(f"the trace store at {store} is not a file")
-        elif not os.path.isdir(os.path.dirname(store) or "."):
+        # `trace record` creates the store file and never the directories above it,
+        # so a store nothing holds is a recording that will refuse. Except under the
+        # pins, which this command makes itself: the store is only ever written from
+        # a reconciliation, a reconciliation only runs against a pin, and the first
+        # pin created that directory. Reporting it would call a binding written
+        # exactly as its contract documents `stale` before the first dispatch.
+        elif not os.path.isdir(holder) and holder != pin_root(home):
             notes.append(f"nothing holds the trace store at {store}; "
                          f"`trace record` never creates the directories above it")
         if notes:
