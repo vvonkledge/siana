@@ -1126,19 +1126,31 @@ def drop(tasks_file: str, task_id: str, record_id: str):
     return "absent" in proc.stdout
 
 
-def check_superseded(rec, world):
+def check_superseded(rec, world, fresh: bool):
     """The four conditions under which a waiting task goes with the record.
 
-    All four are mechanical, and the fourth is the one that matters: a QA task is
+    All four are mechanical, and the last is the one that matters: a QA task is
     removed only where an independent acceptance of the same work exists somewhere
     else. Without it this would be a command that skips QA, and with it removing the
     orphan is recording that something better already read the work it would have
-    read."""
+    read.
+
+    The first condition is that the task exists, and whether an absent one is a
+    refusal depends on which run this is. On a first archive it is: a plan naming a
+    task the queue does not have removes nothing, but writes into the ledger that it
+    did, so `show` reports a removal that never happened while the real stranded task
+    sits in the queue with nothing pointing at it. Typing the orphan's title where
+    its id belongs is exactly how that is reached. On a re-run the same absence is
+    this command's own previous pass, which is what makes a repeated plan converge,
+    so it is passed over there and only there."""
     out, rid = [], rec.get("id")
     for task_id in rec.get("superseded") or []:
         task = world.queue.get(task_id)
         if task is None:
-            continue                           # already dropped: a re-run converges
+            if fresh:
+                out.append(f"{task_id} is not in the queue, so archiving this record"
+                           " would record a removal that never happened")
+            continue                   # already dropped: a re-run converges here
         if task.get("status") != "todo":
             out.append(f"{task_id} is {task.get('status')}, not todo: a task that is"
                        " not merely waiting is not one this may remove")
@@ -1205,7 +1217,8 @@ def archive(world, plan_path: str):
             "nothing has been written and nothing dropped")
 
     problems = check_case(records, world, "archive")
-    superseded = [p for rec in records for p in check_superseded(rec, world)]
+    superseded = [p for rec in records
+                  for p in check_superseded(rec, world, rec["id"] in fresh)]
     if problems or superseded:
         die(f"{case_name} is not a case this may archive",
             *(f"{p.record_id}  {p}" for p in problems), *superseded,

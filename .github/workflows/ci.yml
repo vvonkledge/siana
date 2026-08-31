@@ -33,13 +33,13 @@ jobs:
     # that got slower says how many workers it had.
     #
     # Reason about this from the pool, and not from the serial control. That control
-    # was 696s here, on x86_64, when the suite was 856 tests; this one is 1481, and
+    # was 696s here, on x86_64, when the suite was 856 tests; this one is 1482, and
     # scaling it lands past fifteen minutes. Nothing runs it serially, so that is a
     # number about a mode CI does not use, and sizing the guard against it argues for
     # raising a guard the pool has already made room under.
     #
     # The pool is what to measure. At the three workers a four-core runner gets, a
-    # 1390-test tree took 558s on an eleven-core machine, and this 1481-test one took
+    # 1390-test tree took 558s on an eleven-core machine, and this 1482-test one took
     # 487s on the same box at a load that was higher rather than lower; a runner
     # costs about a tenth more for the same work, which leaves roughly a third of
     # this unspent. Those are one run each, and the difference between them is this

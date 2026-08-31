@@ -766,6 +766,18 @@ class Superseded(Ledger):
                                           acceptance="qa-still-running"))
         self.assertRefused(out, "independent acceptance")
 
+    def test_a_task_the_queue_does_not_have_is_refused_on_a_first_archive(self):
+        # Typing the orphan's title where its id belongs is how this is reached, and
+        # the two differ in this fleet's own records. Passed over, the archive
+        # removes nothing and writes into the ledger that it did, so `show` reports
+        # a removal that never happened while the real stranded task sits in the
+        # queue with nothing pointing at it, and `verify` never looks again.
+        out = self.assertRefused(
+            self.archive(self.round_one(superseded=["qa-the-orphan-that-never-was"])),
+            "is not in the queue")
+        self.assertIn("never happened", out)
+        self.assertEqual(self.ledger_lines(), [])
+
     def test_a_re_run_after_the_orphan_is_gone_converges(self):
         self.archived(self.round_one(superseded=[self.orphan]))
         self.assertIn("already archived",
