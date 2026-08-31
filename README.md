@@ -525,17 +525,17 @@ core for its whole length, with the rest of the machine idle. So `tests/run.py`
 hands whole test classes to a pool of worker processes, and the first line of a run
 says how many workers it got.
 
-Measured on an eleven-core M3 Pro, 901 tests, interleaving the two modes:
+Measured on an eleven-core M3 Pro at `61261a1`, 909 tests, interleaving the two
+modes with the load average between 11 and 21:
 
-    one worker      1070s and 1073s
-    five workers    428s to 553s, median 447s
+    one worker      903s and 1091s,  0.67 cores
+    five workers    317s to 527s,    1.9 to 2.8 cores, median 329s
 
-That is a 58% cut, and the spread is the machine rather than the runner. The
-serial figures agree to within 0.3% because a run using less than one core barely
-notices what else is happening; the pool, at three and a half cores, does. Those
-runs were taken with the load average between 10 and 27, which is what this machine
-looks like with a fleet on it. Expect seven to nine minutes under that, less on a
-quiet machine, and take the one-worker figure as the thing that does not move.
+That is a 67% cut against the median. Read both columns as ranges rather than
+figures: two one-worker runs started at the same load average and differed by 21%,
+so this machine's own variation is larger than most of what you might measure
+against it. Expect five to nine minutes from the pool and fifteen to eighteen from
+one worker, and re-measure rather than trusting a single number.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like

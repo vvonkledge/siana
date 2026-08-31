@@ -40,9 +40,9 @@ the pool out of the picture:
 
 That is `unittest`, serially, in one process, and it is the control every timing
 here is measured against. It is also much the slower of the two now: the runner's
-own tests roughly doubled it, and one worker measures around eighteen minutes
-against the pool's seven to nine. Reach for it to answer a question, not to run
-the suite.
+own tests roughly doubled it, and one worker measures fifteen to eighteen minutes
+against the pool's five to nine. Reach for it to answer a question, not to run the
+suite.
 
 Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
 and answers when it answers, so the answers that matter most - herdr slow, wrong, or
