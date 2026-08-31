@@ -1,0 +1,22 @@
+{
+  "name": "siana-console-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The browser application siana-console serves: read the fleet from a phone.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "jsdom": "30.0.1",
+    "tailwindcss": "4.3.3",
+    "vite": "8.2.2"
+  }
+}

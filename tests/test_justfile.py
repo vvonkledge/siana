@@ -163,6 +163,14 @@ class Doctor(Recipe):
         self.assertIn("none    node (only siana-console needs it)", out.stdout)
         self.assertNotIn("missing node", out.stdout)
 
+    def test_the_browser_application_is_reported_when_it_has_been_built(self):
+        # `just test` builds it, so any run of this suite has one. What matters is
+        # that the captain can find out from `doctor` whether the console has a page
+        # to serve, rather than by opening one on a phone and finding nothing.
+        out = self.just("doctor").stdout
+        self.assertIn("ok      console app -> ", out)
+        self.assertIn(os.path.join(DISTRO, "console", "dist"), out)
+
     def test_an_empty_store_is_a_zero_and_never_a_fault(self):
         # datafile writes the .jsonl on the first append, so absent-with-a-contract
         # is an empty store. Doctor must not cry wolf about it.

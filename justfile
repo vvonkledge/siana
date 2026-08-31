@@ -437,6 +437,40 @@ _contract-drift:
     echo "          until then every task the CLI writes is rejected by the" >&2
     echo "          contract, which is a traceback rather than a refusal" >&2
 
+# Build the browser application `siana-console` serves.
+#
+# `npm ci` and then `vite build`, into `console/dist/`, which is what the console
+# reads at startup and what the suite tests. Neither the packages nor the bundle is
+# committed: `console/package-lock.json` is what makes the install reproducible, and
+# a committed bundle would be a second answer to what the source says.
+#
+# `just test` runs this first, so an ordinary check builds what it is about to test.
+# Run it by hand after a `git pull` that changed the frontend, or after a fresh
+# clone: the console serves whatever was last built here and says so on startup when
+# there is nothing.
+#
+# Absent `npm` is reported and not a stop. Nothing else in this distro needs it, and
+# a captain who does not want a console should not be told their checkout is broken.
+build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v npm >/dev/null || {
+        echo "no npm, so the browser application was not built" >&2
+        echo "  it is the only thing here that needs one; siana-console will serve" >&2
+        echo "  the API and say that it has no application to serve" >&2
+        exit 0
+    }
+    cd console
+    # `npm ci` deletes and reinstalls node_modules every time, which is twenty
+    # seconds this recipe pays on every `just test`. It is only needed when what is
+    # installed is not what the lockfile says, and npm records that in
+    # `node_modules/.package-lock.json`.
+    if [ ! -f node_modules/.package-lock.json ] || \
+       [ package-lock.json -nt node_modules/.package-lock.json ]; then
+        npm ci --no-audit --no-fund
+    fi
+    npm run build
+
 # Run the distro's tests. Pass unittest arguments through: `just test -v`, or
 # `just test -k slug` for one rule.
 #
@@ -456,7 +490,7 @@ _contract-drift:
 #
 # That is the mode to reach for when a failure looks like it might be the pool's
 # fault rather than the code's, and it is the control every timing here is against.
-test *args:
+test *args: build
     #!/usr/bin/env bash
     set -euo pipefail
     # No bytecode from this interpreter, and `-B` rather than the suite setting
@@ -524,6 +558,15 @@ doctor: _contract-drift
     p="$(command -v node || true)"
     if [ -n "$p" ]; then echo "  ok      node -> $p"
     else echo "  none    node (only siana-console needs it)"; fi
+    # The browser application, which is built rather than committed. Absent is a
+    # console that serves its API and no page, which is a real thing to be told
+    # before the captain opens one on a phone and finds nothing there.
+    if [ -f "$PWD/console/dist/index.html" ]; then
+        echo "  ok      console app -> $PWD/console/dist"
+    else
+        echo "  none    console app (run \`just build\`; siana-console serves the API"
+        echo "                       and says it has no application to serve)"
+    fi
     # What `siana` can start in. A harness needs both the command and the queue
     # integration `init` wrote into this home for it, so they are reported as the
     # one fact they make: a session started with either half missing has no fleet
