@@ -117,11 +117,29 @@ on its first append, so a contract with no `.jsonl` beside it is an empty store 
 not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
-`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
-`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
-`siana-read`, `siana-console`, `siana-semantic`. They are links, so a `git pull`
-here updates the commands with no reinstall. It does not update the home;
-`just upgrade` does that.
+`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
+`siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
+`siana-gate`, `siana-read`, `siana-clean`, `siana-report`, `siana-console`,
+`siana-semantic`. They are links, so a `git pull` here updates the commands with no
+reinstall. It does not update the home; `just upgrade` does that.
+
+### The distro's own pi package
+
+Beside the queue integration, `init` installs `template/pi-siana` into the home as a
+project-local pi package. It carries three things:
+
+    siana_cleanup, siana_runbook   tools, so SIANA can delegate fleet cleanup
+    captain-report                 a skill, reached as `/skill:captain-report`
+    /captain-report                the same procedure, as the command you type
+
+It is installed from this checkout rather than copied, so a `git pull` updates it the
+way it updates the commands. It is also installed exactly once: pi identifies a local
+package by its resolved absolute path, so the same package reached through two
+spellings is two packages to pi and every resource in it is discovered twice. `init`
+reconciles the settings entry rather than appending one.
+
+Loading it starts nothing. No process, no watcher, no timer, no model. A cleanup run
+begins when something calls the tool, and never before.
 
 ### The queue integration
 
@@ -291,8 +309,9 @@ this convention keep the names they have, and every command still finds them.
 
 You never make one of these by hand, and nothing here pushes one. `siana-publish`
 pushes the branch a QA minion accepted, and only that; `siana-retire` removes the
-worktree once nothing is left in it that only it holds; `siana-reap` removes the
-branch once the work has landed.
+worktree once nothing is left in it that only it holds; `siana-close-workspace`
+closes the Herdr workspace that retirement left open, and only after it; `siana-reap`
+removes the branch once the work has landed.
 
 ### What the merge request says
 
@@ -638,6 +657,143 @@ what you wanted.
 `~/.siana/review.md` is what that reviewer is told. It is yours to edit, like every
 other instruction file in the home.
 
+### Delegate the cleanup
+
+Retiring worktrees and reaping branches is long, repetitive and almost entirely
+mechanical. Done inside SIANA's session it is thirty rounds of tool output crowding
+out the fleet. So it happens somewhere else, and SIANA sees only what it has to
+answer:
+
+    siana-clean start --grant retire       one run, in its own context
+    siana-clean status                     what it is doing, or stopped on
+    siana-clean answer <run> --text ...    your answer to its question
+    siana-clean resume <run>               carry it on from there
+
+At the helm you never type these: SIANA calls the `siana_cleanup` tool the pi package
+registers, and it is the same command underneath.
+
+A run carries a grant, and the grants are named after the commands they unlock.
+`inventory` reads and is always in force. `retire` adds `siana-retire`. `reap-report`
+adds `siana-reap` in its report-only form. `close-workspace` adds
+`siana-close-workspace`. There is no grant that reaches `siana-reap --yes`, because a
+wrong reap is the one mistake in this fleet that loses work.
+
+`close-workspace` is the narrow authority you granted to close the Herdr workspace a
+finished minion leaves behind, and it is a grant of its own rather than part of
+`retire` because closing a workspace kills the agent in it. Start a run with both and
+it retires each tree and then closes the workspace that retirement left open, which
+is where the idle agent and the open workspace per retirement used to accumulate.
+
+The narrowness is in the command rather than in what the cleaner was told.
+`siana-close-workspace` takes a task id, and resolves the workspace from that task's
+own recorded owner pane - never from a label, a workspace number, an agent name or
+what is focused, each of which finds *a* workspace rather than *that task's*. It
+closes only a `done` task's workspace, only when Herdr says the workspace is a
+linked-worktree one open on exactly the tree the queue recorded, in exactly the
+repository the registry gives that project, unfocused, named by no other task in the
+queue, and with its agent in one of the states a finished minion actually leaves -
+idle, done or unknown. That last one is an allowlist, so an agent mid-turn, an agent
+stopped at a dialog waiting for you, and a state a later Herdr grows all refuse. And
+it closes only after the retirement has actually happened: the tree gone from disk and
+gone from git's own list of worktrees, read from the world rather than taken from an
+exit code.
+
+That ordering is load-bearing twice over. A workspace closed before its worktree is
+removed strands the worktree, and a project's *source* workspace closes every
+linked-worktree workspace under it, so a workspace Herdr does not mark
+`is_linked_worktree` is refused outright. Raw `herdr` closing stays refused to a
+cleanup run whatever grants it holds.
+
+The cleaner does no safety thinking of its own. It enumerates and delegates, and
+every refusal it meets is one of your existing commands refusing on its own terms.
+
+What keeps it to that is a directory of refusing shims put on the front of its `PATH`
+for the run. A command outside the grant fails with a message naming what to do
+instead, so the ordinary way an agent goes wrong - reaching for the next obvious
+command - is stopped by a mechanism rather than by a sentence in a prompt. It is not
+a sandbox, and it is worth knowing which: it intercepts command names, so a binary
+invoked by absolute path is outside it. What actually holds is that the destructive
+work lives in commands that fail closed on their own inputs.
+
+What the cleaner does instead of guessing is stop:
+
+    $ siana-clean start --grant retire
+    run      clean-20260830-0730
+      round  1
+      asks   design-three-part's tree holds 44 untracked files; are they yours?
+      kind   siana
+      answer siana-clean answer clean-20260830-0730 --text <your answer>
+
+The question is on disk before anybody reads it, and nothing after that point runs
+until an answer is recorded. Answering and resuming are two operations with a process
+boundary between them, so nothing is ever waiting on anything else and a restart
+loses at most a round.
+
+A question the cleaner marks `captain` is one SIANA cannot answer for you. It becomes
+an ordinary recorded decision, you answer it, and only then can the run be unblocked.
+
+Every answer lands in `$SIANA_HOME/runbook.md`, which the next cleaner reads first.
+Entries are built out of the question a cleaner wrote down and the answer SIANA
+recorded, and nothing else can be *recorded* there, so a guess, a secret or a stray
+piece of transcript cannot get in that way.
+
+That is a property of the command and not a wall around the file. A cleaner runs with
+a shell, and a shell can write any file its user can, so the rule against editing the
+runbook by hand is carried in the cleaner's instructions the way the rest of its
+scope is. The child is started without the harness's file-writing tools, which
+narrows it. Read it the way you read the shim guard above: a real boundary against
+the ordinary mistake, and not a wall.
+
+If anything goes wrong, nothing was half-done. The mutations belong to commands that
+fail closed on their own inputs, so a killed cleaner, an unavailable model or a
+corrupt run record all leave the fleet exactly as it was. `siana-clean status` says
+which, and the package's README lists the recoveries.
+
+### Ask for the report
+
+    /captain-report
+
+SIANA reads the live queue, registry, repositories, forge, watcher, herdr,
+obligations, cleanup runs and decision history, and writes you an overview: what
+happened, whether the fleet is moving, what is about to go wrong, what is waiting to
+be published or cleaned up, what is still owed, and every decision you have to take.
+
+A source it could not read is named as unreadable. It is never rendered as healthy
+and never as empty, because "no open workspaces" when herdr is down is a lie you
+would act on.
+
+Each pending decision arrives with its options, what each one costs, what SIANA
+recommends, and why. A recommendation is not authority and nothing in this distro
+turns one into an action.
+
+### What the fleet learns from what you decide
+
+Every decision SIANA puts in front of you is recorded twice, and the split is the
+point. The obligation holds the question, whether it is still open, and - once you
+answer - your answer, in your words. Beside it, keyed by the same id,
+`attended.jsonl` holds what the obligation has no room for: the situation, the
+options, what each one cost, which SIANA would have chosen, and why.
+
+    siana-owe history            every decision, joined
+    siana-owe history --json     the same, for a program
+
+Your answer lives in exactly one place and is read out of it every time, so there is
+nothing here to go stale. Later, once an answer has been carried out:
+
+    siana-owe outcome <id> --outcome "what actually happened"
+
+It refuses while the obligation is still open, because an outcome recorded before an
+answer is a guess.
+
+This is a learning corpus and a reporting foundation, and that is all it is. It
+exists so that "how often did SIANA and I agree, and about what" is a question with
+an answer, which is the only ground an argument for giving the fleet more autonomy
+could ever stand on. Nothing reads a recommendation as permission today, and nothing
+in this distro turns a row of this store into an action.
+
+It is not `decisions.jsonl`. That one is the advisory ledger: what SIANA would have
+done while you were away, where nobody was asked and no answer exists.
+
 ## Validate a change to the distro
 
     just test
@@ -677,16 +833,25 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-So expect about four minutes from the pool and about ten and a half from one
-worker. Both stretch under fleet load, and this machine's own variation is wider
-than the gap between any two pool sizes. Measured separately by the author of the
-pool at `6906b6a`, interleaving the two modes: one control of 1115s taken at load
-11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and 26.4.
-Across the whole of that work, at heads and loads that were not held constant, the
-one-worker control measured anywhere from 703s to 1115s. Those are observations of
-what load does, not a second speed claim - they are not comparable with the four
-runs above and are not combined with them. Re-measure rather than trusting any
-single number here.
+Those four runs are that head's, and that head had 912 tests. This tree has 1526, so
+expect longer on the one you are standing on: measured here rather than scaled, on the
+same eleven-core M3 Pro, two runs of the default five-worker pool at 302.5s and 302.4s
+and one at the three workers a four-core runner gets at 379.1s, that last taken at load
+averages between 3.0 and 5.5 with nothing else of this size on the box. Call it five
+minutes from the default pool and six and a half at three. One worker is slower again
+in proportion, and stays a control to reach for rather than a way to run the suite. All
+of them stretch under fleet load, and this machine's own variation is wider than the
+gap between any two pool sizes - wider, on this evidence, than the gap between suite
+sizes, since the same three-worker mode took 558s at `a97e447` over 1390 tests rather
+than 1526.
+
+Measured separately by the author of the pool at `6906b6a`, interleaving the two
+modes: one control of 1115s taken at load 11.8, against pool runs of 199s, 296s and
+551s taken at loads 14.3, 19.7 and 26.4. Across the whole of that work, at heads and
+loads that were not held constant, the one-worker control measured anywhere from 703s
+to 1115s. Those are observations of what load does, not a second speed claim - they are
+not comparable with the four runs above and are not combined with them. Re-measure
+rather than trusting any single number here.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like
@@ -741,9 +906,21 @@ into your own when you want that.
     just doctor
 
 It changes nothing. It reports every file the home should hold, whether each required
-command is on the `PATH` and where it resolves to, whether a SIANA is running,
+command is on the `PATH` and where it resolves to, whether the distro's own pi
+package is installed in the home's harness settings, whether a SIANA is running,
 whether an advisory session is, whether every in-flight task's minion is still alive
 in the pane it was dispatched to, what SIANA owes you, and the queue itself.
+
+Almost all of that is a line for you to read and act on, and `doctor` exits zero
+having said so. Two things make it exit nonzero. The first it always had: the home's
+queue does not read at all, which includes there being no home there yet - the
+ordinary state before `just init`. The second is new: on a machine with `pi`, the
+distro's own `pi-siana` package is not installed into the home, whether because the
+settings file does not name it, names it twice, names it somewhere it is not, or is
+not there at all. That one fails rather than reports because you cannot see it from
+inside a session. A home missing that package has no `siana_cleanup` and no
+`siana_runbook` tool, no `captain-report` skill and no `/captain-report` command, and
+none of them fails: none of them is there to be called.
 
 Things it says that are not faults:
 
@@ -772,6 +949,11 @@ Things it says that are:
 - `GONE <task>: herdr has no agent in <pane>`. A minion died. `tasks reset` reclaims
   the task, and it stays manual, because that minion's worktree may hold work nobody
   has landed.
+- `missing pi-siana package: <why>`, and `missing .pi/settings.json` on a machine
+  with `pi`. The distro's own package is not installed in this home: the settings
+  file does not name it, names it twice, names it somewhere it is not, or is not
+  there at all. `just init` installs it and collapses a duplicate back to one. This
+  and an unreadable queue are what make `doctor` exit nonzero.
 
 ## Read the fleet as JSON
 
@@ -920,7 +1102,8 @@ deleted. Your home is left alone, queue and all. Delete it by hand when you mean
                 world surprises them, and never adjudicate meaning.
     template/   what an install copies into the home: SIANA's instructions, the
                 standing orders every minion is started with, the brief and
-                handoff templates, and the store contracts.
+                handoff templates, the store contracts, and `pi-siana/`, the
+                distro's own pi package.
     tests/      the suite.
     justfile    init, upgrade, test, doctor, uninstall.
     VISION.md   what the fleet is for.

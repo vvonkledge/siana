@@ -67,27 +67,6 @@ class Recipe(HomeTest):
             os.chmod(path, 0o755)
         return d
 
-    def path_without(self, *names):
-        """A PATH on which some commands cannot be found.
-
-        Every directory holding one is replaced by a mirror of itself with that
-        entry left out, rather than dropped. Dropping it would take `uv` with it on
-        a Homebrew machine, and init would then fail on a tool it needs instead of
-        on the harness this is hiding - a green test for the wrong reason.
-        """
-        out = []
-        for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
-            if not any(os.path.lexists(os.path.join(d, n)) for n in names):
-                out.append(d)
-                continue
-            mirror = self.at(f"path-{i}")
-            os.makedirs(mirror, exist_ok=True)
-            for entry in os.listdir(d):
-                if entry not in names:
-                    os.symlink(os.path.join(d, entry), os.path.join(mirror, entry))
-            out.append(mirror)
-        return os.pathsep.join(out)
-
     def on_path(self, first, rest=None):
         return os.pathsep.join([first, rest if rest is not None
                                 else os.environ["PATH"]])
@@ -264,6 +243,16 @@ class Doctor(Recipe):
         self.just("doctor")
         self.assertTrue(os.path.exists(self.at("afk")))
 
+    @unittest.skipUnless(has("pi"), "the package is reported for pi only")
+    def test_a_pi_home_with_no_settings_at_all_is_never_reported_healthy(self):
+        # The case the package check exists for, arriving one layer up. With no
+        # settings file there is nothing for the check to read, so it is never
+        # reached - and a home that names no pi-siana package at all exited 0 while
+        # a home that named it badly exited 1.
+        out = self.just("doctor")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("missing .pi/settings.json", out.stdout)
+
     @unittest.skipUnless(has("pi") and has("tasks"),
                          "the queue package is reported for pi only")
     def test_a_home_carrying_two_queue_packages_is_not_called_complete(self):
@@ -364,11 +353,19 @@ class Init(Recipe):
                   # starts.
                   "handoff.md",
                   "schema-projects.yaml", "schema-obligations.yaml",
-                  "schema-decisions.yaml",
+                  "schema-decisions.yaml", "schema-tasks.yaml",
+                  # The reasoning behind the decisions the captain was asked. A
+                  # decision recorded without it is one nothing can learn from, and
+                  # `siana-owe decision` refuses rather than writing one.
+                  "schema-attended.yaml",
                   # The captain's semantic bindings. Absent, `siana-dispatch`
                   # cannot be given one at all, and `datafile` would refuse the
                   # write with no contract to hold it to.
-                  "schema-semantic.yaml", "schema-tasks.yaml",
+                  "schema-semantic.yaml",
+                  # What a cleanup run reads before it starts. Written here so that
+                  # `doctor` can say whether it is there, rather than a cleaner
+                  # having to create the file it reads.
+                  "runbook.md",
                   # The principles an advisory session holds SIANA to. It ships
                   # unfilled and `siana-afk` refuses to start until it is written,
                   # so a home without it is one where a session cannot start at all.
@@ -379,9 +376,10 @@ class Init(Recipe):
                   os.path.join(".pi", "extensions", "wake.ts")):
             self.assertTrue(os.path.exists(self.at(f)), f"init left out {f}")
         for c in ("siana", "siana-dispatch", "siana-brief", "siana-watch",
-                  "siana-owe", "siana-retire", "siana-handoff", "siana-publish",
-                  "siana-reap", "siana-pipeline", "siana-afk", "siana-gate",
-                  "siana-read", "siana-console", "siana-semantic"):
+                  "siana-owe", "siana-retire", "siana-close-workspace",
+                  "siana-handoff", "siana-publish", "siana-reap", "siana-pipeline",
+                  "siana-afk", "siana-gate", "siana-read", "siana-clean",
+                  "siana-report", "siana-console", "siana-semantic"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this
@@ -400,6 +398,185 @@ class Init(Recipe):
         missing = [line.strip() for line in doctor.stdout.splitlines()
                    if "missing " in line]
         self.assertEqual(missing, [])
+
+    def siana_package_entries(self):
+        """Every settings entry that resolves to this distro's pi package.
+
+        Resolved rather than compared as strings: pi writes the entry relative to the
+        settings file, and the whole failure this guards against is one package
+        reached through two spellings.
+        """
+        settings = self.at(".pi", "settings.json")
+        with open(settings) as fh:
+            packages = json.load(fh).get("packages", [])
+        want = os.path.realpath(os.path.join(DISTRO, "template", "pi-siana"))
+        out = []
+        for entry in packages:
+            source = entry if isinstance(entry, str) else entry.get("source", "")
+            resolved = os.path.realpath(
+                os.path.join(os.path.dirname(settings), source))
+            if resolved == want:
+                out.append(source)
+        return out
+
+    def test_the_distros_own_package_is_installed_exactly_once(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(len(self.siana_package_entries()), 1)
+
+    def test_a_second_init_does_not_install_it_twice(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(len(self.siana_package_entries()), 1)
+
+    def test_the_same_package_under_a_second_spelling_is_reconciled_away(self):
+        # The collision this exists to prevent. Pi identifies a local package by its
+        # resolved absolute path, so a relative entry and an absolute one naming the
+        # same directory are two packages: two `/captain-report` commands, two
+        # `siana_cleanup` tools, and a skill-name collision at every startup.
+        self.assertEqual(self.just("init").returncode, 0)
+        settings = self.at(".pi", "settings.json")
+        with open(settings) as fh:
+            config = json.load(fh)
+        config["packages"].append(
+            os.path.realpath(os.path.join(DISTRO, "template", "pi-siana")))
+        with open(settings, "w") as fh:
+            json.dump(config, fh)
+        self.assertEqual(len(self.siana_package_entries()), 2)
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(len(self.siana_package_entries()), 1)
+
+    def test_reconciling_leaves_the_queue_package_alone(self):
+        # It is another local entry in the same array, and losing it would take the
+        # ambient queue out of SIANA's session while looking like a clean install.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json")) as fh:
+            packages = json.load(fh)["packages"]
+        self.assertTrue(any("pi-agent-tasks" in str(p) for p in packages), packages)
+
+    def test_the_package_extension_is_not_also_auto_discovered(self):
+        # An extension present in `.pi/extensions/` *and* in an installed package is
+        # loaded twice, which is the same collision by another route.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertEqual(sorted(os.listdir(self.at(".pi", "extensions"))),
+                         ["wake.ts"])
+
+    def settings(self, mutate):
+        """The home's pi settings, rewritten by `mutate`. Every check below is about
+        what doctor makes of the file rather than about how it got that way, so the
+        home is installed for real first and then damaged."""
+        path = self.at(".pi", "settings.json")
+        with open(path) as fh:
+            config = json.load(fh)
+        mutate(config)
+        with open(path, "w") as fh:
+            json.dump(config, fh)
+
+    def test_doctor_passes_the_package_the_install_actually_wrote(self):
+        # The half that makes every refusal below mean something. A check nothing
+        # can satisfy would fail an install that is correct.
+        self.assertEqual(self.just("init").returncode, 0)
+        doctor = self.just("doctor")
+        self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        self.assertIn("ok      .pi/settings.json (pi-siana)", doctor.stdout)
+
+    def test_a_home_that_lost_the_package_is_never_reported_healthy(self):
+        # The gap this closes. Doctor checked that `.pi/settings.json` existed, and
+        # a home whose packages array had lost the pi-siana entry has no
+        # `siana_cleanup` and no `siana_runbook` tool, no `captain-report` skill and
+        # no `/captain-report` command - none of which fails, because none of them
+        # is there to be called. It printed `ok .pi/settings.json` and exited 0.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.settings(lambda config: config.__setitem__(
+            "packages", [p for p in config["packages"]
+                         if "pi-siana" not in str(p)]))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("missing pi-siana package: no entry names it", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+
+    def test_a_second_spelling_of_the_package_is_reported_rather_than_blessed(self):
+        # Two spellings of one directory are two packages to pi, so every resource
+        # in it is discovered twice. `init` reconciles it; doctor is what says the
+        # captain needs to run one.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.settings(lambda config: config["packages"].append(
+            os.path.realpath(os.path.join(DISTRO, "template", "pi-siana"))))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("2 entries name it", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+
+    def test_an_entry_that_resolves_nowhere_is_not_a_present_package(self):
+        # The failure the README already names: the entry is a relative path into
+        # the checkout, so a checkout that moved leaves a settings file that still
+        # names a package and a home that has none.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.settings(lambda config: config.__setitem__(
+            "packages", [p for p in config["packages"]
+                         if "pi-siana" not in str(p)]
+            + [os.path.join(self.home, "moved-away", "pi-siana")]))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("which is not there", doctor.stderr)
+
+    def test_a_directory_that_is_no_package_is_not_a_present_package(self):
+        # The near miss `init` already refuses on the way in, asked of a home that
+        # has one anyway. Existing and a directory is not enough.
+        self.assertEqual(self.just("init").returncode, 0)
+        empty = self.at("empty", "pi-siana")
+        os.makedirs(empty, exist_ok=True)
+        self.settings(lambda config: config.__setitem__(
+            "packages", [p for p in config["packages"]
+                         if "pi-siana" not in str(p)] + [empty]))
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("holds no package.json", doctor.stderr)
+
+    def test_settings_that_are_json_but_hold_no_object_are_told_apart(self):
+        # `null` parses without error, so the parse guard passes it straight
+        # through, and the check then had nothing to ask about and no answer
+        # assigned: it raised a NameError and printed a traceback where the reason
+        # and the repair belong. Doctor still failed, which is why this is a report
+        # defect and not a safety one - and it is the same tracing-instead-of-
+        # refusing this branch has already fixed twice elsewhere.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json"), "w") as fh:
+            fh.write("null\n")
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("does not hold a JSON object", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+        self.assertNotIn("Traceback", doctor.stderr)
+
+    def test_settings_that_will_not_parse_is_never_a_healthy_package(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at(".pi", "settings.json"), "w") as fh:
+            fh.write("{ this is not json\n")
+        doctor = self.just("doctor")
+        self.assertNotEqual(doctor.returncode, 0, doctor.stdout)
+        self.assertIn("will not parse", doctor.stderr)
+        self.assertIn("`just init` installs it", doctor.stderr)
+
+    def test_doctor_reports_the_runbook_and_the_cleanup_state(self):
+        self.assertEqual(self.just("init").returncode, 0)
+        doctor = self.just("doctor")
+        self.assertIn("runbook.md", doctor.stdout)
+        self.assertIn("attended.jsonl", doctor.stdout)
+        # A home that has never run one is a zero and not a fault.
+        self.assertIn("cleanup  no runs", doctor.stdout)
+
+    def test_upgrade_keeps_the_runbook_and_the_attended_contract(self):
+        # Both hold the fleet's own accumulated answers. An upgrade that rewrote
+        # either would lose them to restore something nobody needed.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at("runbook.md"), "a") as fh:
+            fh.write("\n<!-- siana-clean:q1 -->\n## Is it?\n\nNo.\n")
+        out = self.just("upgrade")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        with open(self.at("runbook.md")) as fh:
+            self.assertIn("No.", fh.read())
+        self.assertIn("kept     ", out.stdout)
+        self.assertIn("schema-attended.yaml", out.stdout)
 
     def test_the_wake_extension_is_the_distros_and_is_refreshed_on_every_init(self):
         # Distro-owned and never the captain's work, so it is overwritten rather
@@ -517,7 +694,13 @@ class Init(Recipe):
         # to `.pi/`, and what has to hold is which directory it lands on.
         landed = [os.path.realpath(os.path.join(self.at(".pi"), p))
                   for p in packages]
-        self.assertEqual(landed, [os.path.realpath(self.at("pi-agent-tasks"))],
+        # The distro's own package is configured here too and is not a queue
+        # package, so what has to hold is that the queue skill still has exactly one
+        # source. Named rather than filtered out, so an init that stopped installing
+        # pi-siana fails here rather than passing quietly.
+        self.assertEqual(landed, [os.path.realpath(self.at("pi-agent-tasks")),
+                                  os.path.realpath(
+                                      os.path.join(DISTRO, "template", "pi-siana"))],
                          f"init left {packages} behind")
 
     def test_a_settings_file_that_cannot_be_read_is_refused_and_never_read_as_empty(self):

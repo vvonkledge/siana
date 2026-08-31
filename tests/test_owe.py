@@ -101,10 +101,24 @@ class Command(HomeTest):
 
     def setUp(self):
         super().setUp()
-        self.contract("obligations")
+        self.contract("obligations", "attended")
 
     def owe(self, *args):
         return self.run_bin("siana-owe", *args)
+
+    # The reasoning half of a decision, as one argument list. Every field of it is
+    # required, so a test that only cares about the obligation would otherwise have
+    # to restate all five, and the restatements would drift apart.
+    REASONING = ("--situation", "Two worktrees claim the same branch",
+                 "--option", "Retire the older one",
+                 "--consequence", "One tree goes; the branch is untouched",
+                 "--option", "Leave both and report",
+                 "--consequence", "Dispatch stays blocked on that project",
+                 "--recommend", "Leave both and report",
+                 "--because", "Neither tree can be shown to be the stale one")
+
+    def decision(self, body, *args):
+        return self.owe("decision", body, *self.REASONING, *args)
 
     def records(self):
         with open(self.at("obligations.jsonl")) as fh:
@@ -133,7 +147,7 @@ class Command(HomeTest):
         self.assertRefused(self.owe("promise", "   "), "needs a body")
 
     def test_a_decision_can_name_the_task_it_is_about(self):
-        self.assertAccepted(self.owe("decision", "Who owns the push", "--task", "t1"))
+        self.assertAccepted(self.decision("Who owns the push", "--task", "t1"))
         self.assertEqual(self.records()[0]["task"], "t1")
         self.assertIn("(t1)", self.assertAccepted(self.owe()))
 
@@ -278,6 +292,201 @@ class Command(HomeTest):
                             "--set", "id=abc", "--set", "kind=promise",
                             "--set", "bdoy=typo", "--set", "opened=2026-01-01T00:00:00Z"])
         self.assertNotEqual(out.returncode, 0)
+
+
+class AttendedDecisions(HomeTest):
+    """The learning corpus: what the captain was asked, what they were offered, what
+    SIANA would have chosen and why, what they said, and how it turned out.
+
+    The property under test throughout is that the answer lives in exactly one store.
+    Everything else about this arrangement is bookkeeping; that one thing is what
+    keeps a corpus from becoming a second, staler record of the captain's decisions.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.contract("obligations", "attended")
+
+    def owe(self, *args):
+        return self.run_bin("siana-owe", *args)
+
+    REASONING = ("--situation", "Six branches are retained and two are a week old",
+                 "--option", "Reap them now",
+                 "--consequence", "The branches go; recovery is the forge only",
+                 "--option", "Keep them until QA lands",
+                 "--consequence", "The list grows and dispatch eventually blocks",
+                 "--recommend", "Keep them until QA lands",
+                 "--because", "A wrong reap is the one mistake here that loses work")
+
+    def decision(self, body="Whether to reap the retained branches", *args):
+        return self.owe("decision", body, *self.REASONING, *args)
+
+    def attended(self):
+        with open(self.at("attended.jsonl")) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_a_decision_records_its_reasoning_beside_the_obligation(self):
+        self.assertAccepted(self.decision())
+        rec = self.attended()[-1]
+        self.assertEqual(rec["options"],
+                         ["Reap them now", "Keep them until QA lands"])
+        self.assertEqual(len(rec["consequences"]), 2)
+        self.assertEqual(rec["recommendation"], "Keep them until QA lands")
+        self.assertIn("loses work", rec["rationale"])
+
+    def test_the_two_records_share_one_id(self):
+        # The join, and the whole reason nothing is copied: the corpus reads the
+        # answer out of the obligation every time, so there is nothing to go stale.
+        self.assertAccepted(self.decision())
+        with open(self.at("obligations.jsonl")) as fh:
+            obligation = json.loads(fh.readline())
+        self.assertEqual(self.attended()[-1]["id"], obligation["id"])
+
+    def test_the_answer_is_never_copied_into_the_reasoning_record(self):
+        self.assertAccepted(self.decision())
+        rid = self.attended()[-1]["id"]
+        self.assertAccepted(self.owe("close", rid, "--answer", "keep them"))
+        self.assertNotIn("answer", self.attended()[-1])
+        self.assertIn("keep them", self.assertAccepted(self.owe("history")))
+
+    def test_one_option_is_refused(self):
+        out = self.owe("decision", "Something", "--situation", "s",
+                       "--option", "only one", "--consequence", "c",
+                       "--recommend", "only one", "--because", "r")
+        self.assertRefused(out, "at least two --option", "notification")
+
+    def test_a_mismatched_consequence_list_is_refused(self):
+        out = self.owe("decision", "Something", "--situation", "s",
+                       "--option", "a", "--option", "b", "--consequence", "c",
+                       "--recommend", "a", "--because", "r")
+        self.assertRefused(out, "2 options and 1 consequences")
+
+    def test_a_recommendation_that_is_not_an_option_is_refused(self):
+        # Otherwise the corpus records agreement with a choice that was never on the
+        # table, which is the one thing a training corpus must not hold.
+        out = self.owe("decision", "Something", "--situation", "s",
+                       "--option", "a", "--consequence", "ca",
+                       "--option", "b", "--consequence", "cb",
+                       "--recommend", "c", "--because", "r")
+        self.assertRefused(out, "--recommend is not one of the options")
+
+    def test_a_decision_missing_its_reasoning_is_refused(self):
+        out = self.owe("decision", "Something", "--option", "a", "--option", "b",
+                       "--consequence", "ca", "--consequence", "cb")
+        self.assertRefused(out, "--situation", "--recommend", "--because")
+
+    def test_nothing_is_written_anywhere_when_the_reasoning_is_refused(self):
+        # The obligation is written first, so a validator that ran after it would
+        # leave the captain a question with no reasoning behind it.
+        self.owe("decision", "Something", "--situation", "s",
+                 "--option", "only one", "--consequence", "c",
+                 "--recommend", "only one", "--because", "r")
+        self.assertFalse(os.path.exists(self.at("obligations.jsonl")))
+        self.assertFalse(os.path.exists(self.at("attended.jsonl")))
+
+    def test_a_promise_needs_none_of_it(self):
+        # Only a decision carries reasoning. A promise is a thing SIANA owes, and
+        # there is nothing for the captain to choose between.
+        self.assertAccepted(self.owe("promise", "Report on the fleet at noon"))
+        self.assertFalse(os.path.exists(self.at("attended.jsonl")))
+
+    def test_an_outcome_before_an_answer_is_refused(self):
+        self.assertAccepted(self.decision())
+        rid = self.attended()[-1]["id"]
+        out = self.owe("outcome", rid, "--outcome", "it went fine")
+        self.assertRefused(out, "has not been answered yet", "is a guess")
+
+    def test_an_outcome_after_the_answer_is_recorded(self):
+        self.assertAccepted(self.decision())
+        rid = self.attended()[-1]["id"]
+        self.assertAccepted(self.owe("close", rid, "--answer", "keep them"))
+        self.assertAccepted(self.owe("outcome", rid, "--outcome",
+                                     "QA landed and they reaped cleanly"))
+        self.assertEqual(self.attended()[-1]["outcome"],
+                         "QA landed and they reaped cleanly")
+        self.assertIn("outcome_at", self.attended()[-1])
+
+    def test_history_joins_both_stores(self):
+        self.assertAccepted(self.decision())
+        rid = self.attended()[-1]["id"]
+        self.assertAccepted(self.owe("close", rid, "--answer", "keep them"))
+        out = self.assertAccepted(self.owe("history"))
+        self.assertIn("Whether to reap the retained branches", out)
+        self.assertIn("Keep them until QA lands", out)
+        self.assertIn("keep them", out)
+
+    def test_history_as_json_is_one_row_per_decision(self):
+        self.assertAccepted(self.decision())
+        rows = json.loads(self.assertAccepted(self.owe("history", "--json")))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "open")
+        self.assertEqual(rows[0]["body"], "Whether to reap the retained branches")
+
+    def test_an_open_decision_shows_no_captain_answer_at_all(self):
+        # Absent, not "(unrecorded)". Nobody has been asked yet, and that is a
+        # different fact from a record written without its answer.
+        self.assertAccepted(self.decision())
+        self.assertNotIn("captain", self.assertAccepted(self.owe("history")))
+
+    def test_a_decision_written_before_this_store_existed_stays_readable(self):
+        # The migration case. An obligation of kind `decision` with no reasoning is
+        # not part of the corpus, because it never carried what a corpus is made of,
+        # and inventing empty options for it would record that the captain was
+        # offered nothing.
+        self.store("obligations.jsonl",
+                   {"id": "older-decision", "kind": "decision",
+                    "body": "Something asked before the corpus existed",
+                    "status": "open", "opened": "2026-01-01T00:00:00+00:00"})
+        self.assertIn("Something asked before",
+                      self.assertAccepted(self.owe()))
+        self.assertIn("decided  nothing",
+                      self.assertAccepted(self.owe("history")))
+
+    def test_reasoning_whose_obligation_is_gone_is_reported_and_not_dropped(self):
+        # A corpus that quietly loses rows is one nobody can count.
+        self.assertAccepted(self.decision())
+        rid = self.attended()[-1]["id"]
+        self.store("obligations.jsonl", {"id": rid, "_deleted": True})
+        out = self.assertAccepted(self.owe("history"))
+        self.assertIn("orphan", out)
+        self.assertIn("the obligation for this is gone", out)
+
+    def test_no_attended_contract_is_a_stop_for_a_decision(self):
+        os.remove(self.at("schema-attended.yaml"))
+        self.assertRefused(self.decision(), "no attended-decision contract",
+                           "just upgrade")
+
+    def test_no_attended_contract_is_a_stop_for_history_too(self):
+        # A home that has not been upgraded reported `decided nothing`, which is what
+        # a home with an empty corpus reports, while `siana-owe` and `siana-owe
+        # closed` went on listing real decisions. An uninstalled store rendered as an
+        # empty one is the failure the rest of this reporting is written against.
+        self.assertAccepted(self.decision())
+        os.remove(self.at("schema-attended.yaml"))
+        self.assertRefused(self.owe("history"), "no attended-decision contract")
+        self.assertRefused(self.owe("history", "--json"),
+                           "no attended-decision contract")
+        # The obligation itself is still readable, which is what makes the silent
+        # version of this so easy to miss.
+        self.assertIn("Whether to reap", self.assertAccepted(self.owe()))
+
+    def test_a_corrupt_line_names_the_store_that_is_corrupt(self):
+        # `fold` had one caller and one store when its recovery was written. It has
+        # two now, and a recovery naming the wrong file quarantines nothing.
+        self.assertAccepted(self.decision())
+        self.store("attended.jsonl", "{half a record")
+        out = self.assertRefused(self.owe("history"), "is not JSON")
+        self.assertIn("-f attended.jsonl repair", out)
+        self.assertNotIn("obligations.jsonl repair", out)
+
+    def test_the_advisory_ledger_is_a_different_store_entirely(self):
+        # `decisions.jsonl` holds what SIANA would have done while the captain was
+        # away, and nobody was asked. Folding the two would put rows in the corpus
+        # with no captain answer that could ever arrive.
+        self.assertAccepted(self.decision())
+        self.assertFalse(os.path.exists(self.at("decisions.jsonl")))
+        rows = json.loads(self.assertAccepted(self.owe("history", "--json")))
+        self.assertEqual([r["id"] for r in rows], [self.attended()[-1]["id"]])
 
 
 if __name__ == "__main__":
