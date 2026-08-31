@@ -69,6 +69,18 @@ from datetime import datetime, timedelta, timezone
 
 REFUSED = 1
 
+# Every kind of refusal this contract defines, and nothing else. Closed like the
+# rest of the response: an error is a document from the other side of the boundary
+# like any other, and reading one field out of it while ignoring the rest is what
+# every other check here exists not to do.
+ERROR_KINDS = ("usage", "input", "pack", "trace", "path", "store")
+
+# What a relayed sentence may be. Generous for a message and bounded all the same,
+# and rejecting control characters with it, because this text is printed as a
+# refusal hint and a dispatch splits that output into lines: a newline in here is a
+# provider writing extra lines into a refusal SIANA reads as context.
+ERROR_MESSAGE_LIMIT = 1000
+
 # The contract, and the only version of it this consumer knows how to read. A
 # document declaring another is refused rather than read field by field: a layout
 # that is unstated is one a reader believes a piece at a time, and the fields it
@@ -354,11 +366,13 @@ def call(argv, command, stdin=None):
             die(f"asked `{COMMAND} {command}`, and the refusal is about "
                 f"{answer['command']!r}")
         error = answer["error"]
-        if not isinstance(error, dict) or not isinstance(error.get("message"), str):
-            die(f"`{COMMAND} {command}` refused, and its error is not one this "
-                f"contract defines: {error!r}")
-        die(f"`{COMMAND} {command}` refused: {error.get('kind')}: "
-            f"{error['message']}")
+        exact("the error", error, {"kind", "message"})
+        if error["kind"] not in ERROR_KINDS:
+            die(f"`{COMMAND} {command}` refused with a kind this contract does not "
+                f"define: {error['kind']!r}")
+        message = text_field("the error message", error["message"],
+                             limit=ERROR_MESSAGE_LIMIT)
+        die(f"`{COMMAND} {command}` refused: {error['kind']}: {message}")
     # A success is about the command that was asked for, and null is not one: it is
     # only ever written where nothing ran.
     if answer["command"] != command:
@@ -1114,7 +1128,8 @@ def cmd_reconcile(args, home):
         return 0
 
     print(f"semantic  {len(found)} pinned")
-    recorded = already = waiting = lost = failed = 0
+    recorded = already = waiting = failed = 0
+    lost = []
     for name in found:
         try:
             state, detail = reconcile_one(home, name, tasks)
@@ -1130,16 +1145,16 @@ def cmd_reconcile(args, home):
         elif state == "already":
             already += 1
         elif state == "lost":
-            lost += 1
-            print(f"  LOST    {name}: {detail}")
+            lost.append(detail)
+            print(f"  LOST    {name}: {LOST[detail]}")
         else:
             waiting += 1
     print(f"          {recorded} recorded, {already} already, "
-          f"{waiting} not terminal yet, {lost} never recorded, {failed} refused")
-    if lost:
-        print("          a run is unrecordable once its task has been reset: the")
-        print("          queue keeps one instant per task, so reconcile before you")
-        print("          reset one, not before you dispatch it again")
+          f"{waiting} not terminal yet, {len(lost)} never recorded, "
+          f"{failed} refused")
+    for reason in sorted(set(lost)):
+        for line in LOST_ADVICE[reason]:
+            print(f"          {line}")
     return REFUSED if failed else 0
 
 
@@ -1187,9 +1202,30 @@ def pin_state(home, name, pin, tasks):
 
 
 # Why a pin is not being acted on, in the words `reconcile` prints.
-WAITING = {"quiet": "never claimed", "unclaimed": "never claimed",
+WAITING = {"quiet": "nothing was ever claimed against it",
            "running": "a minion is holding it"}
-LOST = ("claimed, and the queue keeps no terminal record to build a run from")
+
+# The two ways a run ends up unrecordable, and the sentence for each. Both are holes
+# in the record and both are counted together, because what a reader has to act on
+# is the same: there is a task the fleet finished and nothing that says what it did.
+# Only the reason differs, and the reason is worth keeping.
+LOST = {
+    "lost": "claimed, and the queue keeps no terminal record to build a run from",
+    "unclaimed": "terminal, and no claim was ever marked against this pin",
+}
+
+# What to do differently, per reason, said once however many pins share it. The two
+# have nothing in common but their consequence, so one line covering both would be
+# advice that is wrong half the time.
+LOST_ADVICE = {
+    "lost": ("a run is unrecordable once its task has been reset: the queue keeps",
+             "one instant per task, so reconcile before you reset one, not before",
+             "you dispatch it again"),
+    "unclaimed": ("a pin nothing claimed is either a dispatch that could not write",
+                  "its claim down - it says so at the time and this is the only",
+                  "trace of it afterwards - or a task somebody took terminal by",
+                  "hand, which never had a run at all"),
+}
 
 
 def reconcile_one(home, name, tasks):
@@ -1207,13 +1243,13 @@ def reconcile_one(home, name, tasks):
     state = pin_state(home, name, pin, tasks)
     if state in WAITING:
         return "waiting", WAITING[state]
-    if state == "lost":
+    if state in LOST:
         # A hole in the record, named rather than counted with work that is merely
         # waiting. It is not a refusal: nothing clears it, so a nonzero exit here
         # would be permanent noise on a command SIANA runs on every wake, and the
         # only thing that prevents the next one is reconciling before a task is
         # reset.
-        return "lost", LOST
+        return "lost", state
     started = dispatched_at(home, name)
     already = read_recorded(home, name)
     task = tasks.get(task_id)
@@ -1363,7 +1399,7 @@ def cmd_status(args, home):
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(
         home, "tasks.jsonl")
     tasks = fold(tasks_file, "id")
-    waiting, lost, unclaimed = [], [], []
+    waiting, lost = [], []
     for name in pins:
         try:
             pin = read_pin(home, name)
@@ -1380,15 +1416,11 @@ def cmd_status(args, home):
         state = pin_state(home, name, pin, tasks)
         if state == "ready":
             waiting.append(name)
-        elif state == "lost":
+        elif state in LOST:
             lost.append(name)
-        elif state == "unclaimed":
-            unclaimed.append(name)
     # Named and not only counted: a hole in the record is something somebody has to
     # be able to go and look at, and the directory is where the evidence is.
     tail = f", {len(lost)} never recorded: {', '.join(lost)}" if lost else ""
-    tail += (f", {len(unclaimed)} terminal but never claimed: "
-             f"{', '.join(unclaimed)}") if unclaimed else ""
     if not pins:
         print("  ok      no pins yet")
     elif waiting:
