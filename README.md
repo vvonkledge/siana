@@ -376,6 +376,11 @@ precisely so it still works once you have removed either, and running one twice 
 but did not apply is a refusal that tells you to go and look, never a report that it
 worked.
 
+During an advisory session the reading form still answers and the cancelling forms
+are refused, so a merge armed before the session still happens when its checks pass.
+Stopping that one is your forge's own interface. See [Leave it
+advisory](#leave-it-advisory).
+
 **Only GitHub.** GitLab is refused under this field, and publishes to it exactly as it
 did before. `glab` has no command that cancels an armed merge and none that says which
 checks a project requires - a merge request there has one pipeline, and whether it

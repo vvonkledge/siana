@@ -452,10 +452,22 @@ request that task published, and `--dry-run` on it says what it would disarm. Re
 for it when you know which request you mean; reach for `--armed` when the question is
 the project.
 
-**Under an advisory session nothing is armed, cancelled or merged**, on the same
-terms as publishing: the proposal goes into the ledger and the command refuses. A
-standing grant in the registry is not a permission a session hands out, and a session
-in force is the captain saying decisions are being written down rather than made.
+**Under an advisory session nothing is armed, cancelled or merged.** A standing grant
+in the registry is not a permission a session hands out, and a session in force is
+the captain saying decisions are being written down rather than made. Where the two
+forms differ is in what is left behind, so do not report one as the other:
+
+- `siana-publish <qa-task-id>`, with or without `--cancel-automerge`, goes to the
+  gate on the same terms as any publish. The proposal is written into the ledger and
+  the command refuses, and the captain reads it in the morning.
+- `siana-publish --armed <project> --cancel-automerge` is refused outright, before
+  any gate call, and **nothing is recorded anywhere**. A proposal is written against
+  the task it is about, and this form is about several requests with no task between
+  them. Never tell the captain a decision is waiting for them after running it.
+
+Reading is exempt from both: `siana-publish --armed <project>` on its own changes
+nothing and answers during a session, which is the question worth asking while
+something you cannot stop is armed.
 
 **Only github.** A gitlab project carrying the field refuses to publish, and says
 why: `glab` has no call that cancels an armed merge and none that says which checks a
