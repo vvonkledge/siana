@@ -39,6 +39,16 @@ const MIN_REFETCH_MS = 5_000;
 /** How often to ask when there is no stream to be told by. */
 const POLL_MS = 10_000;
 
+/** How long a quiet stream goes before the app reads anyway.
+ *
+ * Comfortably under `STALE_AFTER_MS` and not equal to it: the read has to have come
+ * back before the screen would be called stale, not started at that moment.
+ * `/api/state` runs six `siana-read` processes and is not instant, so a refresh armed
+ * at the threshold would leave the loud banner up for the whole round trip, once a
+ * minute, on a console that is connected and current - which is exactly how a captain
+ * learns to look past it. */
+const QUIET_MS = 30_000;
+
 /** The ceiling a failing link backs off to. Bounded, because a captain who fixes
  * their network wants the screen back in under a minute. */
 const BACKOFF_MAX_MS = 60_000;
@@ -234,14 +244,14 @@ function settle() {
     planRefresh(Math.max(0, MIN_REFETCH_MS - (now() - lastAsked)));
     return;
   }
-  // A read even while the stream is up, once the screen would otherwise be old
-  // enough to be called stale. A connection that wedged without ever firing an error
-  // - a proxy holding the socket open, a laptop that slept - would otherwise leave
-  // the app behind a `Not live` banner with nothing left that would ever ask again.
-  // An unchanged fleet costs a `204` and no body, so the price of this is one empty
-  // response a minute per open page.
+  // A read even while the stream is up, before the screen would be old enough to be
+  // called stale. A connection that wedged without ever firing an error - a proxy
+  // holding the socket open, a laptop that slept - would otherwise leave the app
+  // behind a `Not live` banner with nothing left that would ever ask again. An
+  // unchanged fleet costs a `204` and no body, so the price of this is one empty
+  // response every half minute per open page.
   const streaming = source && source.readyState === 1 && !failures;
-  planRefresh(streaming ? STALE_AFTER_MS : pollDelay());
+  planRefresh(streaming ? QUIET_MS : pollDelay());
 }
 
 /** A revision the console says exists. Never state: the event carries a revision and

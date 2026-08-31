@@ -208,6 +208,31 @@ test('a read that never comes back is called stale, with its age', async (t) => 
   assert.match(said, /Nothing can be sent from here/);
 });
 
+test('a quiet stream is read again with room to spare, and the banner never flashes',
+  async (t) => {
+    // The read has to come back before the threshold rather than start at it.
+    // `/api/state` runs six `siana-read` processes and is not instant, so a refresh
+    // scheduled at exactly the staleness threshold would leave the loud banner up
+    // for the whole round trip - once a minute, on a console that is connected and
+    // current, which is how a captain learns to look past it.
+    const page = await connected(t, steady([task('a-task')]));
+    const slow = 10_000;
+    page.answer = (url) => new Promise((resolve) => {
+      page.window.setTimeout(() => resolve(answering(steady([task('a-task')]))(url)),
+                             slow);
+    });
+    const loud = [];
+    const watcher = new page.window.MutationObserver(() => {
+      if (bar(page).dataset.stale === 'yes') loud.push(page.clock);
+    });
+    watcher.observe(bar(page),
+                    { attributes: true, childList: true, subtree: true });
+    await page.tick(5 * STALE);
+    watcher.disconnect();
+    assert.deepEqual(loud, [], 'the stale banner appeared on a healthy console');
+    assert.ok(page.requests.length > 3, 'nothing was read across five minutes');
+  });
+
 test('a stream that goes quiet is still read again before it goes stale',
   async (t) => {
     // A connection that wedged without ever firing an error would otherwise leave

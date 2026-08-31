@@ -233,7 +233,9 @@ export function load({
       }
       if (!soonest) break;
       const [id, timer] = soonest;
-      page.clock = timer.at;
+      // Never backwards. A test whose scripted answer takes time takes it off this
+      // same clock, so a timer armed before that must not rewind it when it fires.
+      page.clock = Math.max(page.clock, timer.at);
       if (timer.every === null) pending.delete(id);
       else timer.at = page.clock + timer.every;
       timer.fn(...timer.args);
