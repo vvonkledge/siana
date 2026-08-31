@@ -703,6 +703,16 @@ def cases_of(records):
                   reverse=True)
 
 
+def cell(value):
+    """One field, as the view can print it.
+
+    A row that is valid JSON and missing a contract field reaches every reader here,
+    and the other three say so in words. This one formatted straight into a width
+    spec, where `None` raises rather than renders, so the first thing a captain types
+    was the one place a malformed row produced a traceback instead of a report."""
+    return "?" if value is None else str(value)
+
+
 def first_line(text, width=64):
     line = (text or "").strip().splitlines()
     line = line[0] if line else ""
@@ -726,13 +736,17 @@ def view(world):
     print(f"findings {len(records)} in {len(groups)} case"
           f"{'' if len(groups) == 1 else 's'}")
     for name, rounds in groups:
-        project = rounds[0].get("project")
-        print(f"  {name}  ({project}, {len(rounds)} round"
+        project = cell(rounds[0].get("project"))
+        print(f"  {cell(name)}  ({project}, {len(rounds)} round"
               f"{'' if len(rounds) == 1 else 's'})")
         wid = max(len(r.get("id") or "") for r in rounds)
         for rec in rounds:
-            print(f"    {rec.get('round')}  {rec.get('id'):<{wid}}"
-                  f"  {rec.get('kind'):<6}  {first_line(rec.get('summary'))}")
+            print(f"    {cell(rec.get('round'))}  {cell(rec.get('id')):<{wid}}"
+                  f"  {cell(rec.get('kind')):<6}  {first_line(rec.get('summary'))}")
+    if any(rec.get(field) is None
+           for rec in records for field in ("round", "kind", "summary")):
+        print("  a row above is missing fields this view needs; `siana-findings"
+              " verify` says which")
 
 
 def show(world, rid):
@@ -1001,21 +1015,41 @@ def plan_fields(rec):
     return out
 
 
-def differences(plan_rec, stored):
-    """Which of the plan's own fields this stored record disagrees with.
+def default_for(kind):
+    """What a field the plan does not set is worth, by the contract's own defaults.
+
+    A list defaults to empty and everything else to null, which is what `datafile`
+    materialises an omitted field to. Without this a plan that never mentioned
+    `tags` would read as disagreeing with the empty list the store wrote."""
+    return [] if kind == "list" else None
+
+
+def differences(plan_rec, stored, fields):
+    """Which of this stored record's fields the plan disagrees with.
+
+    Over every field either of them has, and not only the ones the plan still
+    carries. A field deleted from a plan is a change to what SIANA decided, and
+    reading only the plan's own keys made that the one edit that converged silently:
+    a wrong pointer taken back out gave a green run against a ledger that still held
+    it, and the store is append-only by refusal, so nothing else would ever have
+    surfaced the divergence.
 
     Named one by one rather than reported as "differs", because the whole question a
     reader has at this point is which half is wrong: the plan they just edited, or
     the record that was written before they edited it."""
     left, right = plan_fields(plan_rec), plan_fields(stored)
     out = []
-    for key, value in sorted(left.items()):
+    for key in sorted(set(left) | set(right)):
         if key in ("id", "case"):
             # The key itself, and the field the caller has already refused on with
             # a message that says more than a field name could.
             continue
-        if right.get(key) != value:
-            out.append(f"{key}: the plan says {value!r}, the ledger holds"
+        if key in left:
+            if right.get(key) != left[key]:
+                out.append(f"{key}: the plan says {left[key]!r}, the ledger holds"
+                           f" {right.get(key)!r}")
+        elif right.get(key) != default_for(fields.get(key)):
+            out.append(f"{key}: the plan no longer carries it, and the ledger holds"
                        f" {right.get(key)!r}")
     return out
 
@@ -1123,7 +1157,12 @@ def drop(tasks_file: str, task_id: str, record_id: str):
         die(f"the queue refused to drop {task_id}",
             *(proc.stdout + proc.stderr).strip().splitlines()[:6],
             "the ledger already holds this case, so re-running this plan is safe")
-    return "absent" in proc.stdout
+    # The line, not the word. Ids match `^[a-z][a-z0-9-]{2,47}$`, and the reason
+    # this writes is echoed back on stdout, so `qa-absent-blob` would have read as a
+    # task that was already gone: dropped in fact and reported as untouched, in the
+    # archive's only account of the step that removes queue records.
+    return any(line.strip() == "result: absent"
+               for line in proc.stdout.splitlines())
 
 
 def check_superseded(rec, world, fresh: bool):
@@ -1183,7 +1222,7 @@ def archive(world, plan_path: str):
                 die(f"{rid} is already archived under case {stored.get('case')}",
                     f"this plan files it under {case_name}; a task id is the key of"
                     " this store and two different findings may not share one")
-            diffs = differences(plan_rec, stored)
+            diffs = differences(plan_rec, stored, world.fields())
             if diffs:
                 die(f"{rid} is already archived and this plan differs from it",
                     *diffs,

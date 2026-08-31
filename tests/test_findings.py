@@ -281,10 +281,27 @@ class MalformedStore(Ledger):
         # Valid JSON, so the fold reads it. What refuses it is the contract, asked
         # of the code that enforces it at the write rather than re-implemented here.
         self.archived()
-        self.store("findings.jsonl", {"id": "half-a-record", "case": "demo-case",
-                                      "round": 2})
+        self.half_a_record()
         out = self.assertRefused(self.findings("verify"), "contract")
         self.assertIn("resolution", out)
+
+    def test_every_reader_reports_such_a_line_rather_than_dying_on_it(self):
+        # The default view formatted straight into a width spec, where a missing
+        # field raises rather than renders. It is the first thing a captain types
+        # and it was the one reader that answered a malformed row with a traceback.
+        self.archived()
+        self.half_a_record()
+        for argv in ((), ("case", "demo-case"), ("show", "qa-one")):
+            with self.subTest(argv=argv):
+                out = self.findings(*argv)
+                self.assertNotIn("Traceback", out.stdout + out.stderr)
+        listing = self.assertAccepted(self.findings())
+        self.assertIn("half-a-record", listing)
+        self.assertIn("missing fields this view needs", listing)
+
+    def half_a_record(self):
+        self.store("findings.jsonl", {"id": "half-a-record", "case": "demo-case",
+                                      "round": 2})
 
 
 # --------------------------------------------------------------------------
@@ -650,6 +667,28 @@ class Converge(TwoRounds):
         self.assertIn("summary", out)
         self.assertEqual(len(self.ledger_lines()), 2)
 
+    def test_a_plan_with_a_field_taken_back_out_is_refused(self):
+        # The edit SIANA makes when a pointer was wrong. Read against the plan's own
+        # keys alone, a deleted field was the one change that converged silently: a
+        # green run against a ledger that still held the value, in a store that is
+        # append-only by refusal, so nothing else would ever have said so.
+        one, two = self.rounds()
+        self.archived(one, two)
+        out = self.assertRefused(self.archive(self.round_one(landed=_OMIT,
+                                                             acceptance="qa-two"),
+                                              two),
+                                 "already archived and this plan differs")
+        self.assertIn("landed: the plan no longer carries it", out)
+
+    def test_a_plan_that_never_carried_an_optional_field_still_converges(self):
+        # The other half of the same rule. A plan that never set `tags` agrees with
+        # the empty list the store materialised, and must not read as a change.
+        one, two = self.rounds()
+        one, two = dict(one), dict(two)
+        one.pop("tags"), two.pop("tags")
+        self.archived(one, two)
+        self.assertIn("already archived", self.archived(one, two))
+
     def test_a_re_run_after_the_blobs_copies_nothing_twice(self):
         one, two = self.rounds()
         sha = self.digest(self.report)
@@ -738,6 +777,17 @@ class Superseded(Ledger):
     def setUp(self):
         super().setUp()
         self.orphan = self.add("qa the orphan", dep="qa-one")
+
+    def test_a_task_whose_id_contains_the_word_absent_is_reported_as_dropped(self):
+        # The queue echoes the id and this command's own reason back on stdout, so a
+        # substring match read a real removal as a task that was already gone. The
+        # queue ends in the right state either way; what was wrong was the archive's
+        # only account of the step that removes queue records.
+        absent = self.add("qa absent blob", dep="qa-one")
+        out = self.archived(self.round_one(superseded=[absent]))
+        self.assertIn(f"dropped  {absent}", out)
+        self.assertIn("2 tasks removed", out)
+        self.assertNotIn("already archived", out)
 
     def test_the_accepted_path_removes_it_and_says_what_replaced_it(self):
         self.archived(self.round_one(superseded=[self.orphan]))
