@@ -735,6 +735,28 @@ class Descendants(unittest.TestCase):
         self.assertNotIn(os.getpid(), pids)
         self.assertNotIn(1, pids)
 
+    def test_a_zombie_child_is_not_a_process_to_kill(self):
+        """The false positive that would turn every green run red.
+
+        A child that exited and has not been waited for still holds its pid and
+        still answers `kill(pid, 0)`, so counting it would make the caller sit out
+        its whole grace period and then report a process it could not kill - for
+        something running nothing, which disappears the moment its parent is
+        waited for. Any test that leaves a child unwaited would do it.
+        """
+        parent = subprocess.Popen([sys.executable, "-c", textwrap.dedent("""
+            import subprocess, sys, time
+            child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+            time.sleep(0.5)                       # exited, deliberately not waited
+            sys.stdout.write(f"{child.pid}\\n"); sys.stdout.flush()
+            time.sleep(300)
+        """)], stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(self.reap_tree, parent)
+        zombie = int(parent.stdout.readline().strip())
+        pids, _ = run.descendants([parent.pid])
+        self.assertIn(parent.pid, pids)
+        self.assertNotIn(zombie, pids, "a zombie was counted as a live process")
+
     def test_no_roots_finds_nothing(self):
         # The empty case, because `reap` reaches it on every run whose workers have
         # all exited normally, and a walk that invented a root there would signal

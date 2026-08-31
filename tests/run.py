@@ -451,15 +451,23 @@ def descendants(roots):
     # its own listing as a child of whoever asked, and it is also the pid most
     # likely to have just been freed - so signalling it would be this runner's one
     # realistic chance of reaching a process it never started.
-    asking = subprocess.Popen(["ps", "-Ao", "pid=,ppid=,pgid="],
+    asking = subprocess.Popen(["ps", "-Ao", "pid=,ppid=,pgid=,state="],
                               stdout=subprocess.PIPE, text=True)
     listing = asking.communicate()[0]
     children, groups = {}, {}
     for line in listing.splitlines():
         fields = line.split()
-        if len(fields) != 3 or not all(f.lstrip("-").isdigit() for f in fields):
+        if len(fields) != 4 or not all(f.lstrip("-").isdigit() for f in fields[:3]):
             continue
-        pid, parent, group = (int(f) for f in fields)
+        pid, parent, group = (int(f) for f in fields[:3])
+        # A zombie is skipped, and that matters more than it looks. It answers
+        # `kill(pid, 0)` exactly as a running process does and no signal can move
+        # it, so counting one would make the caller wait out its whole grace
+        # period and then report a process it could not kill - for something that
+        # is running nothing and disappears the moment its parent is waited for.
+        # Any test that leaves a child unwaited would turn a green run red.
+        if fields[3].startswith("Z"):
+            continue
         children.setdefault(parent, []).append(pid)
         groups[pid] = group
     seen, stack = set(), list(roots)
@@ -524,7 +532,12 @@ def terminate(roots, grace, spare=(), settle=None):
             settle()
         time.sleep(0.05)
     signal_all(signal.SIGKILL)
-    return alive()
+    # The verdict is taken from a fresh walk rather than from `kill(pid, 0)`,
+    # because a process this call just killed is a zombie until somebody waits for
+    # it and a zombie answers that signal exactly as a running process does.
+    # `descendants` leaves zombies out, so what comes back here is only what is
+    # genuinely still running.
+    return sorted(descendants(roots)[0] & pids)
 
 
 def reap(workers, root):
@@ -555,6 +568,21 @@ def reap(workers, root):
             pass
     shutil.rmtree(root, ignore_errors=True)
     return survivors
+
+
+def reap_own_children():
+    """Wait for any child of this process that has already exited.
+
+    Handed to `terminate` as its settle, so that a child it has just killed stops
+    answering `kill(pid, 0)` instead of holding the whole grace period open as a
+    zombie. Only this process's own children can be reaped, which is exactly the
+    set a worker leaks.
+    """
+    try:
+        while os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except (ChildProcessError, OSError):
+        pass
 
 
 def _alive(pid):
@@ -691,16 +719,24 @@ def work():
                 break
     finally:
         result.stopTestRun()
-        events.close()
         # A worker clears its own tree before it goes, and this is the only place
         # that case can be answered from. A test may leave a child behind - one in
         # a session of its own, which is the shape `tests/test_siana.py` uses - and
         # once this process has exited that child has reparented to init, where
         # nothing can say it was ever this run's. So it is taken now, while there
         # is still a parent to name it by.
-        left = terminate([os.getpid()], GRACE_S // 2, spare=(os.getpid(),))
+        left = terminate([os.getpid()], GRACE_S // 2, spare=(os.getpid(),),
+                         settle=reap_own_children)
         if left:
-            sys.stderr.write(f"worker {os.getpid()} could not reap {sorted(left)}\n")
+            # Told to the coordinator rather than written to this worker's log.
+            # The log is only read when a worker died mid-test, and the run root
+            # holding it is deleted at the end of every run - so on the one path
+            # that happens on every green suite, a worker that could not kill
+            # what it started would have reported it into a file nobody opens and
+            # then had the file removed. That is the exact failure this whole
+            # arrangement is written against, reading as a clean run.
+            result.send(e="left", pids=sorted(left))
+        events.close()
 
 
 # --------------------------------------------------------------------------------
@@ -767,7 +803,7 @@ def coordinate(ids, pool, verbosity, failfast, stream):
     # the `finally` below and takes the run's temporary state with it.
     root = short_tmp()
     workers, started = [], time.monotonic()
-    survivors, stalled = [], None
+    survivors, stalled, orphans = [], None, []
 
     def cleanup():
         return reap(workers, root)
@@ -912,6 +948,11 @@ def coordinate(ids, pool, verbosity, failfast, stream):
                             stream.write("          " + (
                                 f"skipped: {event['t']}" if event["o"] == "skip"
                                 else event["o"]) + "\n")
+                    elif event["e"] == "left":
+                        # A worker could not kill something it started. Held here
+                        # so it reaches the report and the exit code, exactly as
+                        # the coordinator's own leftovers do.
+                        orphans.extend(event["pids"])
                     elif event["e"] == "idle":
                         hand_out(worker)
                 stream.flush()
@@ -961,9 +1002,10 @@ def coordinate(ids, pool, verbosity, failfast, stream):
                 "no worker reported this test; it was discovered and never ran\n")))
     reported = [t for t in ids if t in outcomes]
     ok = report(reported, outcomes, time.monotonic() - started, verbosity, stream)
-    if survivors:
-        stream.write(f"\nleft running after SIGKILL: {sorted(survivors)}\n")
-    return 0 if ok and not survivors and not stalled else 1
+    leftover = sorted(set(survivors) | set(orphans))
+    if leftover:
+        stream.write(f"\nleft running after SIGKILL: {leftover}\n")
+    return 0 if ok and not leftover and not stalled else 1
 
 
 def main():
