@@ -969,6 +969,35 @@ class Reconciling(SemanticTest):
         self.released()
         self.released()
 
+    def test_a_recorded_run_stays_recorded_once_its_task_is_reset(self):
+        # The step straight after reconciling, in the re-dispatch this fleet
+        # prescribes. The run is in the store and finished; reading the queue first
+        # would call it a hole in the record and tell SIANA it had reconciled too
+        # late when it had reconciled exactly on time.
+        self.ready_to_record(status="blocked")
+        self.assertAccepted(self.sem("reconcile"))
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "reset", self.TASK,
+             "--reason", "given to a new minion"]))
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertNotIn("LOST", out)
+        self.assertIn("0 recorded, 1 already", out)
+        self.assertEqual(len(self.calls("trace record")), 1)
+
+    def test_a_recorded_run_stays_recorded_once_its_task_leaves_the_queue(self):
+        self.ready_to_record()
+        self.assertAccepted(self.sem("reconcile"))
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "drop", self.TASK,
+             "--reason", "no longer wanted", "--force"]))
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertNotIn("LOST", out)
+        self.assertIn("1 already", out)
+
     def test_a_run_reset_before_it_was_recorded_is_named_and_never_invented(self):
         # The one loss this cannot prevent, so the one it must never hide. The queue
         # keeps a single instant per task, so `reset` overwrites when that run ended

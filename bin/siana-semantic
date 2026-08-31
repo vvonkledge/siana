@@ -1137,19 +1137,29 @@ def reconcile_one(home, name, tasks):
         # dispatched again later, or blocked by hand - and recording a run for it
         # would be an execution nobody ever performed.
         return "waiting", "never claimed"
+    # Read before anything is asked of the queue, because a run already in the store
+    # is finished and nothing the queue does afterwards changes that. Reset is the
+    # ordinary thing that happens next - it is the step after reconciling in the
+    # re-dispatch this fleet prescribes - and reading the queue first would report a
+    # correctly recorded run as a hole in the record.
+    already = read_recorded(home, name)
     task = tasks.get(task_id)
     if task is None:
         # The pin outlived its task. Nothing is recorded and nothing is removed:
         # the bytes a minion was briefed from are evidence, and a queue that no
         # longer holds the task is not a reason to throw them away.
+        if already is not None:
+            return "already", already["trace_id"]
         return "waiting", "no such task"
     if task.get("status") not in OUTCOMES:
+        if already is not None:
+            return "already", already["trace_id"]
         if task.get("status") == "doing":
             return "waiting", "doing"
-        # Claimed, and the queue holds no terminal record to build a run from. The
-        # task was reset after the claim, and `updated` names the reset rather than
-        # whatever it did before it: a run that ended here can no longer be recorded
-        # by anything, because when it ended is not written down anywhere.
+        # Claimed, never recorded, and the queue holds no terminal record to build a
+        # run from. The task was reset after the claim, and `updated` names the reset
+        # rather than whatever it did before it: a run that ended here can no longer
+        # be recorded by anything, because when it ended is not written down anywhere.
         #
         # Named rather than counted with the ordinary waiting, because it is a hole
         # in the record and the only thing that can prevent the next one is
@@ -1178,7 +1188,6 @@ def reconcile_one(home, name, tasks):
 
     doc = run_document(pin, task, started)
     body = document(doc)
-    already = read_recorded(home, name)
     if already is not None:
         # A replay has to be the same run. A pin whose task went terminal, was
         # reset, and went terminal again differently is two runs under one trace id,
