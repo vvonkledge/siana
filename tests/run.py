@@ -473,7 +473,12 @@ def descendants(roots):
     seen, stack = set(), list(roots)
     while stack:
         pid = stack.pop()
-        if pid in seen:
+        # Only what the listing actually holds. A root that has already exited is
+        # not a process any more, and adding one unconditionally made every caller
+        # report its own workers as things it had failed to kill - so every Ctrl-C
+        # ended by naming a leak that was not there, which is the one message this
+        # runner must never print without meaning it.
+        if pid in seen or pid not in groups:
             continue
         seen.add(pid)
         stack.extend(children.get(pid, ()))
@@ -500,13 +505,18 @@ def terminate(roots, grace, spare=(), settle=None):
     Returns whatever was still alive after SIGKILL. An empty list is the only
     acceptable answer, and every caller says so when it is not.
     """
-    pids, groups = descendants(roots)
-    pids -= set(spare)
-    groups -= {os.getpgid(0), 0}
-    if not pids:
-        return []
+    spare = set(spare)
 
-    def signal_all(sig):
+    def still_running():
+        """What is alive under `roots` right now, and the sessions holding it.
+
+        Asked again every time rather than kept, because the answer is what makes
+        the difference between reporting a leak and inventing one.
+        """
+        seen, groups = descendants(roots)
+        return seen - spare, groups - {os.getpgid(0), 0}
+
+    def signal_all(pids, groups, sig):
         for group in groups:
             try:
                 os.killpg(group, sig)
@@ -518,12 +528,12 @@ def terminate(roots, grace, spare=(), settle=None):
             except OSError:
                 pass
 
-    def alive():
-        return [pid for pid in pids if _alive(pid)]
-
-    signal_all(signal.SIGTERM)
+    pids, groups = still_running()
+    if not pids:
+        return []
+    signal_all(pids, groups, signal.SIGTERM)
     deadline = time.monotonic() + grace
-    while time.monotonic() < deadline and alive():
+    while time.monotonic() < deadline and any(_alive(pid) for pid in pids):
         # `settle` is how a caller reaps its own children while it waits. Without
         # it a worker that took SIGTERM immediately would still read as alive - a
         # zombie answers `kill(pid, 0)` exactly as a running process does - and
@@ -531,13 +541,21 @@ def terminate(roots, grace, spare=(), settle=None):
         if settle:
             settle()
         time.sleep(0.05)
-    signal_all(signal.SIGKILL)
-    # The verdict is taken from a fresh walk rather than from `kill(pid, 0)`,
-    # because a process this call just killed is a zombie until somebody waits for
-    # it and a zombie answers that signal exactly as a running process does.
-    # `descendants` leaves zombies out, so what comes back here is only what is
-    # genuinely still running.
-    return sorted(descendants(roots)[0] & pids)
+
+    # Asked again rather than reused, and this is the important line. The snapshot
+    # above is old in process terms by now: `settle` has been reaping, so some of
+    # those pids are free and may already belong to something this runner never
+    # started. Signalling the old set would be the hazard `finish` refuses to take
+    # when it declines to signal a worker it has already waited for. So SIGKILL
+    # reaches only what is still running under these roots, and the verdict is what
+    # survives that.
+    left, groups = still_running()
+    if left:
+        signal_all(left, groups, signal.SIGKILL)
+        if settle:
+            settle()
+        left = still_running()[0]
+    return sorted(left)
 
 
 def reap(workers, root):
@@ -721,17 +739,24 @@ def work():
                 break
             wanted = json.loads(line)
             loaded, why = {}, ""
-            try:
-                where = wanted[0].rsplit(".", 1)[0]
-                loaded = {t.id(): t for t in iterate(loader.loadTestsFromName(where))}
-            except BaseException:
-                # Every exception, because a loader failing is not one of the
-                # outcomes below it: it is this worker unable to do the job it was
-                # given, and the run has to say so with the ids in it rather than
-                # report a suite that is quietly smaller. The reason is carried
-                # into the report, because a load that failed without saying why
-                # is the least diagnosable thing this file could print.
-                why = traceback.format_exc()
+            # Per class rather than per chunk. An ordinary chunk is one class, but
+            # a solo chunk is every test matching a prefix, and a prefix naming a
+            # module - or a second prefix beside the first - spans several. Taking
+            # the class from `wanted[0]` alone would load that one and report every
+            # other test in the chunk as one this worker could not load.
+            for where in dict.fromkeys(t.rsplit(".", 1)[0] for t in wanted):
+                try:
+                    loaded.update({t.id(): t for t in
+                                   iterate(loader.loadTestsFromName(where))})
+                except BaseException:
+                    # Every exception, because a loader failing is not one of the
+                    # outcomes below it: it is this worker unable to do the job it
+                    # was given, and the run has to say so with the ids in it
+                    # rather than report a suite that is quietly smaller. The
+                    # reason is carried into the report, because a load that failed
+                    # without saying why is the least diagnosable thing this file
+                    # could print.
+                    why += traceback.format_exc()
             # Anything the coordinator discovered and this worker cannot load is a
             # named error rather than a test that quietly did not run. The two use
             # the same discovery, so this should be unreachable; it is here because

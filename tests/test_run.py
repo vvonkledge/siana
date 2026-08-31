@@ -329,6 +329,32 @@ class SoloDispatch(Fixture):
         self.assertIn("test_dies.Quiet.test_needs_the_machine", out.stdout)
         self.assertIn("FAILED (errors=1)", out.stdout)
 
+    def test_a_solo_chunk_spanning_several_classes_runs_all_of_them(self):
+        # A solo chunk is every test matching a prefix, so a prefix naming a
+        # module - or a second prefix beside the first - spans classes. A worker
+        # that took the class from the first id alone reported every other test in
+        # the chunk as one it could not load, which is a red run naming tests that
+        # were never broken.
+        where = self.suite(test_wide="""
+            import unittest
+
+            class First(unittest.TestCase):
+                def test_a(self): pass
+
+            class Second(unittest.TestCase):
+                def test_b(self): pass
+
+            class Third(unittest.TestCase):
+                def test_c(self): pass
+        """)
+        ids = ["test_wide.First.test_a", "test_wide.Second.test_b",
+               "test_wide.Third.test_c"]
+        with mock.patch.object(run, "SOLO", ("test_wide.",)):
+            out = self.coordinated(where, ids, pool=2)
+        self.assertNotIn("could not be loaded", out)
+        self.assertIn("Ran 3 tests", out)
+        self.assertIn("OK", out)
+
     def test_the_solo_test_still_runs_when_it_is_the_only_work(self):
         where = self.suite(test_solo="""
             import unittest
@@ -821,12 +847,77 @@ class Descendants(unittest.TestCase):
         self.assertIn(parent.pid, pids)
         self.assertNotIn(zombie, pids, "a zombie was counted as a live process")
 
+    def test_a_root_that_has_exited_is_not_a_descendant(self):
+        # The walk seeds itself with the roots, and adding one that has already
+        # gone made every caller report its own workers as processes it had failed
+        # to kill. See `Reaping` below for what that looked like from outside.
+        gone = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        gone.wait()
+        pids, groups = run.descendants([gone.pid])
+        self.assertNotIn(gone.pid, pids)
+        self.assertEqual(groups, set())
+
     def test_no_roots_finds_nothing(self):
         # The empty case, because `reap` reaches it on every run whose workers have
         # all exited normally, and a walk that invented a root there would signal
         # something. Not a pid that has merely exited: that one can be reused, and a
         # test asserting nothing descends from it would fail on whatever got it.
         self.assertEqual(run.descendants([]), (set(), set()))
+
+
+class Reaping(unittest.TestCase):
+    """`terminate` on its own, because what it *reports* is load-bearing.
+
+    "left running after SIGKILL" is the sentence this whole arrangement exists to
+    make true when it appears and absent when it does not. A version that named
+    the processes it had just killed would print it on every Ctrl-C and send
+    whoever read it hunting pids that never leaked - and the same value feeds the
+    exit code on the stall path.
+    """
+
+    def sleeper(self):
+        proc = subprocess.Popen(["/bin/sleep", "300"], start_new_session=True)
+        self.addCleanup(self.kill, proc)
+        return proc
+
+    def kill(self, proc):
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=30)
+
+    def test_a_process_it_killed_is_not_reported_as_a_survivor(self):
+        proc = self.sleeper()
+        left = run.terminate([proc.pid], 5, settle=proc.poll)
+        self.assertEqual(left, [], "it named a process it had just killed")
+        self.assertIsNotNone(proc.poll(), "the process is still running")
+
+    def test_nothing_to_kill_is_reported_as_nothing(self):
+        gone = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        gone.wait()
+        self.assertEqual(run.terminate([gone.pid], 5), [])
+
+    def test_it_kills_a_child_that_left_the_process_group(self):
+        # The case the walk exists for, and the one that must still work now that
+        # dead roots are skipped: the root is alive, so its tree is findable.
+        parent = subprocess.Popen([sys.executable, "-c", textwrap.dedent("""
+            import subprocess, sys, time
+            child = subprocess.Popen(["/bin/sleep", "300"], start_new_session=True)
+            sys.stdout.write(f"{child.pid}\\n"); sys.stdout.flush()
+            time.sleep(300)
+        """)], stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(self.kill, parent)
+        escaped = int(parent.stdout.readline().strip())
+        self.assertEqual(run.terminate([parent.pid], 5, settle=parent.poll), [])
+        self.assertTrue(until(lambda: not _running(escaped), timeout=15),
+                        f"{escaped} escaped its session and survived")
+
+
+def _running(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 class Pool(Fixture):

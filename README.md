@@ -533,10 +533,9 @@ Measured on an eleven-core M3 Pro, 901 tests, interleaving the two modes:
 That is a 58% cut, and the spread is the machine rather than the runner. The
 serial figures agree to within 0.3% because a run using less than one core barely
 notices what else is happening; the pool, at three and a half cores, does. Those
-runs were taken with the load average between 10 and 27, and on a quiet machine the
-same pool finishes in a little over three minutes. Expect somewhere between three
-and nine minutes depending on what else the machine is doing, and take the
-one-worker figure as the thing that does not move.
+runs were taken with the load average between 10 and 27, which is what this machine
+looks like with a fleet on it. Expect seven to nine minutes under that, less on a
+quiet machine, and take the one-worker figure as the thing that does not move.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like
