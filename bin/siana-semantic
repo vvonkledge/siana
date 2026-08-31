@@ -330,9 +330,6 @@ def call(argv, command, stdin=None):
             f"{answer['version']!r}, and this consumer reads {RESPONSE_VERSION}",
             "reading the fields it recognises out of a later document and guessing",
             "about the rest is the one thing a pinned contract exists to prevent")
-    if answer["command"] != command:
-        die(f"asked `{COMMAND} {command}`, and the answer is about "
-            f"{answer['command']!r}")
     if answer["status"] not in ("ok", "error"):
         die(f"`{COMMAND} {command}` answered status {answer['status']!r}")
 
@@ -347,12 +344,26 @@ def call(argv, command, stdin=None):
             f"{sorted(set(answer) & {'result', 'error'})}",
             "exactly one of `result` and `error` is present in this contract")
     if not ok:
+        # `command` is null when the arguments did not resolve to a command at all,
+        # which is exactly what a usage refusal is - a grammar this consumer no
+        # longer speaks, or a value it handed over that is not the shape stated for
+        # it. Held to the command asked for before this, that whole class died
+        # saying the answer was about something else and threw away the one sentence
+        # that says which argument was wrong.
+        if answer["command"] not in (command, None):
+            die(f"asked `{COMMAND} {command}`, and the refusal is about "
+                f"{answer['command']!r}")
         error = answer["error"]
         if not isinstance(error, dict) or not isinstance(error.get("message"), str):
             die(f"`{COMMAND} {command}` refused, and its error is not one this "
                 f"contract defines: {error!r}")
         die(f"`{COMMAND} {command}` refused: {error.get('kind')}: "
             f"{error['message']}")
+    # A success is about the command that was asked for, and null is not one: it is
+    # only ever written where nothing ran.
+    if answer["command"] != command:
+        die(f"asked `{COMMAND} {command}`, and the answer is about "
+            f"{answer['command']!r}")
     if not isinstance(answer["result"], dict):
         die(f"`{COMMAND} {command}` answered a result that is not an object")
     return answer["result"]

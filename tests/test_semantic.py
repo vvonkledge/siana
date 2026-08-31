@@ -696,6 +696,26 @@ class Refusing(SemanticTest):
                      doc=fs.response("pack export",
                                      self.export_result(as_of="2020-01-01T00:00:00Z")))
 
+    def test_a_grammar_this_consumer_no_longer_speaks_says_so_in_its_own_words(self):
+        # The contract writes `command: null` when the arguments did not resolve to
+        # a command at all, which is what every usage refusal is. An installed
+        # provider whose grammar has moved answers exactly this, and its sentence is
+        # the one thing that would tell the captain to upgrade.
+        doc = fs.response("pack export", error={
+            "kind": "usage",
+            "message": "unrecognized arguments: --expect-target. Run "
+                       "`semantic-layer pack export --help` for what it takes."})
+        doc["command"] = None
+        self.refuses("unrecognized arguments: --expect-target", doc=doc, exit=2)
+
+    def test_a_refusal_about_some_other_command_is_still_refused_as_one(self):
+        # Null is the documented case and the only one. An answer naming a
+        # different command is a provider answering a question nobody asked.
+        self.refuses("the refusal is about",
+                     doc=fs.response("trace get", error={"kind": "path",
+                                                         "message": "no store"}),
+                     exit=1)
+
     def test_an_answer_about_another_command(self):
         self.refuses("is about",
                      doc=fs.response("pack verify", self.export_result()))
