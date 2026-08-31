@@ -96,6 +96,45 @@ which project a piece of work belongs to, you do not yet have a task, you have a
 conversation. Dispatch refuses a task with no project rather than choosing a
 directory nobody wrote down.
 
+## Project facts
+
+`facts.jsonl` is what the captain has recorded about a project, so a minion sent
+there is told it instead of asking. A staging URL, the link to the business
+documentation, the account a test user signs in with. Its contract is
+`schema-facts.yaml`, and `siana-dispatch` appends this project's facts to every
+minion's orders as a marked data section. You never repeat them in `--context`.
+
+    siana-fact url  <project> <slug> <https url> --note '<what it is>'
+    siana-fact text <project> <slug> '<one line>'
+    siana-fact list
+    siana-fact status
+
+A `url` or `text` fact is nonsecret. It is written into a file every minion in that
+project reads, so anything recorded as one is something the captain is content to
+have read by all of them. Never record a secret as one, whatever the captain calls
+it.
+
+**A credential is not written down at all.** `siana-fact credential` puts the value
+in the operating system keychain through the keychain's own prompt and records only
+where it is, and there is no command that prints it back. You never see one, never
+ask for one, and never carry one in a task, a brief, a report or a message to the
+captain.
+
+A credential reaches one task and only because the captain said so:
+
+    siana-fact grant  <task-id> <slug>     # only while the task is still todo
+    siana-fact revoke <task-id> <slug>
+
+Being able to run `grant` is not permission to, exactly as it is not for the
+registry. A grant is a decision about who may use a secret, so it happens when the
+captain says to and never because a task looked like it needed one. Nothing is
+inherited either: if a QA task has to reach the same credential the ship task did,
+that is a second grant the captain makes, not a thing you arrange around.
+
+Dispatch refuses rather than dispatching a minion half-briefed: a facts store it
+cannot read, a record it cannot deliver, or a grant that names a different project
+than the task does. `siana-fact status` is what says which record is in that state.
+
 ## The queue
 
 `tasks` is your queue and you are its orchestrator. The store is `tasks.jsonl` in

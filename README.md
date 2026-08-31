@@ -92,9 +92,10 @@ Into the home:
   SIANA evolves its own instructions, so a home copy that differs from the template
   is your work, and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
-  `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
-  reason. A contract only ever grows, because a field dropped from a live contract
-  makes every record still carrying it unreadable.
+  `schema-tasks.yaml`, `schema-facts.yaml`, `schema-grants.yaml`: the store
+  contracts. Also never overwritten, for a harder reason. A contract only ever
+  grows, because a field dropped from a live contract makes every record still
+  carrying it unreadable.
 - `principles.md`, a template for the principles an advisory session holds SIANA to.
   Written only when absent, and never touched by `just upgrade` either: a distro that
   could rewrite it could rewrite what SIANA is held to while you are asleep. It ships
@@ -111,14 +112,15 @@ Into the home:
   [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
-`decisions.jsonl` - are not written here. `datafile` creates each on its first append,
-so a contract with no `.jsonl` beside it is an empty store and not a broken install.
+`decisions.jsonl`, `facts.jsonl`, `grants.jsonl` - are not written here. `datafile`
+creates each on its first append, so a contract with no `.jsonl` beside it is an
+empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
 `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
-`siana-read`. They are links, so a `git pull` here updates the commands with no
-reinstall. It does not update the home; `just upgrade` does that.
+`siana-read`, `siana-fact`. They are links, so a `git pull` here updates the
+commands with no reinstall. It does not update the home; `just upgrade` does that.
 
 ### The queue integration
 
@@ -228,6 +230,77 @@ orders every minion there is started with, which is where a project's own conven
 belong; `pipeline` says work there is validated by a pipeline the minion drives
 instead of by a command that runs once, and is described under "A rigor the minion
 drives" below.
+
+### Facts about a project
+
+A staging URL, the link to where the business documentation lives, the account a
+test user signs in with: things that are true of one project, that every minion sent
+there needs, and that you got tired of repeating. Record one and every minion
+dispatched for that project is told it, in a marked data section at the end of its
+orders. No other project sees it.
+
+    siana-fact url  <project> <slug> https://staging.example.com --note 'what it is'
+    siana-fact text <project> <slug> 'one line, in your words'
+    siana-fact list
+    siana-fact rm   <project> <slug>
+
+Values are one line, bounded, and https only for a URL. A fact is somewhere to go or
+something to know, never the thing itself, and never a secret: it is written into a
+file on disk in your home and read by every minion in that project.
+
+#### A credential is different
+
+A test login is a fact too, and it is the one kind that must not be written down. So
+`siana-fact` keeps it in the operating system keychain and records only where it is:
+
+    siana-fact credential <project> <slug> --account <username>
+
+That prompts for the value through the keychain's own non-echoing prompt, twice.
+The value is never an argument, never reaches a file, and never reaches SIANA. There
+is no command that prints it back, deliberately, and `siana-fact get` refuses a
+credential rather than making one.
+
+A credential reaches nobody until you say so, for one task, before that task starts:
+
+    siana-fact grant  <task-id> <slug>     # only while the task is still todo
+    siana-fact revoke <task-id> <slug>
+
+Nothing is inherited. Not from the project, not from a dependency, not from the QA
+task paired with the one you granted, and not from a grant on the same fact
+yesterday. The minion of that one task runs it into a child process:
+
+    siana-fact exec <slug> -- <command>
+
+which puts `SIANA_FACT_USERNAME` and `SIANA_FACT_PASSWORD` into that child and
+returns its exit status. It refuses unless the task calling it is the task that was
+granted it and is still `doing`, so a grant stops working the moment the work is
+finished, whether or not you have revoked it. Revoking takes effect before the
+keychain is read.
+
+    siana-fact status
+
+reports what is recorded and what is wrong with it: a reference whose keychain item
+was removed, a grant whose task has finished, a record that was edited by hand into
+a shape nothing can deliver. It reads no credential value to do it, and it repairs
+nothing.
+
+#### What this protects you from, and what it does not
+
+SIANA, its minions and you all run as one operating system user. A process that
+wanted a credential could call the keychain itself, so **this is not a sandbox and
+you should not plan around it as one.**
+
+What it does is narrower and worth having on its own. A fact recorded for one
+project never reaches a minion working on another. A credential never lands in a
+file, an orders document, a report, a handoff or a log, so nothing that leaves this
+machine can carry one. And every use of one is something you authorised in advance,
+for one task, and can withdraw.
+
+`just init` writes both contracts and nothing else, so a home that records no facts
+behaves exactly as it did before this existed, and no dispatch changes. `just
+upgrade` keeps `facts.jsonl` and `grants.jsonl` untouched: a credential record is
+the only pointer to the keychain item behind it, and replacing one would leave a
+value nothing can find again.
 
 ### Branches the fleet leaves in your repository
 
@@ -537,11 +610,11 @@ it showing what the upgrade changed, and then the template lands. Re-apply what 
 still want and delete that directory. Reconciling instructions is reading what they
 mean, which is an agent's job and not a script's.
 
-Your records are never touched: the registry, the queue, the obligations, and all
-three store contracts are left exactly as they are. When the installed `tasks` grows
-a field your contract does not have, `upgrade` and `doctor` say so and name the
-fields, because adding one is your call and the alternative is a raw traceback the
-first time SIANA writes a task.
+Your records are never touched: the registry, the queue, the obligations, the
+project facts, and every store contract are left exactly as they are. When the
+installed `tasks` grows a field your contract does not have, `upgrade` and `doctor`
+say so and name the fields, because adding one is your call and the alternative is a
+raw traceback the first time SIANA writes a task.
 
 ## Diagnose
 
@@ -552,9 +625,14 @@ command is on the `PATH` and where it resolves to, whether a SIANA is running,
 whether an advisory session is, whether every in-flight task's minion is still alive
 in the pane it was dispatched to, what SIANA owes you, and the queue itself.
 
+What is inside the fact stores is a separate report, because answering it means
+asking the keychain about every credential reference:
+
+    siana-fact status
+
 Things it says that are not faults:
 
-- `tasks.jsonl (empty; written on the first task)` and its three siblings. An empty
+- `tasks.jsonl (empty; written on the first task)` and its five siblings. An empty
   store has a contract and no log yet.
 - `no SIANA running`. That is the ordinary state between sessions.
 - `no advisory session (every decision is the captain's)`. That is the state the
@@ -588,6 +666,10 @@ Things it says that are:
 Everything else here prints for a person at a terminal. This prints for a program,
 so something other than a terminal can show you the fleet. It reads and only reads:
 no listener, no port, nothing served, and no path in it that writes to a store.
+
+Project facts and credential references are deliberately not on it. They are local
+operational context rather than fleet state, and a phone is not where you want a
+list of which task may spend which credential.
 
 Every run writes exactly one JSON document to standard output, whether it answered
 or refused, and the exit code is the verdict:

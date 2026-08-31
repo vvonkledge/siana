@@ -114,7 +114,8 @@ init: _contract-drift
     # itself is written by the first `datafile put`, so an empty store is a schema
     # and no log. Never overwritten, for the reason the queue's contract is not: a
     # field dropped from a live contract makes every record carrying it unreadable.
-    for c in schema-projects schema-obligations schema-decisions; do
+    for c in schema-projects schema-obligations schema-decisions schema-facts \
+             schema-grants; do
         if [ -f "$home/$c.yaml" ]; then
             echo "current  $home/$c.yaml"
         else
@@ -265,7 +266,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-fact; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -336,7 +337,13 @@ upgrade: _initialized init
     # project-contract drift announces itself, because `datafile` names the field it
     # rejected and `siana` refuses to start on a registry it cannot read.
     echo "kept     $home/projects.jsonl (the captain's registry)"
-    for c in schema-projects schema-obligations schema-decisions schema-tasks; do
+    # The facts store is the captain's the same way, and its credential records are
+    # the only pointer to the keychain items behind them: an upgrade that replaced
+    # one would leave a value nothing can find again.
+    echo "kept     $home/facts.jsonl (the captain's project facts)"
+    echo "kept     $home/grants.jsonl (who may use which credential)"
+    for c in schema-projects schema-obligations schema-decisions schema-tasks \
+             schema-facts schema-grants; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
     done
     # Never upgraded either, and for a different reason: a distro that could rewrite
@@ -409,17 +416,17 @@ _contract-drift:
     # upgrade never rewrites a live contract, because a dropped field makes every
     # record still carrying it unreadable, so growing one stays the captain's call
     # and this only makes sure they know there is one to make.
-    if [ -f "$home/schema-projects.yaml" ]; then
+    for c in schema-projects schema-facts schema-grants; do
+        [ -f "$home/$c.yaml" ] || continue
         absent="$(comm -13 \
-            <(grep -oE '^  [a-z_]+:' "$home/schema-projects.yaml" | tr -d ' :' | sort) \
-            <(grep -oE '^  [a-z_]+:' "$PWD/template/schema-projects.yaml" | tr -d ' :' | sort))"
-        if [ -n "$absent" ]; then
-            echo "  stale   schema-projects.yaml is missing: $(echo $absent | tr '\n' ' ')" >&2
-            echo "          copy those fields into $home/schema-projects.yaml from" >&2
-            echo "          $PWD/template/schema-projects.yaml; until then the registry" >&2
-            echo "          refuses to record them" >&2
-        fi
-    fi
+            <(grep -oE '^  [a-z_]+:' "$home/$c.yaml" | tr -d ' :' | sort) \
+            <(grep -oE '^  [a-z_]+:' "$PWD/template/$c.yaml" | tr -d ' :' | sort))"
+        [ -n "$absent" ] || continue
+        echo "  stale   $c.yaml is missing: $(echo $absent | tr '\n' ' ')" >&2
+        echo "          copy those fields into $home/$c.yaml from" >&2
+        echo "          $PWD/template/$c.yaml; until then the store" >&2
+        echo "          refuses to record them" >&2
+    done
 
     [ -f "$home/schema-tasks.yaml" ] || exit 0
     fresh="$(mktemp -d)"
@@ -480,7 +487,7 @@ doctor: _contract-drift
     set -uo pipefail
     home='{{home}}'
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-tasks.yaml; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-tasks.yaml schema-facts.yaml schema-grants.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -499,6 +506,15 @@ doctor: _contract-drift
     if [ -e "$home/decisions.jsonl" ]; then echo "  ok      decisions.jsonl"
     elif [ -e "$home/schema-decisions.yaml" ]; then echo "  ok      decisions.jsonl (empty; written on the first decision)"
     else echo "  missing decisions.jsonl"; fi
+    # A home that has recorded no project facts has neither store, which is the same
+    # zero again. What is wrong inside one is `siana-fact status`'s to say, because
+    # answering that means asking the keychain about every credential reference.
+    if [ -e "$home/facts.jsonl" ]; then echo "  ok      facts.jsonl"
+    elif [ -e "$home/schema-facts.yaml" ]; then echo "  ok      facts.jsonl (empty; written on the first fact)"
+    else echo "  missing facts.jsonl"; fi
+    if [ -e "$home/grants.jsonl" ]; then echo "  ok      grants.jsonl"
+    elif [ -e "$home/schema-grants.yaml" ]; then echo "  ok      grants.jsonl (empty; written on the first grant)"
+    else echo "  missing grants.jsonl"; fi
     for cmd in tasks datafile; do
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
@@ -630,7 +646,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-fact; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

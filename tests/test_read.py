@@ -826,6 +826,42 @@ class TheWatcher(Read):
         self.assertEqual(code, OK, doc)
 
 
+class NotOnThisSurface(Read):
+    """Project facts are not part of what a console may read, and neither are the
+    grants beside them.
+
+    `siana-read` is the boundary a phone learns the fleet through, and it is
+    deliberately narrower than the home is. A credential reference and the list of
+    which task may spend one are local operational context, and putting them behind
+    a read surface would be a decision to widen that boundary rather than a feature
+    somebody forgot to finish. This is here so that adding them later is a change
+    that turns this suite red and has to be argued for.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.contract("facts", "grants")
+        self.store("facts.jsonl",
+                   {"id": "demo/test-user", "project": "demo", "slug": "test-user",
+                    "kind": "credential", "account": "qa@example.test",
+                    "service": "siana/demo/test-user",
+                    "recorded": "2026-08-31T00:00:00Z"})
+
+    def test_neither_store_is_a_command(self):
+        for what in ("facts", "grants"):
+            with self.subTest(what):
+                code, doc = self.read(what)
+                self.assertEqual(code, USAGE, doc)
+                self.assertEqual(doc["code"], "USAGE_ERROR", doc)
+
+    def test_no_command_answers_with_a_credential_reference(self):
+        for what in TheContract.COMMANDS:
+            with self.subTest(what):
+                _, doc = self.read(what, env={
+                    "HERDR_SOCKET_PATH": self.at("no-such-socket")})
+                self.assertNotIn("test-user", json.dumps(doc))
+
+
 class TheContract(Read):
     """What every command promises, whatever happened.
 

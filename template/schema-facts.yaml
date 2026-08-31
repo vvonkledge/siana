@@ -1,0 +1,99 @@
+# Contract for facts.jsonl: what the captain has recorded about one project, so a
+# minion working there is told it instead of having to ask.
+#
+# A staging URL, the link to where the business documentation lives, the account a
+# test user signs in with: durable, project-scoped, and the same for every minion
+# sent there. The queue holds work and the registry holds identity, so neither is
+# the place for these. This store is.
+#
+# Facts are kept apart from `projects.jsonl` deliberately. The registry is the
+# identity authority for a handle and is read on every session and every dispatch;
+# a fact has its own lifecycle, is added and dropped far more often, and one kind of
+# fact is a credential. None of that belongs in the record that says where a project
+# is.
+#
+# Write it with `siana-fact`, never by hand and never with `datafile` directly. The
+# script is what derives `id` from the project and the slug, refuses a project the
+# registry does not have, and keeps a credential's value out of this file entirely.
+#
+#   siana-fact url  <project> <slug> <https://...>
+#   siana-fact text <project> <slug> '<one line>'
+#   siana-fact credential <project> <slug> --account <username>
+#
+# **A credential record holds no secret and never will.** `kind: credential` stores
+# only where the value lives - the keychain `service` and `account` naming the item -
+# and the value itself is set through the operating system's own non-echoing prompt
+# and read only by `siana-fact exec`. There is no command that prints it. A record
+# here is a pointer, so this file is as nonsecret as the registry beside it.
+#
+# `extra: forbid` is the point of keeping this in a store: a mistyped key is refused
+# at write, rather than becoming a fact the captain believes they recorded.
+#
+# This contract only ever grows. A field dropped from it makes every record still
+# carrying it unreadable, and a credential reference nobody can read is a keychain
+# item nobody can find.
+
+name: Fact
+key: id
+extra: forbid
+
+fields:
+  id:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{1,31}/[a-z][a-z0-9-]{1,47}$'
+    description: '`<project>/<slug>`, derived by `siana-fact` and never typed. The
+      project is in the key rather than only in a field beside it, so two projects
+      cannot collide on a slug and a read scoped to one project is a prefix rather
+      than a filter somebody has to remember to apply'
+  project:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{1,31}$'
+    description: the handle in `projects.jsonl` this fact belongs to. The same
+      grammar the registry uses, so a handle that is valid there is valid here
+  slug:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{1,47}$'
+    description: what the captain calls this fact within the project. Stable,
+      because a minion is told it and `siana-fact exec` is invoked with it
+  kind:
+    type: enum
+    values: [url, text, credential]
+    description: a closed set, so a kind nothing knows how to deliver is refused at
+      write rather than reaching a minion's orders as a fact with no meaning. `url`
+      and `text` are nonsecret and travel into orders; `credential` is a pointer
+      into the keychain and its value travels nowhere
+  value:
+    type: str
+    required: false
+    max_length: 400
+    pattern: '^[^\x00-\x1f\x7f]{1,400}$'
+    description: the nonsecret value, for `url` and `text` only, and absent on a
+      credential. Bounded and single line by pattern rather than by convention,
+      because a fact is appended to a minion's orders and a newline in one is a
+      fact that can forge the section around it. Control characters are how a
+      value stops reading as data at all
+  account:
+    type: str
+    required: false
+    max_length: 200
+    pattern: '^[^\x00-\x1f\x7f]{1,200}$'
+    description: for a credential, the username the child process is given. It is
+      nonsecret and half of what names the keychain item
+  service:
+    type: str
+    required: false
+    max_length: 200
+    pattern: '^[^\x00-\x1f\x7f]{1,200}$'
+    description: for a credential, the keychain service naming the item. Derived by
+      `siana-fact` from the project and slug, so it is stable and says on sight
+      which fact it belongs to
+  note:
+    type: str
+    required: false
+    max_length: 200
+    pattern: '^[^\x00-\x1f\x7f]{1,200}$'
+    description: what this fact is for, in the captain's words. Delivered with the
+      fact, because a URL with no idea what it is for is a URL a minion guesses at
+  recorded:
+    type: datetime
+    description: stamped by `siana-fact`, because an agent must never type the clock
