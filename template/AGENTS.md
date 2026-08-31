@@ -426,21 +426,31 @@ checks have not started: run it again. `--dry-run` prints the method, the accept
 head, the checks, and whether it would arm, and changes nothing.
 
 **Removing the field cannot retract what is already armed.** Auto-merge lives at the
-forge, so it outlives this fleet and the registry both. Revoking a grant is three
+forge, so it outlives this fleet and the registry both. Revoking a grant is four
 steps in this order:
 
-    siana-publish <qa-task-id> --cancel-automerge              # disarm it
-    siana-publish <qa-task-id> --cancel-automerge --dry-run    # `nothing armed`
+    siana-publish --armed <project>                        # what is armed
+    siana-publish --armed <project> --cancel-automerge     # disarm all of it
+    siana-publish --armed <project>                        # `nothing armed`
     ... and only then does the captain remove the field
 
 Cancelling needs no grant and no `target`, exactly so it can be run after either has
-gone. It disarms the request and asks again to prove it, and a cancel that did not
-take is a refusal rather than a report.
+gone. It disarms every armed request and asks the forge again to prove it, and a
+cancel that did not take is a refusal rather than a report. One it could not disarm
+does not stop it attempting the rest.
 
-**`--cancel-automerge --dry-run` is how you ask what is armed.** It reads the forge
-and changes nothing, and it answers `nothing armed` as readily as it names a method.
-That is the only read-only question about state that lives outside this fleet, so ask
-it rather than assuming from a publish you remember running.
+**`--armed <project>` is how you ask what is armed.** It reads the forge and changes
+nothing - no path through it takes a method, a grant or an accepted head, so there is
+nothing for it to arm - and it names the source, target, method and exact commit of
+every open request the forge is holding a merge for. That is the only read-only
+question about state living outside this fleet, so ask it rather than assuming from a
+publish you remember running, and never hand the captain a revocation checked against
+your memory of which QA tasks armed what.
+
+`siana-publish <qa-task-id> --cancel-automerge` is the same operation for the one
+request that task published, and `--dry-run` on it says what it would disarm. Reach
+for it when you know which request you mean; reach for `--armed` when the question is
+the project.
 
 **Under an advisory session nothing is armed, cancelled or merged**, on the same
 terms as publishing: the proposal goes into the ledger and the command refuses. A
@@ -451,6 +461,14 @@ in force is the captain saying decisions are being written down rather than made
 why: `glab` has no call that cancels an armed merge and none that says which checks a
 project requires, so an arming there could not be retracted and an empty answer could
 not be told from a green. Publishing to gitlab without the field is unchanged.
+
+**A home older than the field cannot carry a grant at all.** An upgrade never
+rewrites a live contract, so a home installed before `automerge` existed still has a
+`schema-projects.yaml` without it. `siana` says so at startup and starts anyway, and
+every project there reads as granting no merge - which is what every project was
+before the field existed. In that state the store refuses to record the field, so do
+not offer to set it: migrating the contract is the captain's, and `siana` prints the
+one line that says how.
 
 **Turning it on for a project is the captain's, in a sitting with them.** It is the
 one field in the registry that lets work reach a default branch without them typing

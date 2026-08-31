@@ -299,11 +299,17 @@ class Granted(HomeTest):
         except OSError:
             return []
 
-    def publish(self, *args, task=None, **env):
+    def run_publish(self, *args, **env):
+        """The command, against the fake clients and the real bare origin. Every
+        invocation in this file goes through here, including the ones that name no
+        task at all."""
         e = {"PATH": self.distro_path(self.clients),
              "FAKE_FORGE": self.forge, "FAKE_FORGE_ORIGIN": self.origin}
         e.update(env)
-        return self.run_bin("siana-publish", task or f"qa-{self.SHIP}", *args, env=e)
+        return self.run_bin("siana-publish", *args, env=e)
+
+    def publish(self, *args, task=None, **env):
+        return self.run_publish(task or f"qa-{self.SHIP}", *args, **env)
 
     def asked(self):
         path = os.path.join(self.forge, "calls.jsonl")
@@ -891,6 +897,288 @@ class Cancelling(Granted):
         self.assertRefused(out, "no task nope")
 
 
+class AnOlderProjectContract(Granted):
+    """A home whose project contract is older than the grant.
+
+    Neither `init` nor `upgrade` rewrites a live contract, so this is the state
+    every home installed before the field is in after the documented
+    `git pull && just upgrade`. Nothing here can carry a grant, and the whole of
+    what that means is that publishing is exactly what it was before the field
+    existed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.register(automerge=None)
+        self.older_contract("projects", "automerge")
+
+    def test_it_publishes_and_leaves_the_merge_to_the_captain(self):
+        self.seed([])
+        text = self.assertAccepted(self.publish())
+        self.assertIn("merging is the captain's, and still done by hand", text)
+        self.assertNothingMerged()
+        self.assertNotArmed()
+
+    def test_the_store_refuses_a_grant_until_the_contract_has_the_field(self):
+        """Fail-closed at the write, and the reason nothing downstream has to guard
+        against a grant appearing on an old contract: there is no way to record one.
+        """
+        out = self.run_cmd(["datafile", "-f", self.at("projects.jsonl"),
+                            "-c", self.at("schema-projects.yaml"), "put",
+                            "--set", "handle=demo", "--set", f"path={self.repo}",
+                            "--set", "automerge=squash"])
+        self.assertRefused(out, "automerge")
+
+    def test_what_is_armed_still_answers_here(self):
+        # Nothing this fleet did could have armed anything on a home in this state,
+        # and the command that says so still runs: a captain checking a project
+        # before migrating it gets an answer rather than a traceback.
+        self.seed([self.request()])
+        self.assertIn("nothing armed on demo",
+                      self.assertAccepted(self.run_publish("--armed", "demo")))
+
+
+class WhatIsArmed(Granted):
+    """Revocation at the scale a revocation actually happens at.
+
+    `--cancel-automerge` on a QA task is exact about the one request that task
+    published. A captain taking the grant off a project has to be exact about all of
+    them, and asking one task at a time means remembering every task id that ever
+    armed something, with nothing to tell them whether they missed one. So the same
+    command answers the project-scoped question, and answers it out of the forge
+    rather than out of anything this fleet remembers.
+
+    Reading is the default here and disarming is the flag, because the question a
+    captain asks first must not be able to change anything.
+    """
+
+    OTHER = "siana/feat/second-thing"
+    THIRD = "siana/fix/third-thing"
+
+    def armed_on(self, *args, **env):
+        return self.run_publish("--armed", "demo", *args, **env)
+
+    def other(self, branch, url, armed="", state="open", head=None):
+        """A request some earlier round published.
+
+        With a head of its own, because these branches are not in the bare origin:
+        what is under test is a captain reading requests they no longer remember
+        opening."""
+        return {"branch": branch, "base": "main", "url": url, "state": state,
+                "title": "t", "body": "b", "armed": armed,
+                "head": head or "a" * 40, "checks": self.CHECKS}
+
+    def assertNoneOpenArmed(self):
+        """Nothing that could still merge is armed.
+
+        `assertNotArmed` reads every request, and one of the four here is a merged
+        one that keeps its auto-merge record. Cancelling touches nothing about it,
+        and a sweep that had to would be reaching for a request that has landed."""
+        for pr in self.prs():
+            if (pr.get("state") or "open") == "open":
+                self.assertFalse(pr.get("armed"), f"still armed: {pr}")
+
+    def two_armed(self):
+        """Three open requests, two of them armed, and one merged one that is not
+        anybody's to cancel."""
+        self.seed([self.request(armed="squash", head=self.accepted),
+                   self.other(self.OTHER, f"{self.URL}8", armed="rebase",
+                              head="b" * 40),
+                   self.other(self.THIRD, f"{self.URL}9"),
+                   self.other("siana/feat/landed", f"{self.URL}5", armed="squash",
+                              state="merged")])
+
+    # -- reading ----------------------------------------------------------------
+
+    def test_it_names_every_armed_request_and_what_each_would_merge(self):
+        # Source, target, method and head, because those four are what say whether
+        # this is work the captain recognises and what would land if they left it.
+        self.two_armed()
+        text = self.assertAccepted(self.armed_on())
+        self.assertIn(f"{self.URL}\n", text)
+        self.assertIn(f"{self.URL}8", text)
+        self.assertIn(self.branch, text)
+        self.assertIn(self.OTHER, text)
+        self.assertIn("method  squash", text)
+        self.assertIn("method  rebase", text)
+        self.assertIn(f"head    {self.accepted[:12]}", text)
+        self.assertIn("head    bbbbbbbbbbbb", text)
+        self.assertIn("target  main", text)
+        self.assertIn("2 armed, out of 3 open", text)
+
+    def test_a_request_nothing_is_holding_is_not_in_the_list(self):
+        self.two_armed()
+        self.assertNotIn(f"{self.URL}9", self.assertAccepted(self.armed_on()))
+
+    def test_a_request_the_forge_already_merged_is_not_in_the_list(self):
+        # There is nothing to cancel on one that has landed, and offering it as
+        # something to revoke would read as work still on its way in.
+        self.two_armed()
+        self.assertNotIn(f"{self.URL}5", self.assertAccepted(self.armed_on()))
+
+    def test_a_project_holding_nothing_says_so_rather_than_nothing(self):
+        self.seed([self.request(), self.other(self.OTHER, f"{self.URL}8")])
+        text = self.assertAccepted(self.armed_on())
+        self.assertIn("nothing armed on demo", text)
+        self.assertIn("2 open", text)
+
+    def test_a_project_with_no_open_request_at_all(self):
+        self.seed([])
+        self.assertIn("nothing is open here at all",
+                      self.assertAccepted(self.armed_on()))
+
+    def test_reading_arms_cancels_and_merges_nothing(self):
+        """The property that makes this safe to reach for first. Enumeration is not
+        a source of merge authority: no path through it takes a method, a grant or
+        an accepted head, so there is nothing for it to arm."""
+        self.two_armed()
+        self.assertAccepted(self.armed_on())
+        self.assertNothingMerged()
+        self.assertEqual(self.prs()[0]["armed"], "squash")
+
+    def test_it_says_the_record_does_not_retract_these(self):
+        self.two_armed()
+        self.assertIn("would stop the next one and retract none of",
+                      self.assertAccepted(self.armed_on()))
+
+    # -- cancelling -------------------------------------------------------------
+
+    def test_it_disarms_every_one_and_proves_each(self):
+        self.two_armed()
+        text = self.assertAccepted(self.armed_on("--cancel-automerge"))
+        self.assertIn(f"cancelled {self.URL}", text)
+        self.assertIn(f"cancelled {self.URL}8", text)
+        self.assertIn("armed squash at", text)
+        self.assertIn("armed rebase at", text)
+        self.assertIn("2 cancelled, and nothing is armed now", text)
+        self.assertNoneOpenArmed()
+
+    def test_it_says_the_field_can_come_off_the_record_now(self):
+        # The order the whole feature depends on: cancel, check, then edit the
+        # record. This is the line that says the check came back clean.
+        self.two_armed()
+        self.assertIn("`automerge` can come off demo's record",
+                      self.assertAccepted(self.armed_on("--cancel-automerge")))
+
+    def test_running_it_twice_is_the_same_answer(self):
+        self.two_armed()
+        self.assertAccepted(self.armed_on("--cancel-automerge"))
+        text = self.assertAccepted(self.armed_on("--cancel-automerge"))
+        self.assertIn("nothing armed on demo", text)
+        self.assertNoneOpenArmed()
+
+    def test_it_answers_after_the_grant_and_the_target_have_gone(self):
+        """The load-bearing case, and the reason this asks the registry for nothing
+        but a path. A captain who edited the record first would otherwise have no
+        way left to see or retract what is already armed."""
+        self.two_armed()
+        self.register(automerge=None, target=None)
+        self.assertIn("2 armed", self.assertAccepted(self.armed_on()))
+        self.assertAccepted(self.armed_on("--cancel-automerge"))
+        self.assertNoneOpenArmed()
+
+    def test_a_cancel_that_did_not_take_is_a_refusal_and_not_a_report(self):
+        self.two_armed()
+        out = self.armed_on("--cancel-automerge", FAKE_FORGE_STICKY="1")
+        self.assertRefused(out, "demo is not clear",
+                           "2 request(s) may still merge",
+                           "settle each in the forge's own interface")
+        self.assertEqual(self.prs()[0]["armed"], "squash")
+
+    def test_one_request_it_cannot_disarm_does_not_strand_the_others(self):
+        """Why the sweep attempts every one before it reports.
+
+        Stopping at the first refusal would leave every request after it armed with
+        nothing having said so, and one stuck request would be enough to put the
+        rest permanently out of this command's reach."""
+        self.two_armed()
+        out = self.armed_on("--cancel-automerge", FAKE_FORGE_STICKY=self.branch)
+        text = self.assertRefused(out, "1 request(s) may still merge")
+        self.assertIn(f"cancelled {self.URL}8", text)
+        self.assertIn(f"{self.URL} is armed with squash", text)
+        held = {pr["url"]: pr.get("armed") for pr in self.prs()}
+        self.assertEqual(held[self.URL], "squash")
+        self.assertEqual(held[f"{self.URL}8"], "")
+
+    def test_something_armed_while_it_was_working_is_not_reported_as_clear(self):
+        """The race the second read exists for, and the half of it that is not about
+        this run at all.
+
+        Checking only the requests this run named would say `nothing is armed now`
+        with something armed, and the captain would take the field off the record on
+        the strength of it. So what is checked is that nothing is armed here."""
+        self.two_armed()
+        out = self.armed_on("--cancel-automerge",
+                            FAKE_FORGE_ARMS=f"merge:{self.THIRD}:squash")
+        text = self.assertRefused(out, "demo is not clear",
+                                  "1 request(s) may still merge")
+        self.assertIn(f"{self.URL}9 is armed with squash", text)
+        self.assertIn(f"cancelled {self.URL}8", text)
+
+    def test_a_forge_that_refuses_the_cancel_says_they_may_still_merge(self):
+        self.two_armed()
+        self.assertRefused(self.armed_on("--cancel-automerge",
+                                         FAKE_FORGE_FAIL="merge"),
+                           "demo is not clear", "may still merge")
+
+    def test_a_dry_run_says_what_it_would_disarm_and_disarms_nothing(self):
+        self.two_armed()
+        text = self.assertAccepted(self.armed_on("--cancel-automerge", "--dry-run"))
+        self.assertIn("would disarm all 2", text)
+        self.assertEqual(self.prs()[0]["armed"], "squash")
+        self.assertNothingMerged()
+
+    # -- what it refuses --------------------------------------------------------
+
+    def test_a_forge_that_cannot_be_asked_is_not_a_project_with_nothing_armed(self):
+        self.two_armed()
+        self.assertRefused(self.armed_on(FAKE_FORGE_FAIL="list"),
+                           "could not say what is open on demo",
+                           "never a project with nothing armed")
+
+    def test_an_answer_that_is_not_json(self):
+        self.assertRefused(self.armed_on(FAKE_FORGE_OUT="Please log in"),
+                           "not JSON")
+
+    def test_an_answer_that_is_not_a_list_of_requests(self):
+        self.assertRefused(self.armed_on(FAKE_FORGE_OUT='{"message": "no"}'),
+                           "not a list of requests")
+
+    def test_an_answer_that_arrives_exactly_full_refuses_rather_than_truncating(self):
+        """A silent truncation here reads as `that is all of them`, which is the one
+        thing this list is for. The client's own cap is real, so the case where the
+        answer is exactly as long as it was asked for is a refusal."""
+        limit = publish.ARMED_LIMIT
+        self.seed([self.other(f"siana/feat/n-{i}", f"{self.URL}{i}", armed="squash")
+                   for i in range(limit + 5)])
+        self.assertRefused(self.armed_on(), f"which is the {limit} it was asked for",
+                           "cannot be told from more")
+
+    def test_a_forge_this_fleet_arranges_no_merges_on(self):
+        self.git("remote", "set-url", "origin", "git@gitlab.com:demo/demo.git")
+        self.assertRefused(self.armed_on(), "arranges no merges on gitlab")
+
+    def test_a_machine_with_no_client_cannot_answer_and_says_so(self):
+        # There is nothing local to read instead: what is armed is a fact about the
+        # forge, so a machine that cannot ask has to refuse rather than report none.
+        self.two_armed()
+        self.assertRefused(
+            self.run_publish("--armed", "demo",
+                             PATH=self.path_with_no_forge_client()),
+            "gh is not installed")
+
+    def test_an_unknown_project(self):
+        self.assertRefused(self.run_publish("--armed", "nowhere"),
+                           "unknown project: nowhere", "known handles: demo")
+
+    def test_a_qa_task_and_a_project_are_two_different_questions(self):
+        self.assertRefused(self.run_publish(f"qa-{self.SHIP}", "--armed", "demo"),
+                           "not both")
+
+    def test_naming_neither_publishes_nothing(self):
+        self.assertRefused(self.run_publish(), "nothing here says what to publish")
+
+
 class UnderAnAdvisorySession(Granted):
     """A session in force, which permits nothing.
 
@@ -921,6 +1209,26 @@ class UnderAnAdvisorySession(Granted):
     def test_a_cancel_arms_and_disarms_nothing_and_is_refused(self):
         out = self.publish("--cancel-automerge")
         self.assertRefused(out, "needs --record")
+        self.assertNothingMerged()
+
+    def test_a_project_wide_cancel_is_refused_and_disarms_nothing(self):
+        """Refused outright rather than recorded, because a proposal is written
+        against the task it is about and this one is about several requests with no
+        task between them. What a captain does about something armed before the
+        session is the forge's own interface, and the refusal says so."""
+        self.seed([self.request(armed="squash", head=self.accepted)])
+        out = self.run_publish("--armed", "demo", "--cancel-automerge")
+        self.assertRefused(out, "nothing is disarmed here",
+                           "the forge's own interface")
+        self.assertArmed()
+
+    def test_reading_what_is_armed_still_answers_under_a_session(self):
+        # Exempt for the reason a dry run is: it changes nothing, and it is the
+        # question a captain most needs answered while something they cannot stop
+        # is armed.
+        self.seed([self.request(armed="squash", head=self.accepted)])
+        self.assertIn("method  squash",
+                      self.assertAccepted(self.run_publish("--armed", "demo")))
         self.assertNothingMerged()
 
     def test_a_record_does_not_buy_the_arming_either(self):

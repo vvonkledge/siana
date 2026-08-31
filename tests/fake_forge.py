@@ -53,6 +53,10 @@ The environment scripts everything a real forge would decide on its own:
                        every armed request whose required checks have all passed. An
                        armed request is a promise the forge keeps later, and without
                        this nothing here could show it ever being kept
+    FAKE_FORGE_ARMS    `<verb>:<branch>:<method>`: after serving `<verb>`, arm that
+                       branch. Something else arming a request while a sweep is
+                       disarming the ones it read is a race no single answer from a
+                       forge can show, and it is the race the second read exists for
 """
 
 import json
@@ -237,6 +241,25 @@ def moved(verb):
     save(prs)
 
 
+def armed_after(verb):
+    """Something else arming a request after this verb was served, if a test asked
+    for one.
+
+    Written after the answer for the reason `moved` is: the run that asked gets the
+    truth and the next read gets the race."""
+    scripted = os.environ.get("FAKE_FORGE_ARMS")
+    if not scripted or scripted.count(":") != 2:
+        return
+    when, branch, method = scripted.split(":")
+    if when != verb:
+        return
+    prs = load()
+    for pr in prs:
+        if pr["branch"] == branch:
+            pr["armed"] = method
+    save(prs)
+
+
 def main():
     cli = os.path.basename(sys.argv[0])
     argv = sys.argv[1:]
@@ -265,8 +288,19 @@ def main():
         # A fake that always answered with everything would let a publish that forgot
         # to ask still see a merged request, which is the case it must never miss.
         every = named.get("state") == "all" or named.get("all") is True
-        found = [pr for pr in prs if pr["branch"] == branch
+        # No branch named is the whole repository, which is what the real client
+        # answers and is the call a project-scoped read makes. Modelled rather than
+        # refused, because the alternative is a suite that is green about an
+        # enumeration nothing ever ran.
+        found = [pr for pr in prs
+                 if (branch is None or pr["branch"] == branch)
                  and (every or state_of(pr) == "open")]
+        # `--limit` is the client's own cap and it really does truncate. Honoured
+        # here so that a caller asking for more than a project has, and a caller
+        # whose answer arrives exactly full, are two states this suite can reach.
+        limit = named.get("limit")
+        if limit not in (None, True):
+            found = found[:int(limit)]
         print(json.dumps([rendered(cli, pr, named.get("json")) for pr in found]))
         return
 
@@ -343,7 +377,12 @@ def main():
             # a write the forge lost - or one something re-armed underneath - looks
             # like from here. A cancel that trusted the exit code would report this
             # as done and send the captain on to remove the grant.
-            if not os.environ.get("FAKE_FORGE_STICKY"):
+            #
+            # Named as a branch it sticks on, or `1` for every one of them. A sweep
+            # over a project has to keep going past the one it could not disarm, and
+            # a fake that could only lose every write or none could not show that.
+            sticky = os.environ.get("FAKE_FORGE_STICKY")
+            if sticky not in ("1", branch):
                 pr["armed"] = ""
                 save(prs)
             print(f"Auto-merge disabled for pull request {pr['url']}")
@@ -387,3 +426,4 @@ if __name__ == "__main__":
         # and a race scripted onto one has to happen for the same reason.
         if len(sys.argv) > 2:
             moved(sys.argv[2])
+            armed_after(sys.argv[2])

@@ -26,12 +26,9 @@ this file is how you drive it. The first thing a run of it executes is the suite
 
     just test
 
-Twelve to twenty minutes, and growing with the fleet. It drives the pure mechanics
-in-process and drives the commands as real processes against a real `tasks` and
-`datafile`, because a stubbed store would only ever agree with the suite. That is
-where every minute of it goes, and it is the cost of the guarantee rather than an
-inefficiency to hunt. Run it once rather than per edit, and use `just test -k <name>`
-on the file you are working in.
+Three or four minutes. It drives the pure mechanics in-process and drives the
+commands as real processes against a real `tasks` and `datafile`, because a stubbed
+store would only ever agree with the suite.
 
 Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
 and answers when it answers, so the answers that matter most - herdr slow, wrong, or

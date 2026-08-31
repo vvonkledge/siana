@@ -39,6 +39,13 @@ so `--cancel-automerge` exists and is exact: it disarms the open request and the
 again to prove it is disarmed. Revoking the grant safely is cancel first, check, then
 remove the field, in that order.
 
+Doing that one QA task at a time means remembering every task that ever armed
+something, so `--armed <project>` reads the other scope: every open request that
+project's forge is holding a merge for, with the source, the target, the method and
+the head of each. It reads and it cannot arm. With `--cancel-automerge` it disarms
+all of them and asks the forge again to prove it, which is what makes a revocation
+something the captain can check rather than something they have to remember.
+
 It takes the QA task and never the ship task. A rejected ship task is repaired on a
 new branch cut from the old one, so after one rejection `siana/<ship-id>` is no
 longer the branch worth publishing and a script starting there would have a chain to
@@ -506,6 +513,14 @@ AUTOMERGE = {
         "arm": ["gh", "pr", "merge", "{branch}", "--auto", "{method}",
                 "--match-head-commit", "{head}"],
         "cancel": ["gh", "pr", "merge", "{branch}", "--disable-auto"],
+        # Every open request in the repository, for the one question a revocation
+        # asks: what is armed here. Branch-scoped like the rest of this file would
+        # need the captain to name each branch, which is the thing they cannot be
+        # asked to remember. The fields are the same ones `REQUESTS` reads, taken
+        # from that map rather than spelled again, so a request read this way and a
+        # request read by branch can never mean different things.
+        "open": ["gh", "pr", "list", "--state", "open", "--limit", "{limit}",
+                 "--json", ",".join(REQUESTS["github"][1].values())],
         # The client's word for each method the contract allows. Passed through and
         # never defaulted: a script choosing between these would be choosing how the
         # captain's history reads.
@@ -517,6 +532,54 @@ AUTOMERGE = {
 # pending one may still arm - waiting for CI is the whole reason to arm at all - and
 # a skipped one is a check the forge itself is not holding the merge for.
 CHECK_FAILED = {"fail", "cancel"}
+
+# How many open requests one project-wide read asks for. A cap is the client's own
+# behaviour and not a choice made here - `gh pr list` answers with 30 unless it is
+# told otherwise - so the only question is what to do when the answer arrives
+# exactly full, and the only unsafe answer is to truncate in silence. The whole use
+# of that read is a captain being able to say nothing else is armed, and a list cut
+# off at its limit cannot be told from a longer one, so it refuses instead.
+ARMED_LIMIT = 200
+
+
+def open_requests(forge: str, path: str):
+    """Every open request in this project, or why none could be listed.
+
+    Repository-scoped, and that is the point of it: `--cancel-automerge` on a QA
+    task is exact about the one request that task published, and a captain revoking
+    a grant has to be exact about all of them. Asking per branch would mean
+    remembering every QA task id that ever armed one, with nothing to say whether
+    they missed one - which is the same as not being able to revoke safely at all.
+
+    It reads and it cannot arm. Nothing here takes a method, a grant or an accepted
+    head, so no path through it arranges a merge; what it produces is a list to look
+    at and, one by one, to disarm.
+
+    Everything that is not a list of requests refuses, on the terms every forge read
+    in this file refuses: an answer nothing can understand is never an empty one,
+    and an empty one here is what says nothing is armed."""
+    argv = [part.replace("{limit}", str(ARMED_LIMIT))
+            for part in AUTOMERGE[forge]["open"]]
+    out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+    if out.returncode != 0:
+        return None, ((out.stderr or out.stdout).strip()
+                      or f"{argv[0]} exited {out.returncode} and said nothing")
+    try:
+        found = json.loads(out.stdout or "[]")
+    except json.JSONDecodeError:
+        return None, f"{argv[0]} answered something that is not JSON"
+    if not isinstance(found, list) or any(not isinstance(r, dict) for r in found):
+        return None, f"{argv[0]} answered something that is not a list of requests"
+    if len(found) >= ARMED_LIMIT:
+        return None, (f"{argv[0]} answered with {len(found)} requests, which is the "
+                      f"{ARMED_LIMIT} it was asked for and cannot be told from more")
+    fields = REQUESTS[forge][1]
+    listed = [{name: request_field(name, r.get(key)) for name, key in fields.items()}
+              for r in found]
+    # Filtered here as well as asked for, for the reason `requests_for` filters: a
+    # client that widened its own matching would hand back something closed or
+    # merged, and this list is read as the whole of what can still merge.
+    return [r for r in listed if r["state"].lower() in OPEN], None
 
 
 def pipeline_run(home: str, task_id: str):
@@ -817,15 +880,22 @@ def arm(forge: str, path: str, branch: str, method: str, accepted: str) -> None:
             "it is simply not armed, and merging it stays the captain's")
 
 
-def disarm(forge: str, path: str, branch: str) -> None:
+def disarm(forge: str, path: str, branch: str):
+    """Take one arming back at the forge. Answers a refusal, or None.
+
+    Reported rather than raised, because a sweep across a project has to keep going
+    and say at the end which ones it could not disarm. Stopping at the first would
+    leave every request after it armed with nothing having said so, and would mean
+    one stuck request is enough to make the others unreachable by this command."""
     spec = AUTOMERGE[forge]
     argv = [part.replace("{branch}", branch) for part in spec["cancel"]]
     out = subprocess.run(argv, cwd=path, capture_output=True, text=True)
     if out.returncode != 0:
-        die(f"{forge} refused to cancel the armed merge of {branch}",
-            (out.stderr or out.stdout).strip(),
-            "the request is still armed, so it may still merge; cancel it in the",
-            "forge's own interface before removing the grant")
+        return (f"{forge} refused to cancel the armed merge of {branch}",
+                (out.stderr or out.stdout).strip(),
+                "the request is still armed, so it may still merge; cancel it in",
+                "the forge's own interface before removing the grant")
+    return None
 
 
 def automerge_step(args, path: str, forge: str, branch: str, target: str,
@@ -954,7 +1024,9 @@ def cancel_automerge(args, path: str, forge: str, branch: str, handle: str) -> i
         print("  captain's, in person")
         return 0
 
-    disarm(forge, path, branch)
+    refusal = disarm(forge, path, branch)
+    if refusal is not None:
+        die(*refusal)
 
     # Asked again, because a cancel that reported success and left the request armed
     # is the one outcome this command must never produce: the captain would then
@@ -975,6 +1047,121 @@ def cancel_automerge(args, path: str, forge: str, branch: str, handle: str) -> i
     print(f"cancelled {request['url']}")
     print(f"  it was armed {request['armed']}, and is not armed now")
     print("  merging it is the captain's again, in person")
+    return 0
+
+
+def one_armed(r) -> None:
+    """One armed request, as a captain reads it before deciding what to do with it.
+
+    Source, target, method and head, because those four are what say whether this
+    is work they recognise: which branch it came from, where it is about to land,
+    how the history will be shaped, and the exact commit that would go in."""
+    print(f"  {r['url']}")
+    print(f"    source  {r['source']}")
+    print(f"    target  {r['target'] or 'a branch it would not name'}")
+    print(f"    method  {r['armed']}")
+    print(f"    head    {r['head'][:12] or 'a head it would not name'}")
+
+
+def project_armed(args, path: str, forge: str, handle: str, registry: str) -> int:
+    """What this project has armed at its forge, and - when asked - all of it
+    disarmed, proved.
+
+    The project-scoped half of a revocation. Removing `automerge` from the registry
+    stops the next arming and retracts none of these, so the safe order is to read
+    this, cancel, read it again, and only then edit the record. Doing that with the
+    single-request cancel alone means remembering every QA task id that ever armed
+    something, and being wrong about one of them is a merge the captain thought they
+    had revoked.
+
+    It asks the registry for nothing but where the repository is, exactly as the
+    single-request cancel does and for the same reason: it has to answer after the
+    grant and the target have both come off the record.
+
+    Reading is the default and disarming needs `--cancel-automerge`, so the question
+    a captain asks first cannot change anything by mistake."""
+    if forge not in AUTOMERGE:
+        die(f"this fleet arranges no merges on {forge}, so there is none to cancel",
+            f"nothing published from {handle} was ever armed by this fleet; if",
+            "something is armed on one of its requests, it was armed somewhere else",
+            "and is cancelled there")
+
+    found, problem = open_requests(forge, path)
+    if found is None:
+        die(f"{forge} could not say what is open on {handle}", problem,
+            "this is the list a revocation is checked against, so a forge that",
+            "cannot be asked is a refusal and never a project with nothing armed")
+    armed = [r for r in found if r["armed"]]
+
+    if not armed:
+        print(f"nothing armed on {handle}")
+        if found:
+            print(f"  {len(found)} open, and the forge is holding a merge for none")
+            print("  of them")
+        else:
+            print("  nothing is open here at all")
+        return 0
+
+    print(f"armed on {handle}")
+    for r in armed:
+        one_armed(r)
+    print(f"  {len(armed)} armed, out of {len(found)} open")
+
+    if not args.cancel_automerge:
+        print("  what is armed lives at the forge, so taking `automerge` off the")
+        print(f"  record for {handle} would stop the next one and retract none of")
+        print("  these; disarm them first with --cancel-automerge")
+        return 0
+
+    if args.dry_run:
+        print(f"  would disarm all {len(armed)} and prove each one, and would")
+        print("  change nothing about the requests themselves: they stay open, and")
+        print("  merging them goes back to being the captain's, in person")
+        return 0
+
+    # Every one attempted before anything is reported, so a forge that refuses the
+    # third cancel has still had the fourth asked of it.
+    refused = []
+    for r in armed:
+        why = disarm(forge, path, r["source"])
+        if why is not None:
+            refused.append((r, why))
+
+    # Asked again, and asked about the whole project rather than about the ones this
+    # run named. Two things have to be caught here and only one of them is about this
+    # run: a cancel the forge accepted and did not apply, and something armed by
+    # anything else while this was working. Both end with the captain removing the
+    # grant believing nothing can merge while something still can, so what is checked
+    # is that nothing is armed here now.
+    after, problem = open_requests(forge, path)
+    if after is None:
+        die(f"{forge} would not say what is still armed on {handle}", problem,
+            "the cancels were accepted, and nothing here can confirm they took;",
+            "look at the requests before removing the grant")
+    still = [r for r in after if r["armed"]]
+
+    stuck = {r["url"] for r, _ in refused} | {r["url"] for r in still}
+    for r in armed:
+        if r["url"] not in stuck:
+            print(f"cancelled {r['url']}")
+            print(f"  it was armed {r['armed']} at "
+                  f"{r['head'][:12] or 'a head it would not name'}, and is not "
+                  f"armed now")
+
+    if stuck:
+        hints = [f"  {r['url']} is armed with {r['armed']}" for r in still]
+        hints += [f"  {r['url']}: {why[1]}" for r, why in refused
+                  if r["url"] not in {s["url"] for s in still}]
+        die(f"{handle} is not clear: {len(stuck)} request(s) may still merge",
+            *hints,
+            "a cancel the forge accepted and did not apply, and something armed",
+            "while this was working, read the same from here and carry the same",
+            "risk; settle each in the forge's own interface and run this again",
+            f"before `automerge` comes off {handle}'s record")
+
+    print(f"{handle}: {len(armed)} cancelled, and nothing is armed now")
+    print("  merging them is the captain's again, in person")
+    print(f"  `automerge` can come off {handle}'s record in {registry} now")
     return 0
 
 
@@ -1199,6 +1386,54 @@ def repair_publish(args, home: str, tasks_file: str, handle: str, path: str,
               "captain's")
 
 
+def registry_project(home: str, registry: str, handle: str):
+    """The captain's record for one project, or a refusal naming what is missing.
+
+    One reader for both scopes: a publish reads the handle off the task it was
+    given, and a project-scoped read is given it directly."""
+    if not os.path.isfile(os.path.join(home, "schema-projects.yaml")):
+        die(f"no project registry at {registry}", "run `just init` in the distro")
+    projects = fold(registry, "handle")
+    if handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {handle}", f"known handles: {known}")
+    return projects[handle]
+
+
+def repository_at(handle: str, project, registry: str) -> str:
+    """The checkout this project's record points at."""
+    path = os.path.abspath(os.path.expanduser(str(project["path"])))
+    if not os.path.isdir(path):
+        die(f"{handle} points at {path}, which is not a directory",
+            f"fix the `path` for {handle} in {registry}")
+
+    if git(path, "rev-parse", "--git-dir", check=False).returncode != 0:
+        die(f"{handle} is at {path}, which is not a git repository",
+            "there is no branch to push and nothing to open a merge request from")
+    return path
+
+
+def forge_client(handle: str, path: str):
+    """The forge this checkout publishes to, and whether its client is installed
+    here. Answers `(remote_url, forge, cli, missing)`.
+
+    Split from the checkout above rather than folded into it, so the order the
+    publish refuses in is unchanged: the branch a verdict names is looked for
+    between the two."""
+    remote = git(path, "remote", "get-url", "origin", check=False)
+    if remote.returncode != 0:
+        die(f"{handle} has no `origin` remote at {path}",
+            "there is nowhere to push, so there is no merge request to open")
+    remote_url = remote.stdout.strip()
+    forge = forge_of(remote_url)
+    if forge is None:
+        die(f"cannot tell which forge {remote_url} is",
+            "only gitlab and github are recognised, and the wrong guess publishes",
+            "somewhere nobody asked for; open this one by hand")
+    cli = "glab" if forge == "gitlab" else "gh"
+    return remote_url, forge, cli, shutil.which(cli) is None
+
+
 def propose(task_id: str, record: str) -> int:
     """Ask `siana-gate` whether this may happen, and let it say so in its own words.
 
@@ -1223,7 +1458,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="Publish the branch a QA task accepted: a merge request of its "
                     "own, or a fast-forward of the one it repairs.")
-    ap.add_argument("task_id", help="the QA task whose verdict authorises this")
+    ap.add_argument("task_id", nargs="?",
+                    help="the QA task whose verdict authorises this")
     ap.add_argument("--dry-run", action="store_true",
                     help="print what would be published, and change nothing")
     ap.add_argument("--cancel-automerge", action="store_true",
@@ -1231,6 +1467,11 @@ def main() -> None:
                          "disarmed; needs no `automerge` in the registry, because "
                          "cancelling before the field is removed is the only safe "
                          "order to revoke the grant in")
+    ap.add_argument("--armed", metavar="PROJECT",
+                    help="list every open request this project's forge is holding "
+                         "a merge for, with source, target, method and head; add "
+                         "--cancel-automerge to disarm all of them and prove it, "
+                         "which is what a revocation checks itself against")
     ap.add_argument("--record", metavar="FILE",
                     help="the decision SIANA wrote, as JSON; required while an "
                          "advisory session is in force, and a request to be gated "
@@ -1260,6 +1501,46 @@ def main() -> None:
     # as the request it is costs nothing, because with no session the gate records
     # the proposal and refuses, which is exactly what the caller was asking for.
     gated = args.record is not None or os.path.exists(os.path.join(home, "afk"))
+
+    if args.armed and args.task_id:
+        die(f"pass a QA task or --armed {args.armed}, and not both",
+            "one publishes a verdict and the other reads what a whole project has",
+            "armed; they are different questions and the answer to neither is the",
+            "other")
+    if not args.armed and not args.task_id:
+        die("nothing here says what to publish",
+            "  siana-publish <qa-task-id>              # publish what QA accepted",
+            "  siana-publish --armed <project>         # what its forge is holding")
+
+    # Project scope stops here. It reads no task, no brief, no handoff and no
+    # pipeline record, because none of those is a condition for reading or for
+    # taking back an arming - and every one of them is a condition for making one,
+    # which this cannot do. It reaches the registry and the forge and nothing else.
+    if args.armed:
+        project = registry_project(home, registry, args.armed)
+        # A session in force refuses the disarming half outright rather than
+        # recording a proposal, because a proposal is written against the task it is
+        # about and this one is about several requests with no task between them.
+        # The reading half is exempt for the reason a dry run is: it changes
+        # nothing, and it is the question the captain most needs answered while
+        # something they cannot stop is armed.
+        if gated and args.cancel_automerge and not args.dry_run:
+            die("an advisory session is in force, so nothing is disarmed here",
+                "a session is the captain saying decisions are being written down",
+                "rather than made, and this one is about several requests at once",
+                "with no task to record it against",
+                f"  siana-publish --armed {args.armed}   # reads, and changes",
+                "                                        # nothing",
+                "something armed before the session still merges when its checks",
+                "pass, and stopping that during one is the forge's own interface")
+        path = repository_at(args.armed, project, registry)
+        _, forge, cli, missing = forge_client(args.armed, path)
+        if missing:
+            die(f"{cli} is not installed, and this needs it",
+                "what is armed is a fact about the forge and is asked of the",
+                f"forge; there is nothing here to read instead, so install {cli}")
+        raise SystemExit(project_armed(args, path, forge, args.armed, registry))
+
     # A dry run is exempt, because it changes nothing and records nothing either. A
     # proposal written for a command that was never going to run would put a decision
     # in front of the captain that SIANA did not make.
@@ -1298,13 +1579,7 @@ def main() -> None:
             "the project is what says where the repository is and what a merge",
             "request targets")
 
-    if not os.path.isfile(os.path.join(home, "schema-projects.yaml")):
-        die(f"no project registry at {registry}", "run `just init` in the distro")
-    projects = fold(registry, "handle")
-    if handle not in projects:
-        known = ", ".join(sorted(projects)) or "(the registry is empty)"
-        die(f"unknown project: {handle}", f"known handles: {known}")
-    project = projects[handle]
+    project = registry_project(home, registry, handle)
 
     target = project.get("target")
     # Cancelling needs no target. It disarms a request that already exists, and the
@@ -1400,14 +1675,7 @@ def main() -> None:
 
     # What follows asks whether the world can carry the publish out, which is a
     # different failure from any above and worth reaching in a different order.
-    path = os.path.abspath(os.path.expanduser(str(project["path"])))
-    if not os.path.isdir(path):
-        die(f"{handle} points at {path}, which is not a directory",
-            f"fix the `path` for {handle} in {registry}")
-
-    if git(path, "rev-parse", "--git-dir", check=False).returncode != 0:
-        die(f"{handle} is at {path}, which is not a git repository",
-            "there is no branch to push and nothing to open a merge request from")
+    path = repository_at(handle, project, registry)
 
     at = git(path, "rev-parse", "--verify", f"{branch}^{{commit}}", check=False)
     if at.returncode != 0:
@@ -1421,19 +1689,7 @@ def main() -> None:
     # later commit refuses here instead of describing something that has moved.
     head = at.stdout.strip()
 
-    remote = git(path, "remote", "get-url", "origin", check=False)
-    if remote.returncode != 0:
-        die(f"{handle} has no `origin` remote at {path}",
-            "there is nowhere to push, so there is no merge request to open")
-    remote_url = remote.stdout.strip()
-    forge = forge_of(remote_url)
-    if forge is None:
-        die(f"cannot tell which forge {remote_url} is",
-            "only gitlab and github are recognised, and the wrong guess publishes",
-            "somewhere nobody asked for; open this one by hand")
-
-    cli = "glab" if forge == "gitlab" else "gh"
-    missing = shutil.which(cli) is None
+    remote_url, forge, cli, missing = forge_client(handle, path)
 
     # The branch whose request carries this work: its own, or the one it repairs.
     # Both publication paths end on it, and it is the only branch anything is armed

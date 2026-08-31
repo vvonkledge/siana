@@ -104,15 +104,54 @@ command -v "$harness" >/dev/null || {
 # with half the context it believes it has. One flag cannot have that bug.
 context=""
 if [ -f "$home/schema-projects.yaml" ]; then
+    stale=""
     if ! registry="$(datafile -f "$home/projects.jsonl" \
             list --fields handle,path,ship,pipeline,automerge,orders,worktree \
             2>&1)"; then
-        echo "the project registry at $home/projects.jsonl is not readable" >&2
-        echo "$registry" >&2
-        exit 1
+        # One drift is survivable, and exactly one: a home whose project contract
+        # is older than `automerge`. Neither `init` nor `upgrade` rewrites a live
+        # contract, because a field dropped from one makes every record still
+        # carrying it unreadable, so every home installed before that field exists
+        # in this state - and a distro that stopped starting on them would take the
+        # fleet's only entry point away until a captain hand-edited a YAML file.
+        #
+        # Both halves have to hold before the field is dropped: `datafile` refused,
+        # and the contract really does not declare it. A read that failed for any
+        # other reason is the stop it has always been, and a contract that does
+        # declare the field is never read without it - that read would hide a
+        # standing merge grant from the one session that has to know about it.
+        if ! grep -qE '^  automerge:' "$home/schema-projects.yaml" \
+                && registry="$(datafile -f "$home/projects.jsonl" \
+                    list --fields handle,path,ship,pipeline,orders,worktree \
+                    2>&1)"; then
+            stale=1
+        else
+            echo "the project registry at $home/projects.jsonl is not readable" >&2
+            echo "$registry" >&2
+            exit 1
+        fi
     fi
     context="# The captain's projects ($home/projects.jsonl)
 $registry"
+    # Said to the captain, and said to SIANA, because they act on it differently.
+    # The captain is the only one who can migrate the contract; SIANA is the one
+    # that would otherwise try to set a field the store refuses, and read the
+    # absent column as every project having been checked and found grantless.
+    if [ -n "$stale" ]; then
+        echo "stale    $home/schema-projects.yaml is older than \`automerge\`" >&2
+        echo "         every project here is read as granting no merge, which is" >&2
+        echo "         what they all were before that field existed" >&2
+        echo "         to grant one, copy \`automerge\` into it from" >&2
+        echo "         ${SIANA_DISTRO:-<the distro>}/template/schema-projects.yaml" >&2
+        context="$context
+
+This home's project contract is older than the \`automerge\` field, so no project
+here can carry a merge grant, the column above is absent rather than empty, and
+nothing merges without the captain. Migrating the contract is theirs: copy
+\`automerge\` into $home/schema-projects.yaml from
+${SIANA_DISTRO:-<the distro>}/template/schema-projects.yaml. Until they have, the
+store refuses to record the field at all, so do not offer to set it."
+    fi
 fi
 
 # What SIANA owes the captain and has not yet paid. Injected for the same reason the

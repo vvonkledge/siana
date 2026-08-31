@@ -320,6 +320,10 @@ method. There is no default and nothing infers one: how your history reads is no
 choice a script gets to make on your behalf, and the contract refuses anything else at
 the write.
 
+If that write is refused with `unknown field`, your home predates the field: see
+"Upgrade" below for the one line that migrates it. Until it is migrated the field
+cannot be recorded at all, which is the safe direction to fail in.
+
 **It delegates arranging, not deciding.** What SIANA does with it is ask the forge to
 merge that one request, pinned to that one commit, once every check and review your
 branch protection requires has passed. Your protection rule is still the gate, and it
@@ -348,15 +352,29 @@ and whether it would arm, and changes nothing.
 
 **Turning it off has an order.** What is armed lives at the forge, so it outlives this
 fleet: taking the field off the record stops the next one being armed and retracts
-nothing already armed. Cancel first, check, then remove the field:
+nothing already armed. Read what is armed, cancel it, check, and only then remove the
+field:
 
-    siana-publish <qa-task-id> --cancel-automerge
+    siana-publish --armed <project>                        # what is armed, and what
+                                                           # each would merge
+    siana-publish --armed <project> --cancel-automerge     # disarm all of it
+    siana-publish --armed <project>                        # `nothing armed`
+    ... and only then take `automerge` off the record
 
-That disarms the request and then asks the forge again to prove it is disarmed. It
-needs neither the field nor a `target`, precisely so it still works once you have
-removed either, and running it twice says `nothing armed` rather than doing anything
-a second time. A cancel the forge accepted but did not apply is a refusal that tells
-you to go and look, never a report that it worked.
+The first form reads and cannot arm anything: it asks your forge for every open
+request it is holding a merge for and prints the source branch, the target, the
+method and the exact commit of each. That is the list to check a revocation against,
+and it is what stops the whole thing depending on your remembering which QA tasks
+armed what. With `--cancel-automerge` it disarms every one of them and then asks the
+forge again to prove it, and it reports the ones it could not rather than stopping at
+the first, so one stuck request never puts the others out of reach.
+
+`siana-publish <qa-task-id> --cancel-automerge` is the same operation for one
+request, when you know which. Either form needs neither the field nor a `target`,
+precisely so it still works once you have removed either, and running one twice says
+`nothing armed` rather than doing anything a second time. A cancel the forge accepted
+but did not apply is a refusal that tells you to go and look, never a report that it
+worked.
 
 **Only GitHub.** GitLab is refused under this field, and publishes to it exactly as it
 did before. `glab` has no command that cancels an armed merge and none that says which
@@ -610,6 +628,16 @@ a field your contract does not have, `upgrade` and `doctor` say so and name the
 fields, because adding one is your call and the alternative is a raw traceback the
 first time SIANA writes a task.
 
+That holds for the project contract too, and one field is worth knowing about by
+name. A home installed before `automerge` existed keeps a `schema-projects.yaml`
+without it, and `upgrade` says so rather than editing the file. Nothing breaks: the
+fleet still starts, `siana` says the contract is older than the field and prints the
+line above, and every project reads as granting no merge, which is what every project
+was before the field existed. What you cannot do until you copy the field across is
+grant one, and the store refuses the write rather than recording something it cannot
+validate. Copy `automerge` out of `template/schema-projects.yaml` in this repository
+into your own when you want that.
+
 ## Diagnose
 
     just doctor
@@ -633,6 +661,10 @@ Things it says that are:
 
 - `stale schema-tasks.yaml is missing: <fields>`. Your contract predates the
   installed `tasks`. Add the fields it names.
+- `stale schema-projects.yaml is missing: <fields>`. Your project contract predates
+  this distro. The fleet runs without them and the registry refuses to record them,
+  so this is a setting you cannot make rather than something that is broken. Copy
+  the fields it names out of `template/schema-projects.yaml`.
 - `stale session claims pid <n>, which is gone`. A SIANA was killed before it could
   release its claim. Remove `$SIANA_HOME/session` and start again.
 - `stale advisory session stopped without saying why`. The `siana-afk` process is

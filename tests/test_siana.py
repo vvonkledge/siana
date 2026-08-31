@@ -224,6 +224,99 @@ class Context(Siana):
         self.assertIn("siana-watch cannot wake this session", out)
 
 
+class AnOlderProjectContract(Siana):
+    """A home whose project contract is older than the distro's.
+
+    Neither `init` nor `upgrade` rewrites a live contract, because a field dropped
+    from one makes every record still carrying it unreadable. So a home installed
+    before `automerge` existed still has a contract without it after the documented
+    `git pull && just upgrade`, and a `siana` that insisted on the field would take
+    the fleet's only entry point away until the captain hand-edited a YAML file.
+
+    What it does instead is start, read every project as granting no merge - which
+    is what every project was before the field existed - and say what the captain
+    would have to do to be able to grant one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.initialize()
+        self.contract("projects", "obligations")
+        self.older_contract("projects", "automerge")
+
+    def test_the_session_still_starts_and_the_registry_still_reaches_it(self):
+        self.project("workshop", ship="just check")
+        self.assertAccepted(self.start())
+        prompt = "\n".join(self.argv())
+        self.assertIn("workshop", prompt)
+        self.assertIn("just check", prompt)
+
+    def test_the_captain_is_told_what_is_stale_and_how_to_migrate(self):
+        out = self.assertAccepted(self.start(SIANA_DISTRO="/distro"))
+        self.assertIn("stale", out)
+        self.assertIn(self.at("schema-projects.yaml"), out)
+        self.assertIn("/distro/template/schema-projects.yaml", out)
+
+    def test_siana_is_told_no_project_here_can_carry_a_grant(self):
+        # It is the one that would otherwise offer to set a field the store refuses,
+        # and the one that would read the absent column as every project having been
+        # checked and found grantless.
+        self.project("workshop")
+        self.assertAccepted(self.start())
+        prompt = "\n".join(self.argv())
+        self.assertIn("older than the `automerge` field", prompt)
+        self.assertIn("do not offer to set it", prompt)
+
+    def test_the_store_refuses_the_field_until_the_contract_has_it(self):
+        """Fail-closed at the write, and the reason nothing downstream has to guard
+        against a grant appearing on an old contract: there is no way to record one.
+        """
+        out = self.run_cmd(["datafile", "-f", self.at("projects.jsonl"),
+                            "-c", self.at("schema-projects.yaml"), "put",
+                            "--set", "handle=workshop", "--set", f"path={self.home}",
+                            "--set", "automerge=squash"])
+        self.assertRefused(out, "automerge")
+
+    def test_a_registry_that_cannot_be_read_is_still_a_stop(self):
+        # The compatibility is narrow to one absent optional field, and everything
+        # else is the stop it has always been: injecting the error would leave SIANA
+        # believing the captain has no projects.
+        os.mkdir(self.at("projects.jsonl"))
+        self.assertRefused(self.start(), "not readable")
+        self.assertFalse(os.path.exists(self.argv_file))
+
+    def test_a_contract_broken_some_other_way_is_still_a_stop(self):
+        # It has no `automerge` either, so this is the case that says the second
+        # read is not a fallback for any refusal that happens to mention a field.
+        with open(self.at("schema-projects.yaml"), "w") as fh:
+            fh.write("fields: [this is not\n  a contract\n")
+        self.assertRefused(self.start(), "not readable")
+        self.assertFalse(os.path.exists(self.argv_file))
+
+
+class TheContractThatHasTheField(Siana):
+    """A home the captain has already migrated, which is read with the field and
+    never without it. A registry that hid a standing merge grant from the session
+    that has to know about it would be worse than no registry."""
+
+    def setUp(self):
+        super().setUp()
+        self.initialize()
+        self.contract("projects", "obligations")
+
+    def test_a_store_that_cannot_be_read_is_not_read_as_an_older_contract(self):
+        os.mkdir(self.at("projects.jsonl"))
+        self.assertRefused(self.start(), "not readable")
+        self.assertFalse(os.path.exists(self.argv_file))
+
+    def test_the_grant_is_never_dropped_from_the_read(self):
+        self.project("workshop", automerge="squash")
+        self.assertAccepted(self.start())
+        prompt = "\n".join(self.argv())
+        self.assertIn("squash", prompt)
+        self.assertNotIn("older than the `automerge` field", prompt)
+
+
 class Leadership(Siana):
     """One SIANA leads the fleet, and `$SIANA_HOME/session` is what says which."""
 

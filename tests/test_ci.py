@@ -113,11 +113,8 @@ class Workflow(unittest.TestCase):
         self.assertIn("github.ref", group[0])
 
     def test_the_job_cannot_hold_a_runner_forever(self):
-        # Without a timeout a hang sits there until GitHub's own limit, hours later,
-        # with nobody told why. The value is not asserted, only its presence: the
-        # suite is fifteen to twenty minutes and grows with the fleet, so a number
-        # pinned here would be a budget this file was quietly enforcing rather than
-        # the hang guard the workflow says it is.
+        # The suite takes three or four minutes. Without a timeout a hang sits
+        # there until GitHub's own limit, hours later, with nobody told why.
         self.assertTrue(
             [line for line in block("jobs") if line.startswith("timeout-minutes:")],
             "the job has no timeout")
