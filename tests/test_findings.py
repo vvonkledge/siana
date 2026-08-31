@@ -623,6 +623,17 @@ class Chain(TwoRounds):
         self.assertIn("round 2", self.assertAccepted(
             self.findings("case", "demo-case")))
 
+    def test_each_round_is_attributed_to_whoever_wrote_its_own_sentence(self):
+        # Nothing requires the rounds of one case to share an author, so a single
+        # attribution line for the whole case would put the second author's sentence
+        # under the first author's name - in the one field the design says is what
+        # makes the judgment arguable later.
+        one, two = self.rounds(resolved_by="a later reader")
+        self.archived(one, two)
+        out = self.assertAccepted(self.findings("case", "demo-case"))
+        self.assertIn("by     siana", out)
+        self.assertIn("by     a later reader", out)
+
     def test_a_round_whose_acceptance_is_not_the_next_round_is_refused(self):
         one, two = self.rounds()
         self.assertRefused(self.archive(dict(one, acceptance="qa-fix-one"), two),

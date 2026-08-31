@@ -889,8 +889,14 @@ def case_view(world, name):
         for missing in lost(rec, "evidence"):
             print(f"    lost     {missing}: it applied here and was never archived")
         print(f"    resolved {rec.get('resolution')}")
-    print(f"  judgment above is {rounds[0].get('resolved_by')}'s and is not checked"
-          " here; `siana-findings verify` checks the mechanics")
+        # Beside the sentence it belongs to, and never once for the whole case.
+        # Nothing requires the rounds of one case to share an author - the field is
+        # free text and the design describes it per record - so one attribution line
+        # at the bottom would put the second author's sentence under the first
+        # author's name, in the one field that makes the judgment arguable later.
+        print(f"      by     {rec.get('resolved_by')}")
+    print("  every `resolved` line above is judgment and is not checked here;"
+          " `siana-findings verify` checks the mechanics")
 
 
 def contract_issues(store: str, schema: str):
