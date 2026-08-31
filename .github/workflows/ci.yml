@@ -28,13 +28,12 @@ jobs:
     # Named for the command it runs, so a red check tells you what to run locally.
     name: just test
     runs-on: ubuntu-latest
-    # This is a hang guard, not a budget, and it has to stay one: a guard the
-    # passing suite runs into is a budget, and it fails a run that was going to be
-    # green. `just test` on this runner took twelve minutes on the trunk before
-    # this branch, and this branch adds 289 tests to 856. Measured side by side on
-    # one machine the whole suite is 1.35x the trunk's, which puts it past fifteen
-    # minutes here with nothing wrong.
-    timeout-minutes: 30
+    # A hang guard, not a budget, and deliberately far above what the suite costs.
+    # `tests/run.py` runs the suite across a pool sized from the runner's core
+    # count, and prints that size on its first line, so a run that got slower says
+    # how many workers it had. The serial figure this has to stay clear of is the
+    # one to reason with: 696s here, on x86_64, before there was a pool at all.
+    timeout-minutes: 15
 
     env:
       # Pinned rather than tracked, so a red run stays reproducible tomorrow. The

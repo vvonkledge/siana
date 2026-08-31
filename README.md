@@ -26,8 +26,9 @@ has been run on an operating system other than macOS.
 
 | Tool       | Verified   | Why it is needed                                      |
 | ---------- | ---------- | ----------------------------------------------------- |
-| `python3`  | 3.13.13    | every `siana-*` command but `siana` and `siana-brief` |
+| `python3`  | 3.13.13    | every `siana-*` command that is not bash or node      |
 | `bash`     | 5.3.9      | `siana`, `siana-brief`, and the recipes in `justfile` |
+| `node`     | 26.7.0     | `siana-console`; no other command here needs it       |
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
 | `datafile` | 0.1.1      | every record store: queue, registry, obligations      |
@@ -117,9 +118,9 @@ so a contract with no `.jsonl` beside it is an empty store and not a broken inst
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
 `siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
-`siana-gate`, `siana-read`, `siana-clean`, `siana-report`. They are links, so a `git
-pull` here updates the commands with no reinstall. It does not update the home; `just
-upgrade` does that.
+`siana-gate`, `siana-read`, `siana-clean`, `siana-report`, `siana-console`. They are
+links, so a `git pull` here updates the commands with no reinstall. It does not update
+the home; `just upgrade` does that.
 
 ### The distro's own pi package
 
@@ -240,13 +241,15 @@ The registry is yours, so SIANA writes it only when told to, with:
     datafile -f ~/.siana/projects.jsonl put \
         --set handle=<handle> --set path=<path> --set ship='<verify command>'
 
-`~/.siana/schema-projects.yaml` is the full field list. Three are worth knowing about
+`~/.siana/schema-projects.yaml` is the full field list. Four are worth knowing about
 when you ask: `qa` is an independent validation command, and setting it puts a QA
 task behind every ship task in that project; `orders` names a file of extra standing
 orders every minion there is started with, which is where a project's own conventions
 belong; `pipeline` says work there is validated by a pipeline the minion drives
 instead of by a command that runs once, and is described under "A rigor the minion
-drives" below.
+drives" below; `automerge` is standing permission for SIANA to arrange the merge of
+work that has been through all of that, and is described under "Letting accepted work
+merge" below.
 
 ### Branches the fleet leaves in your repository
 
@@ -309,8 +312,9 @@ The brief then records the branch that work was published from, and once QA acce
 the fix, `siana-publish` fast-forwards that branch to exactly the head QA accepted.
 Your merge request keeps its number and its review, and gains the commits that fix
 it. Its description is rewritten from the repair minion's own handoff, because after
-that push it is describing that minion's work. Nothing merges: that is still yours,
-in person.
+that push it is describing that minion's work. Nothing merges unless you granted that
+project a merge, under "Letting accepted work merge" below; without the grant it is
+still yours, in person.
 
 It refuses rather than guesses. No open request from that branch, more than one, a
 closed or merged one, a branch that has moved under the request, a head that is not a
@@ -320,6 +324,91 @@ because the head that goes out is the one a second minion actually read.
 
 The push and the description are two calls, so an interrupted run can leave the new
 commits under the old copy. Running it again pushes nothing and puts the copy on.
+
+### Letting accepted work merge
+
+Everything above stops at an open merge request, and merging it is yours. If you would
+rather it merged on its own once it has been through all of that, say so on the
+project's registry record:
+
+    datafile -f ~/.siana/projects.jsonl put \
+        --set handle=<handle> --set path=<path> --set ship='<test command>' \
+        --set qa='<qa command>' --set target=<branch> --set pipeline=true \
+        --set automerge=squash
+
+The value is `merge`, `squash` or `rebase`, and it is both the permission and the
+method. There is no default and nothing infers one: how your history reads is not a
+choice a script gets to make on your behalf, and the contract refuses anything else at
+the write.
+
+If that write is refused with `unknown field`, your home predates the field: see
+"Upgrade" below for the one line that migrates it. Until it is migrated the field
+cannot be recorded at all, which is the safe direction to fail in.
+
+**It delegates arranging, not deciding.** What SIANA does with it is ask the forge to
+merge that one request, pinned to that one commit, once every check and review your
+branch protection requires has passed. Your protection rule is still the gate, and it
+is the thing that actually merges. SIANA never merges anything itself, with or without
+this field.
+
+**Nothing infers it.** Not a previous merge, not the repository's settings, not the
+shape of a branch, and not anything an agent read, wrote or was told. This record is
+the only place it exists, and the file is yours.
+
+**It adds a condition, it does not remove three.** A project with this field and
+without `pipeline`, `qa` or `target` refuses to publish at all rather than publishing
+under a weaker version of what you asked for. What has to hold before anything is
+arranged: a driven pipeline run that passed at the accepted head, a QA task that came
+back `done` on that same head, the branch on your remote still at it, an open
+non-draft request from that branch to `target`, and at least one required check on
+that head. A pending check may arm it; a failed one may not; no checks at all is never
+read as a green.
+
+**Arming is not merging, and it is not a promise.** All you have afterwards is a
+request the forge will merge if its own gate goes green. If a check fails, it sits
+there open exactly as it would have.
+
+`siana-publish --dry-run` prints the method, the accepted head, the required checks
+and whether it would arm, and changes nothing.
+
+**Turning it off has an order.** What is armed lives at the forge, so it outlives this
+fleet: taking the field off the record stops the next one being armed and retracts
+nothing already armed. Read what is armed, cancel it, check, and only then remove the
+field:
+
+    siana-publish --armed <project>                        # what is armed, and what
+                                                           # each would merge
+    siana-publish --armed <project> --cancel-automerge     # disarm all of it
+    siana-publish --armed <project>                        # `nothing armed`
+    ... and only then take `automerge` off the record
+
+The first form reads and cannot arm anything: it asks your forge for every open
+request it is holding a merge for and prints the source branch, the target, the
+method and the exact commit of each. That is the list to check a revocation against,
+and it is what stops the whole thing depending on your remembering which QA tasks
+armed what. With `--cancel-automerge` it disarms every one of them and then asks the
+forge again to prove it, and it reports the ones it could not rather than stopping at
+the first, so one stuck request never puts the others out of reach.
+
+`siana-publish <qa-task-id> --cancel-automerge` is the same operation for one
+request, when you know which. Either form needs neither the field nor a `target`,
+precisely so it still works once you have removed either, and running one twice says
+`nothing armed` rather than doing anything a second time. A cancel the forge accepted
+but did not apply is a refusal that tells you to go and look, never a report that it
+worked.
+
+During an advisory session the reading form still answers and the cancelling forms
+are refused, so a merge armed before the session still happens when its checks pass.
+Stopping that one is your forge's own interface. See [Leave it
+advisory](#leave-it-advisory).
+
+**Only GitHub.** GitLab is refused under this field, and publishes to it exactly as it
+did before. `glab` has no command that cancels an armed merge and none that says which
+checks a project requires - a merge request there has one pipeline, and whether it
+must be green is a project setting the client does not report. So on GitLab an arming
+could not be retracted, and "this branch requires nothing" and "I could not ask"
+arrive as the same empty answer. Neither is a thing to build a merge on.
+
 
 ### Leave it running
 
@@ -480,8 +569,10 @@ Two things it will not do. A minion cannot start one: `siana-afk` refuses outrig
 report cannot talk a well-meaning minion into starting a session on your behalf. That
 is a guard rail and not a boundary, because minions run with permissions that let one
 unset the variable first; closing it properly means narrowing those permissions, which
-is a separate change. And it never merges. Merging is permanently yours, and so is
-skipping a QA pair and answering a pipeline finding marked `decide`.
+is a separate change. And it never merges, whatever a project's registry record says:
+a standing grant is permission for the ordinary attended path, and a session in force
+is you saying decisions are being written down rather than made. Skipping a QA pair
+and answering a pipeline finding marked `decide` are permanently yours either way.
 
 ### A rigor the minion drives
 
@@ -664,16 +755,64 @@ done while you were away, where nobody was asked and no answer exists.
 
     just test
 
-Fifteen to twenty minutes. Standard-library `unittest`, no dependencies to install. It
-drives the pure mechanics in-process and drives the commands as real processes
-against a real `tasks` and `datafile`, into throwaway homes, because a stubbed store
-would only ever agree with the suite. Unittest arguments pass through, so `just test
--v` is verbose and `just test -k <slug>` runs one rule.
+Standard-library `unittest`, no dependencies to install. It drives the pure
+mechanics in-process and drives the commands as real processes against a real
+`tasks` and `datafile`, into throwaway homes, because a stubbed store would only
+ever agree with the suite. Unittest arguments pass through, so `just test -v` is
+verbose and `just test -k <slug>` runs one rule.
 
 It reports a line per test as it goes, rather than unittest's dots, and puts a
-watchdog around each one: a test that stalls dumps every thread's stack and takes the
-run down instead of sitting there. That is `tests/run.py`, and it is there because a
-run killed by a hang guard printed dots that no line-oriented reader ever showed.
+watchdog around each one: a test that stalls dumps every thread's stack and the run
+is taken down instead of sitting there. That is `tests/run.py`, and it is there
+because a run killed by a hang guard printed dots that no line-oriented reader ever
+showed.
+
+Driving real commands is also what makes the suite slow, and slow in a particular
+way: it waits rather than computes. A serial run spends about three quarters of one
+core for its whole length, with the rest of the machine idle. So `tests/run.py`
+hands whole test classes to a pool of worker processes, and the first line of a run
+says how many workers it got.
+
+Measured by an independent reviewer at `0773dde`, the commit this section sits on
+top of, on an eleven-core M3 Pro: 912 tests, four runs green, one warm worktree,
+no cache cleared and no two of them overlapping.
+
+    one worker (control)    635.3s    461.4s CPU    0.73 cores    168 MB
+    pool, default (5)       240.6s    763.3s CPU    3.17 cores    168 MB
+    pool, shuffled          231.6s    737.1s CPU    3.18 cores    167 MB
+    pool, buffered (-b)     192.3s    668.0s CPU    3.47 cores    168 MB
+
+The median pool run against that control is a 63.5% cut: 635.3s to 231.6s, ten and
+a half minutes to under four. That is the figure to quote, because it is the only
+like-for-like one here - same head, same machine, same warm caches - and it errs
+low rather than high. Load was not sampled at every start; what was observed put
+the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6.6
+rising to 15.7 during a pool run, with another agent running this same suite on the
+box for part of the window.
+
+So expect about four minutes from the pool and about ten and a half from one
+worker. Both stretch under fleet load, and this machine's own variation is wider
+than the gap between any two pool sizes. Measured separately by the author of the
+pool at `6906b6a`, interleaving the two modes: one control of 1115s taken at load
+11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and 26.4.
+Across the whole of that work, at heads and loads that were not held constant, the
+one-worker control measured anywhere from 703s to 1115s. Those are observations of
+what load does, not a second speed claim - they are not comparable with the four
+runs above and are not combined with them. Re-measure rather than trusting any
+single number here.
+
+    SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
+    SIANA_TEST_WORKERS=8 just test      or any number you like
+
+The pool is sized from the machine and capped, deliberately below the core count:
+this machine also runs the fleet, and a suite that took most of it would slow down
+everything else on the box. One worker is the control. It is the mode to reach for
+when a failure looks like it might be the pool's fault rather than the code's, and
+it is what every timing here was measured against.
+
+Each worker gets a temporary directory of its own, and the run removes the lot when
+it ends - on success, on failure, on a stall, and on Ctrl-C. Nothing it started
+outlives it.
 
 `ORDERS.md` is the rest of the contract for changing anything here, and the parts of
 it that can be checked exactly are checked by the suite.
@@ -699,6 +838,16 @@ three store contracts are left exactly as they are. When the installed `tasks` g
 a field your contract does not have, `upgrade` and `doctor` say so and name the
 fields, because adding one is your call and the alternative is a raw traceback the
 first time SIANA writes a task.
+
+That holds for the project contract too, and one field is worth knowing about by
+name. A home installed before `automerge` existed keeps a `schema-projects.yaml`
+without it, and `upgrade` says so rather than editing the file. Nothing breaks: the
+fleet still starts, `siana` says the contract is older than the field and prints the
+line above, and every project reads as granting no merge, which is what every project
+was before the field existed. What you cannot do until you copy the field across is
+grant one, and the store refuses the write rather than recording something it cannot
+validate. Copy `automerge` out of `template/schema-projects.yaml` in this repository
+into your own when you want that.
 
 ## Diagnose
 
@@ -735,6 +884,10 @@ Things it says that are:
 
 - `stale schema-tasks.yaml is missing: <fields>`. Your contract predates the
   installed `tasks`. Add the fields it names.
+- `stale schema-projects.yaml is missing: <fields>`. Your project contract predates
+  this distro. The fleet runs without them and the registry refuses to record them,
+  so this is a setting you cannot make rather than something that is broken. Copy
+  the fields it names out of `template/schema-projects.yaml`.
 - `stale session claims pid <n>, which is gone`. A SIANA was killed before it could
   release its claim. Remove `$SIANA_HOME/session` and start again.
 - `stale advisory session stopped without saying why`. The `siana-afk` process is
@@ -823,6 +976,65 @@ It is not literally read-only on disk, and it is worth saying so plainly before
 anything is built on top of it: a `datafile` read may rewrite the `.idx` cache
 beside a store. That write is atomic and it is a cache. No authoritative record is
 ever changed.
+
+## Read the fleet over loopback HTTP
+
+    SIANA_CONSOLE_PORT=8787 siana-console
+
+`siana-read` answers one question and exits, which a phone cannot run. This is the
+smallest process that puts those same documents on a socket, and it is the whole of
+what it does. You start it yourself, and you stop it with Ctrl-C or `kill`. Nothing
+in the fleet starts it, nothing in the fleet depends on it, and stopping it leaves
+SIANA, the watcher, every minion and every store exactly as they were.
+
+It is the one command here that runs on `node`, so `just doctor` reports whether
+there is one to run it on.
+
+Read what it is before you run it:
+
+- **Local only.** It binds `127.0.0.1` and there is no flag, variable or fallback
+  that moves it. Nothing else on your network can reach it.
+- **Unauthenticated.** Anything already running on this machine as you can read it.
+  That is the same reach that anything running as you already has over the home
+  itself, so it adds nothing locally and would add everything remotely, which is why
+  the address is not configurable.
+- **Read-only where it matters.** It has no write endpoint. Every request it serves
+  reaches the fleet through `siana-read` and through nothing else, so no request can
+  change an authoritative record. It writes one file of its own: the claim below.
+  `siana-read` and `datafile` disclose the rest, which is a store's `.idx` cache.
+
+`SIANA_CONSOLE_PORT` has no default, and the console refuses to start without it. A
+port every machine used would be a port something else is one day holding.
+
+It serves two routes and refuses everything else, every other method included:
+
+    GET /api/state?rev=<opaque>    every source, in one document
+    GET /api/stream               server-sent events announcing a new revision
+
+`/api/state` runs all six `siana-read` commands and returns what each of them said:
+the whole document, its exit code, and when it was asked. Nothing is folded, and no
+field of a source document is read, because `siana-read`'s refusals do not share one
+shape. A source that could not be read arrives as a source that could not be read,
+so a silent herdr is `state: "unknown"` here exactly as it is there.
+
+`rev` is a cache validator. Pass back the `revision` you last saw and an unchanged
+fleet answers `204` with no body. It is opaque, it changes when any source's answer
+changes, and it is the same for the same answers, so a console restarted against
+untouched stores hands back the revision you already have.
+
+`/api/stream` says a new revision exists so that a client can refetch `/api/state`.
+It carries no state and no event id: there is nothing to replay, a reconnecting
+client is told the current revision, and `/api/state` is complete on its own when
+the stream is disconnected.
+
+One console runs per home. It claims `$SIANA_HOME/inbox/console` before it binds,
+recording the pid, the `ps` command and the port it owns, and a second one refuses
+and names the first. A claim whose process is gone, or whose pid is now something
+else, is taken over and says so. A claim it cannot read, or cannot prove has
+stopped, is refused rather than taken: the console that wrote it may still be
+serving that port. Nothing is ever killed to recover one. Stopping releases the
+claim; a `kill -9` leaves it behind, and the next start proves it stale and takes
+it.
 
 ## Uninstall
 

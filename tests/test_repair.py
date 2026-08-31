@@ -233,15 +233,21 @@ class Fleet(HomeTest):
             os.symlink(fake, os.path.join(bindir, name))
         return bindir
 
-    def request(self, branch=None, head=None, state=None, url=None):
-        """One request on the published branch, as the fake keeps them."""
-        return {"branch": branch or self.ship_branch,
-                "base": "main",
-                "title": "Carry the flow's own types",
-                "body": "## Intent\n\nThe flow was a bag of strings.\n",
-                "url": url or self.URL,
-                "state": state or "open",
-                "head": self.published if head is None else head}
+    def request(self, branch=None, head=None, state=None, url=None, **over):
+        """One request on the published branch, as the fake keeps them.
+
+        `over` is anything else the fake understands - checks, a draft flag, what it
+        is armed with - so a suite exercising a field this file has no interest in
+        does not need a second copy of the shape."""
+        rec = {"branch": branch or self.ship_branch,
+               "base": "main",
+               "title": "Carry the flow's own types",
+               "body": "## Intent\n\nThe flow was a bag of strings.\n",
+               "url": url or self.URL,
+               "state": state or "open",
+               "head": self.published if head is None else head}
+        rec.update(over)
+        return rec
 
     def seed(self, requests):
         """What the forge already holds. Written straight into the fake's own state,
@@ -664,13 +670,21 @@ class Github(Fleet):
     """What the github client is actually asked, with no credential anywhere."""
 
     def test_the_client_is_asked_about_one_branch_and_every_state(self):
+        """One question, about this branch, in every state.
+
+        The three things a repair turns on. The field list is checked for the four
+        this file needs rather than for the whole of it: what a request has to say
+        grows with what publishing does - `automerge` added four more - and a test
+        that pinned the string would go red every time somebody asked the same
+        question for a different reason."""
         self.assertAccepted(self.publish())
         listed = [a for a in self.asked() if a[1:2] == ["pr"] and a[2:3] == ["list"]]
         self.assertEqual(len(listed), 1, self.asked())
-        self.assertEqual(listed[0],
+        self.assertEqual(listed[0][:8],
                          ["gh", "pr", "list", "--head", self.ship_branch,
-                          "--state", "all", "--json",
-                          "url,state,headRefName,headRefOid"])
+                          "--state", "all", "--json"])
+        for wanted in ("url", "state", "headRefName", "headRefOid"):
+            self.assertIn(wanted, listed[0][8].split(","))
 
     def test_the_copy_reaches_it_as_an_edit_of_the_published_branch(self):
         self.assertAccepted(self.publish())
