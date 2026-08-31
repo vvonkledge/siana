@@ -1103,6 +1103,11 @@ class TheApplication(Console):
                 self.assertEqual(status, 200)
                 self.assertEqual(headers["Content-Type"], "image/png")
                 self.assertEqual(payload[:8], b"\x89PNG\r\n\x1a\n")
+                # Never cached. The script and the stylesheet carry a hash of their
+                # own contents in their names and can be kept for a year; an icon is
+                # emitted at a fixed name, so a browser told the same thing would go
+                # on showing last month's artwork.
+                self.assertEqual(headers["Cache-Control"], "no-store")
 
     def test_an_asset_that_was_not_built_is_a_refusal_and_never_a_guess(self):
         for target in ("/assets/index-deadbeef.js", "/assets/nothing.css",

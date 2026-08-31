@@ -15,7 +15,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { bar, json, load, opened, settle, text, until } from './harness.mjs';
+import { alerts, bar, json, load, opened, settle, text, until }
+  from './harness.mjs';
 import { at, health, snapshot, task } from './fixtures.mjs';
 
 const FLOOR = 5_000;
@@ -277,6 +278,30 @@ test('the first read carries no revision and later reads carry the one held',
     for (const request of page.requests) {
       assert.equal(request.options.cache, 'no-store');
     }
+  });
+
+test('nothing is said about staleness while the first read is still in the air',
+  async (t) => {
+    // The console writes the stream's response head at once and `/api/state` runs six
+    // processes, so on a real cold open the stream is connected long before the first
+    // read comes back. Nothing is on screen to be stale yet, and a loud banner on
+    // every open is one the captain stops reading.
+    const answer = steady([task('a-task')]);
+    const page = load({ snapshot: null });
+    t.after(() => page.close());
+    page.answer = () => new Promise((resolve) => {
+      page.window.setTimeout(() => resolve(json(answer)), 10_000);
+    });
+    await settle(page);
+    page.streams[0].connect();
+    await settle(page);
+    assert.equal(bar(page).dataset.status, 'connected');
+    assert.equal(bar(page).dataset.stale, 'no');
+    assert.deepEqual(alerts(page), []);
+    assert.match(text(page), /Reading the fleet/);
+    await page.tick(11_000);
+    assert.match(text(page), /a-task/);
+    assert.equal(bar(page).dataset.stale, 'no');
   });
 
 test('nothing before the first snapshot is rendered as an empty fleet', async (t) => {

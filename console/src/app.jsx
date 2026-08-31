@@ -89,11 +89,15 @@ function Bar({ state }) {
   const shown = STATUS[state.status] || STATUS.starting;
   const known = state.readAt !== null;
   const age = known ? now - state.readAt : null;
-  // Not while the first read is still in the air. A cold load has never read
-  // anything by definition, and a loud banner that flashes on every open is a banner
-  // the captain learns to look past - which is the one thing this one cannot afford.
+  // Never over a first read that is still in the air. The console writes the
+  // stream's response head at once while `/api/state` is still running six
+  // processes, so on a cold open the link is `connected` for the whole of the first
+  // read and there is nothing old on screen yet to warn about - `Waiting` below says
+  // it is reading. A loud banner that flashes on every open is a banner the captain
+  // learns to look past, which is the one thing this one cannot afford. With nothing
+  // ever read, only a link that has actually failed is worth saying out loud.
   const stale = state.cached || (known && age > STALE_AFTER_MS)
-    || (!known && state.status !== 'starting');
+    || (!known && state.status === 'offline');
   return (
     <div data-status={state.status} data-stale={stale ? 'yes' : 'no'}
       className="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/95

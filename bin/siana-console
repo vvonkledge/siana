@@ -147,23 +147,27 @@ const ASSETS = [
   ['sw.js', '/sw.js', 'text/javascript; charset=utf-8'],
 ];
 
-// The generated files, whose names carry a content hash the console cannot know
-// before the build. The shapes are exact: a name that does not match one of these is
-// a build this does not recognise, and the whole bundle is refused rather than half
-// of it served.
+// A year, immutable, and only for the two files whose names carry a hash of their own
+// contents: the file behind one of those never changes. Nothing else here is cached.
+const FOREVER = 'public, max-age=31536000, immutable';
+
+// The generated files, whose exact names the console cannot know before the build.
+// The shapes are exact: a name that does not match one of these is a build this does
+// not recognise, and the whole bundle is refused rather than half of it served.
+//
+// Only the two under `assets/` are cached, because only those two carry a hash of
+// their own contents in their name. The icons are emitted at fixed names, so a
+// browser told to keep one for a year would go on showing last month's artwork.
 const GENERATED = [
-  [/^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.js$/, 'text/javascript; charset=utf-8'],
-  [/^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.css$/, 'text/css; charset=utf-8'],
-  [/^icons\/[A-Za-z0-9][A-Za-z0-9._-]*\.png$/, 'image/png'],
+  [/^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.js$/, 'text/javascript; charset=utf-8',
+   FOREVER],
+  [/^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.css$/, 'text/css; charset=utf-8', FOREVER],
+  [/^icons\/[A-Za-z0-9][A-Za-z0-9._-]*\.png$/, 'image/png', 'no-store'],
 ];
 
 // The one directory level the bundle is allowed to have, so that walking it is a
 // fixed list of names and not a recursive descent through whatever is there.
 const SUBDIRECTORIES = ['assets', 'icons'];
-
-// A year, immutable: every name under `assets/` carries a hash of its own contents,
-// so the file behind one never changes. Nothing else is cached at all.
-const FOREVER = 'public, max-age=31536000, immutable';
 
 // What the application document is allowed to do, enforced by the browser rather
 // than only by the build.
@@ -725,7 +729,7 @@ function loadApp(dir) {
       return { routes: new Map(),
                error: `${dir} holds a file this does not serve: ${file}` };
     }
-    const loaded = read(dir, file, `/${file}`, generated[1], FOREVER);
+    const loaded = read(dir, file, `/${file}`, generated[1], generated[2]);
     if (loaded.error) return { routes: new Map(), error: loaded.error };
     routes.set(`/${file}`, loaded.entry);
   }
