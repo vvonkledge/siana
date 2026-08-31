@@ -33,7 +33,7 @@ jobs:
     # that got slower says how many workers it had.
     #
     # Reason about this from the pool, and not from the serial control. That control
-    # was 696s here, on x86_64, when the suite was 894 tests; this one is 1390, and
+    # was 696s here, on x86_64, when the suite was 856 tests; this one is 1390, and
     # scaling it lands past fifteen minutes. Nothing runs it serially, so that is a
     # number about a mode CI does not use, and sizing the guard against it argues for
     # raising a guard the pool has already made room under.
