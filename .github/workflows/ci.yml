@@ -28,11 +28,19 @@ jobs:
     # Named for the command it runs, so a red check tells you what to run locally.
     name: just test
     runs-on: ubuntu-latest
-    # A hang guard, not a budget, and deliberately far above what the suite costs.
-    # `tests/run.py` runs the suite across a pool sized from the runner's core
-    # count, and prints that size on its first line, so a run that got slower says
-    # how many workers it had. The serial figure this has to stay clear of is the
-    # one to reason with: 696s here, on x86_64, before there was a pool at all.
+    # A hang guard, not a budget. `tests/run.py` runs the suite across a pool sized
+    # from the runner's core count, and prints that size on its first line, so a run
+    # that got slower says how many workers it had.
+    #
+    # Reason about this from the pool, and not from the serial control. That control
+    # was 696s here, on x86_64, when the suite was 894 tests; this one is 1390, and
+    # scaling it lands past fifteen minutes. Nothing runs it serially, so that is a
+    # number about a mode CI does not use, and sizing the guard against it argues for
+    # raising a guard the pool has already made room under.
+    #
+    # The pool is what to measure. At the three workers a four-core runner gets, the
+    # 1390 tests took 558s on an eleven-core machine; a runner costs about a tenth
+    # more for the same work, which leaves roughly a third of this unspent.
     timeout-minutes: 15
 
     env:
