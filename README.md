@@ -542,8 +542,8 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-So on a quiet machine expect about four minutes from the pool and about eleven from
-one worker. Both stretch under fleet load, and this machine's own variation is wider
+So expect about four minutes from the pool and about ten and a half from one
+worker. Both stretch under fleet load, and this machine's own variation is wider
 than the gap between any two pool sizes. Measured separately by the author of the
 pool at `6906b6a`, interleaving the two modes: one control of 1115s taken at load
 11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and 26.4.
