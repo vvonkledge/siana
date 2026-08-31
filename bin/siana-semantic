@@ -93,10 +93,17 @@ RETENTION_DAYS = 90
 # whole, and bounded because the alternative is not bounded.
 CALL_TIMEOUT_S = 120.0
 
-# The contract refuses an input document past 16 MiB, so an answer past it is not
-# something this could hand back anyway. It is a bound on what is believed, not on
-# what was read: the read already happened by the time this is checked.
-MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# What this consumer is willing to hold, and nothing the contract states: an export
+# carries the whole pack, so how large an answer can legitimately be is a question
+# about the pack and not about the boundary. A context pack is the minimum
+# task-relevant subgraph and the ones this was written against are kilobytes, so
+# this is generous by three orders of magnitude and exists only so that a provider
+# that has gone wrong cannot be an unbounded read.
+#
+# It bounds what is believed rather than what is read: the read has already happened
+# by the time this is checked. Bounding the read itself would mean streaming the
+# answer, which buys nothing against a process this one started.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 HEX16 = re.compile(r"[0-9a-f]{16}")
@@ -249,10 +256,17 @@ def pack_directory(home, binding):
     Relative to the provider's own directory, because that is what a pack path in
     the captain's binding means: a pack lives inside the project that builds it.
     Written absolute or under `~`, it is taken as it is."""
+    # Resolved first and every time, not only when the path needs it. The binding
+    # names a project in the captain's registry, so a handle that is not in it is a
+    # binding that does not say what it claims to say - and an absolute pack would
+    # otherwise let a misspelled or since-deleted provider pin, brief and record
+    # without anything noticing, while `status` printed the handle as if it were
+    # real.
+    provider = project_path(home, str(binding["provider"]))
     pack = str(binding["pack"])
     if pack.startswith(("/", "~")):
         return os.path.abspath(os.path.expanduser(pack))
-    return os.path.join(project_path(home, str(binding["provider"])), pack)
+    return os.path.join(provider, pack)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +308,8 @@ def call(argv, command, stdin=None):
             f"it said: {done.stderr[:200].decode(errors='replace')!r}")
     if len(done.stdout) > MAX_RESPONSE_BYTES:
         die(f"`{COMMAND} {command}` answered with {len(done.stdout)} bytes",
-            f"nothing this contract defines comes near {MAX_RESPONSE_BYTES}")
+            f"this consumer holds at most {MAX_RESPONSE_BYTES}, which is far more",
+            "than a context pack; something on the other side has gone wrong")
     try:
         text = done.stdout.decode()
     except UnicodeDecodeError as e:
@@ -759,6 +774,17 @@ def reusable(home, task_id, pin, task, binding, as_of):
         # undispatchable until somebody moved the directory by hand, which no
         # message here would have asked them to do.
         return within_window(pin["pack"], as_of)
+    if task.get("status") == "doing":
+        # A minion is holding this task right now, and this pin is what it was
+        # briefed from. Dispatch pins before it claims, so a second dispatch of a
+        # running task reaches here first and would roll that pin aside before the
+        # queue refused the claim - leaving the run in flight with no pin to record
+        # it against and a fresh one beside it that no minion ever saw.
+        die(f"{task_id} is already running, and this pin is that run's",
+            f"the pin is at {pin_path(home, task_id)}",
+            "rolling it aside would leave the minion that is working now with",
+            "nothing to record what it did",
+            "if that minion is gone, reclaim the task with `tasks reset` first")
     if (task.get("status") in OUTCOMES
             and read_recorded(home, task_id) is None):
         die(f"{task_id} has a finished run nobody has recorded yet",
@@ -1298,7 +1324,7 @@ def cmd_status(args, home):
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(
         home, "tasks.jsonl")
     tasks = fold(tasks_file, "id")
-    waiting, lost = [], []
+    waiting, lost, unclaimed = [], [], []
     for name in pins:
         try:
             pin = read_pin(home, name)
@@ -1306,9 +1332,20 @@ def cmd_status(args, home):
             print(f"  stale   {name}: {r.message}")
             stale += 1
             continue
-        if pin is None or not os.path.exists(dispatched_marker(home, name)):
+        if pin is None:
             continue
         if os.path.exists(os.path.join(pin_path(home, name), "recorded.json")):
+            continue
+        status = (tasks.get(pin["task"]) or {}).get("status")
+        if not os.path.exists(dispatched_marker(home, name)):
+            # No claim was ever marked here. Ordinarily that is a dispatch that
+            # refused before the queue claim and nothing to say anything about - but
+            # a task that has since gone terminal means either a run happened and
+            # the mark failed to be written, or the task was taken terminal by hand.
+            # Named, because the first of those is a run nobody will ever record and
+            # this is the only place it can be seen at all.
+            if status in OUTCOMES:
+                unclaimed.append(name)
             continue
         # A spent pin - rolled aside when its task was dispatched again - is over,
         # and so is a live one whose task has been reset: the queue keeps one
@@ -1316,13 +1353,14 @@ def cmd_status(args, home):
         # and reconcile will never write one. Counted rather than called stale,
         # because nothing clears it and a permanent fault here would be a doctor
         # that can never come back green. `waiting` is only what reconciling fixes.
-        status = (tasks.get(pin["task"]) or {}).get("status")
         if name != pin["task"] or status not in OUTCOMES:
             if status != "doing":
                 lost.append(name)
         else:
             waiting.append(name)
     tail = f", {len(lost)} never recorded" if lost else ""
+    tail += (f", {len(unclaimed)} terminal but never claimed: "
+             f"{', '.join(unclaimed)}") if unclaimed else ""
     if not pins:
         print("  ok      no pins yet")
     elif waiting:

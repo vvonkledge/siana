@@ -348,6 +348,22 @@ class Binding(SemanticTest):
         self.assertRefused(self.pin(), "unknown project: nowhere")
         self.assertEqual(self.calls(), [])
 
+    def test_an_absolute_pack_does_not_excuse_a_provider_nobody_registered(self):
+        # The handle is resolved whether or not the path needs it. Nothing else
+        # reads it - the export runs the `semantic-layer` on PATH - so a binding
+        # with an absolute pack would otherwise pin, brief and record while naming
+        # a project that is not in the registry, and status would print it as `ok`.
+        elsewhere = self.at("elsewhere")
+        os.makedirs(elsewhere)
+        self.bound(provider="nowhere", pack=elsewhere)
+        self.task()
+        self.plan()
+        self.assertRefused(self.pin(), "unknown project: nowhere")
+        self.assertEqual(self.calls(), [])
+        out = self.sem("status")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("unknown project: nowhere", out.stdout)
+
     def test_a_pack_written_absolute_is_taken_as_it_is(self):
         elsewhere = self.at("elsewhere")
         os.makedirs(elsewhere)
@@ -511,10 +527,10 @@ class Pinning(SemanticTest):
         self.assertEqual(len(self.calls("pack export")), 1)
         self.assertFalse(os.path.exists(self.at("semantic", f"{self.TASK}.1")))
 
-    def test_a_claim_that_landed_on_work_still_running_is_not_reused(self):
-        # Claimed, and the task never went terminal: an abandoned dispatch that got
-        # as far as the claim, or a task the captain reset while it was live. There
-        # is no run to lose, and the pin belongs to an execution that already began.
+    def test_a_claim_that_landed_on_a_task_since_reset_is_not_reused(self):
+        # Claimed, and the task is back in `todo`: an abandoned dispatch that got as
+        # far as the claim, or a task the captain reset. There is no run left to
+        # record, and the pin belongs to an execution that already began.
         self.exporting()
         self.assertAccepted(self.pin())
         first = self.pinned()
@@ -525,6 +541,28 @@ class Pinning(SemanticTest):
         self.assertNotEqual(self.pinned()["trace_id"], first["trace_id"])
         self.assertTrue(os.path.exists(
             self.at("semantic", f"{self.TASK}.1", "pin.json")))
+
+    def test_a_pin_belonging_to_a_running_minion_is_never_rolled_aside(self):
+        # Dispatch pins before it claims, so a second dispatch of a task that is
+        # already running reaches here first - which is the ordinary retry after a
+        # dispatch that refused with the minion alive. Rolling the pin aside would
+        # leave that run with nothing to record it against, and the fresh pin beside
+        # it is one no minion ever saw.
+        self.exporting()
+        self.assertAccepted(self.pin())
+        first = self.pinned()
+        self.dispatched()
+        self.store("tasks.jsonl", {"id": self.TASK, "title": "make a thing",
+                                   "status": "doing", "verify": "true",
+                                   "verify_kind": "cmd", "deps": [], "context": [],
+                                   "project": "proj", "owner": "claude@w1:p1",
+                                   "updated": "2026-08-30T09:10:00Z"})
+
+        self.assertRefused(self.pin(), "already running")
+
+        self.assertEqual(self.pinned()["trace_id"], first["trace_id"])
+        self.assertFalse(os.path.exists(self.at("semantic", f"{self.TASK}.1")))
+        self.assertEqual(len(self.calls("pack export")), 1)
 
     def test_a_task_with_no_project_cannot_have_a_binding(self):
         self.task("unowned", project=None)
@@ -1208,6 +1246,23 @@ class Status(SemanticTest):
         self.assertAccepted(self.pin())
         out = self.assertAccepted(self.sem("status"))
         self.assertIn("2 pins, none waiting", out)
+
+    def test_a_finished_run_whose_claim_was_never_marked_is_named(self):
+        # The mark is written after the queue claim, and a dispatch that could not
+        # write it warns and carries on rather than taking a live minion down. This
+        # is the only place that hole can be seen afterwards. It cannot be told
+        # apart from a dispatch that legitimately never claimed, so it is named
+        # rather than called a fault.
+        self.bound()
+        self.queued()
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.terminal(status="done")
+
+        out = self.assertAccepted(self.sem("status"))
+
+        self.assertIn("terminal but never claimed", out)
+        self.assertIn(self.TASK, out)
 
     def test_it_records_nothing_while_reporting(self):
         # Doctor runs this, so it has to be safe to run at any moment. It reads

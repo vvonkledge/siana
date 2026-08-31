@@ -391,7 +391,9 @@ def mark_dispatched(home: str, tasks_file: str, task_id: str) -> None:
     After the claim, because that is the fact it records. It is reported and never
     fatal: the minion is running by now, and taking a live dispatch down over a
     marker file would cost the work to save the bookkeeping. What is lost without it
-    is one run going unrecorded, and `siana-semantic status` says so out loud."""
+    is one run going unrecorded - the warning below is the only thing said at the
+    time, and afterwards `siana-semantic status` names the pin once its task goes
+    terminal, as one claimed by nothing."""
     semantic_mark(home, tasks_file, task_id, "dispatched",
                   f"the semantic pin for {task_id} is not marked as dispatched, so "
                   f"nothing will record what this run did")
