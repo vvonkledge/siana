@@ -919,6 +919,34 @@ class Reconciling(SemanticTest):
         self.assertEqual(self.calls("trace record"), [])
         self.assertTrue(os.path.exists(self.at("semantic", self.TASK, "pin.json")))
 
+    def test_a_binding_removed_after_a_run_was_recorded_is_not_a_fault(self):
+        # Removing the binding is how the captain turns semantic integration off,
+        # and the pins it produced stay where they are. A run already in the store
+        # writes nothing, so there is nothing left to hold against the binding - and
+        # refusing here would make a command SIANA runs on every wake red forever
+        # over a run that was recorded correctly while the binding still stood.
+        self.ready_to_record()
+        self.assertAccepted(self.sem("reconcile"))
+        self.assertAccepted(self.run_cmd(
+            ["datafile", "-f", self.at("semantic.jsonl"),
+             "-c", self.at("schema-semantic.yaml"), "delete", "proj"]))
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertIn("1 already", out)
+        self.assertNotIn("BROKEN", out)
+        self.assertEqual(len(self.calls("trace record")), 1)
+
+    def test_a_binding_repointed_after_a_run_was_recorded_is_not_a_fault(self):
+        self.ready_to_record()
+        self.assertAccepted(self.sem("reconcile"))
+        self.bound(store=self.at("somewhere-else.sqlite3"))
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertIn("1 already", out)
+        self.assertEqual(len(self.calls("trace record")), 1)
+
     def test_a_binding_the_captain_has_repointed_stops_the_recording(self):
         self.ready_to_record()
         self.bound(store=self.at("somewhere-else.sqlite3"))

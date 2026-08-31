@@ -1194,24 +1194,6 @@ def reconcile_one(home, name, tasks):
         # runs on every wake.
         return "lost", "reset before anything was recorded"
 
-    # The binding as it is now, not only as the pin remembers it. Everything a
-    # recording writes to comes out of that record - the store it lands in, the
-    # agent it is attributed to, the pack it is filed under - so a binding the
-    # captain has repointed or removed is one this must not go on writing against.
-    # Refusing keeps the pin and says so on every run, which is what makes it a
-    # thing somebody can decide about rather than a trace nobody asked for.
-    current = binding_for(home, pin["project"])
-    if current is None:
-        die(f"{pin['project']} has no semantic binding any more, and {task_id} was "
-            f"pinned under one",
-            "nothing here records against a binding the captain has removed",
-            "restore it to record this run, or move the pin aside to drop it")
-    if not same_binding(pin["binding"], current):
-        die(f"the semantic binding for {pin['project']} has moved since {task_id} "
-            f"was pinned",
-            "a run recorded now would go to the store, the agent and the pack the",
-            "binding names today, and this task was never briefed from any of them")
-
     doc = run_document(pin, task, started)
     body = document(doc)
     if already is not None:
@@ -1226,6 +1208,30 @@ def reconcile_one(home, name, tasks):
                 "one trace id cannot hold two runs, so this is left as it is and",
                 "reported every time until somebody decides which is true")
         return "already", already["trace_id"]
+
+    # The binding as it is now, not only as the pin remembers it. Everything a
+    # recording writes to comes out of that record - the store it lands in, the
+    # agent it is attributed to, the pack it is filed under - so a binding the
+    # captain has repointed or removed is one this must not go on writing against.
+    # Refusing keeps the pin and says so on every run, which is what makes it a
+    # thing somebody can decide about rather than a trace nobody asked for.
+    #
+    # Asked here, immediately before the write, and not one line earlier. A run
+    # already in the store writes nothing, so a binding removed afterwards - which
+    # is how the captain turns semantic integration off - would otherwise make this
+    # command red forever, on a path SIANA runs on every wake, over a run that was
+    # recorded correctly while the binding still stood.
+    current = binding_for(home, pin["project"])
+    if current is None:
+        die(f"{pin['project']} has no semantic binding any more, and {task_id} was "
+            f"pinned under one",
+            "nothing here records against a binding the captain has removed",
+            "restore it to record this run, or move the pin aside to drop it")
+    if not same_binding(pin["binding"], current):
+        die(f"the semantic binding for {pin['project']} has moved since {task_id} "
+            f"was pinned",
+            "a run recorded now would go to the store, the agent and the pack the",
+            "binding names today, and this task was never briefed from any of them")
 
     result = record_run(home, name, pin, doc)
     expired = expire(store_path(pin["binding"]), doc["run"]["ended_at"])
