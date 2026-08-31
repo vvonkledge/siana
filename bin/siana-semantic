@@ -461,23 +461,36 @@ def export(directory, binding, as_of):
         die(f"the pack is about target {pack['target']!r}, and the binding expects "
             f"{binding['target']!r}")
 
-    observed = moment("the pack observed_at", pack["observed_at"])
-    fresh_until = moment("the pack fresh_until", pack["fresh_until"])
-    asked = moment("the export as_of", as_of)
-    # Staleness is the provider's refusal and this is the second opinion, held for
-    # the same reason the expectations are: the freshness window is in the answer,
-    # so a provider that returned one it had not honoured says so in its own words.
-    if not observed <= asked <= fresh_until:
-        die(f"the pack was observed at {pack['observed_at']} and is fresh until "
-            f"{pack['fresh_until']}, and this asked as of {as_of}",
-            "a pack outside its own freshness window is not one to brief a minion",
-            "from; refresh it in the provider before dispatching again")
+    fresh_at(pack, as_of)
 
     content = half("content", result["content"], pack["content_digest"],
                    pack["content_bytes"])
     manifest = half("manifest", result["manifest"], pack["manifest_digest"],
                     pack["manifest_bytes"])
     return pack, content, manifest
+
+
+def fresh_at(pack, as_of):
+    """A pack inside its own freshness window at the instant being asked about.
+
+    Staleness is the provider's refusal and this is the second opinion, held for the
+    same reason the expectations are: the window is in the answer, so a provider that
+    returned one it had not honoured says so in its own words.
+
+    It is also the check a reused pin has to pass. A pin outlives the dispatch that
+    wrote it - that is the whole point of reusing one - and a pack that was fresh
+    when it was written can be a day stale by the time the task is dispatched again.
+    A minion briefed from that is briefed from a description of a world that has
+    moved, which is exactly what the window exists to prevent.
+    """
+    observed = moment("the pack observed_at", pack["observed_at"])
+    fresh_until = moment("the pack fresh_until", pack["fresh_until"])
+    asked = moment("the instant asked about", as_of)
+    if not observed <= asked <= fresh_until:
+        die(f"the pack was observed at {pack['observed_at']} and is fresh until "
+            f"{pack['fresh_until']}, and this asked as of {as_of}",
+            "a pack outside its own freshness window is not one to brief a minion",
+            "from; refresh it in the provider before dispatching again")
 
 
 def half(name, doc, digest, size):
@@ -519,7 +532,7 @@ def pin_path(home, task_id):
 
 
 PIN_FIELDS = {"task", "project", "binding", "pack_directory", "as_of",
-              "started_at", "response_version", "trace_id", "span_id", "pack"}
+              "response_version", "trace_id", "span_id", "pack"}
 
 
 def read_pin(home, task_id):
@@ -544,7 +557,6 @@ def read_pin(home, task_id):
     matching(f"the trace id in {path}", HEX32, pin["trace_id"])
     matching(f"the span id in {path}", HEX16, pin["span_id"])
     matching(f"the instant in {path}", INSTANT, pin["as_of"])
-    matching(f"the start in {path}", INSTANT, pin["started_at"])
     if pin["response_version"] != RESPONSE_VERSION:
         die(f"the pin at {path} was written against response version "
             f"{pin['response_version']!r}, and this consumer reads "
@@ -711,6 +723,11 @@ def cmd_pin(args, home):
                 f"the pin is at {pin_path(home, args.task_id)}",
                 "a pin is the bytes a minion was briefed from, so it is never",
                 "rewritten; move it aside if this task is being dispatched afresh")
+        # Held to the window at the instant it is being reused at, not the one it
+        # was written at. The pack it holds was fresh when the first dispatch
+        # refused, and a pack is fresh for about a day: reusing it later brief a
+        # minion from a description of a world that has moved on.
+        fresh_at(existing["pack"], as_of)
         record, reused = existing, True
     else:
         directory = pack_directory(home, binding)
@@ -724,10 +741,6 @@ def cmd_pin(args, home):
             # and never handed to the minion. The pinned copy is what is read.
             "pack_directory": directory,
             "as_of": as_of,
-            # The run starts when its context was fixed. A second clock read here
-            # would put the start of the run a moment either side of the instant
-            # that names what it was started with, for nothing.
-            "started_at": as_of,
             "response_version": RESPONSE_VERSION,
             # Fresh and random, minted once and never again for this task. The layer
             # keys a run by its trace id, so two dispatches minting two ids would be
@@ -767,25 +780,46 @@ def dispatched_marker(home, task_id):
 
 
 def cmd_dispatched(args, home):
-    """Mark a pin whose task was really claimed.
+    """Mark a pin whose task was really claimed, at the instant it was claimed.
 
     A dispatch that refused between pinning and claiming leaves a pin no minion ever
     worked against. Recording a run for one would be writing down an execution that
     did not happen, and the queue cannot tell the difference: the task is back in
-    `todo` either way, and nothing in it remembers having been claimed once."""
+    `todo` either way, and nothing in it remembers having been claimed once.
+
+    The instant is the run's start, and this is the only place that knows it. The
+    pin is written before the claim and may be reused by a later dispatch, so the
+    instant it was written at is when the context was fixed and not when any minion
+    began: reading a start off it would date an hour-old run to yesterday's
+    abandoned attempt. Rewritten on each claim for the same reason - the run being
+    recorded is the one that is actually running."""
     if read_pin(home, args.task_id) is None:
         die(f"{args.task_id} has no pin to mark",
             f"nothing is at {pin_path(home, args.task_id)}")
-    durable(dispatched_marker(home, args.task_id), (stamp() + "\n").encode())
+    at = args.at or stamp()
+    matching("--at", INSTANT, at)
+    durable(dispatched_marker(home, args.task_id), (at + "\n").encode())
     flush(pin_path(home, args.task_id))
     return 0
+
+
+def dispatched_at(home, task_id):
+    """When this pin's task was claimed, or None when it never was."""
+    try:
+        with open(dispatched_marker(home, task_id)) as fh:
+            when = fh.read().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        die(f"the claim marker for {task_id} cannot be read: {e}")
+    return matching(f"the claim instant for {task_id}", INSTANT, when)
 
 
 # --------------------------------------------------------------------------- #
 # reconcile
 # --------------------------------------------------------------------------- #
 
-def run_document(pin, task):
+def run_document(pin, task, started):
     """The closed run, and the whole of what is ever recorded about a fleet task.
 
     One span, saying that a task ran and how it came out. There is no field here for
@@ -794,13 +828,14 @@ def run_document(pin, task):
     document is built from this function and nothing else reaches it.
 
     Deterministic in every part, because a replay has to be byte-identical: the ids
-    come from the pin, the instants come from the pin and the queue, and the outcome
-    is a lookup."""
+    come from the pin, the start from the claim marker, the end from the queue, and
+    the outcome is a lookup."""
     status = task["status"]
     ended = queue_instant(task)
-    started = pin["started_at"]
+    # Both are fixed-width in the one spelling this boundary takes, so comparing
+    # them as text is comparing them as instants.
     if ended < started:
-        die(f"{pin['task']} ended at {ended} and its pin starts at {started}",
+        die(f"{pin['task']} ended at {ended} and was claimed at {started}",
             "a run cannot end before it began, so one of the two is not about this",
             "task; nothing is recorded until they agree")
     run = {
@@ -968,7 +1003,8 @@ def reconcile_one(home, task_id, tasks):
     if pin is None:
         die(f"{pin_path(home, task_id)} is not a pin",
             "it holds no pin.json, so nothing here knows what it was for")
-    if not os.path.exists(dispatched_marker(home, task_id)):
+    started = dispatched_at(home, task_id)
+    if started is None:
         # Pinned and never claimed. The task may well be terminal - it can be
         # dispatched again later, or blocked by hand - and recording a run for it
         # would be an execution nobody ever performed.
@@ -982,7 +1018,25 @@ def reconcile_one(home, task_id, tasks):
     if task.get("status") not in OUTCOMES:
         return "waiting", str(task.get("status"))
 
-    doc = run_document(pin, task)
+    # The binding as it is now, not only as the pin remembers it. Everything a
+    # recording writes to comes out of that record - the store it lands in, the
+    # agent it is attributed to, the pack it is filed under - so a binding the
+    # captain has repointed or removed is one this must not go on writing against.
+    # Refusing keeps the pin and says so on every run, which is what makes it a
+    # thing somebody can decide about rather than a trace nobody asked for.
+    current = binding_for(home, pin["project"])
+    if current is None:
+        die(f"{pin['project']} has no semantic binding any more, and {task_id} was "
+            f"pinned under one",
+            "nothing here records against a binding the captain has removed",
+            "restore it to record this run, or move the pin aside to drop it")
+    if not same_binding(pin["binding"], current):
+        die(f"the semantic binding for {pin['project']} has moved since {task_id} "
+            f"was pinned",
+            "a run recorded now would go to the store, the agent and the pack the",
+            "binding names today, and this task was never briefed from any of them")
+
+    doc = run_document(pin, task, started)
     body = document(doc)
     already = read_recorded(home, task_id)
     if already is not None:
@@ -1043,12 +1097,18 @@ def cmd_status(args, home):
     reported is what can be read: whether a binding still resolves, and whether the
     pins it produced have been recorded."""
     bound = bindings(home)
-    if not bound:
-        print("semantic  disabled (no bindings)")
-        return 0
-
     stale = 0
-    print(f"semantic  {len(bound)} bound")
+    pins = pinned_tasks(home)
+    if not bound:
+        # Disabled, and the pins are still reported. A home that has just had its
+        # last binding removed still holds the pins that binding produced, and going
+        # quiet about them here while `reconcile` still had something to say about
+        # them would be two commands disagreeing about the same directory.
+        print("semantic  disabled (no bindings)")
+        if not pins:
+            return 0
+    else:
+        print(f"semantic  {len(bound)} bound")
     for project in sorted(bound):
         try:
             binding = binding_for(home, project)
@@ -1074,7 +1134,7 @@ def cmd_status(args, home):
 
     # The provider itself, once. It is one fact about this machine and says nothing
     # about any one binding, so repeating it per project would read as many faults.
-    if shutil.which(COMMAND) is None:
+    if bound and shutil.which(COMMAND) is None:
         print(f"  missing {COMMAND} is not on PATH, so nothing can be pinned or "
               f"recorded")
         stale += 1
@@ -1082,7 +1142,6 @@ def cmd_status(args, home):
     tasks_file = os.environ.get("SIANA_TASKS_FILE") or os.path.join(
         home, "tasks.jsonl")
     tasks = fold(tasks_file, "id")
-    pins = pinned_tasks(home)
     waiting = []
     for task_id in pins:
         if not os.path.exists(dispatched_marker(home, task_id)):
@@ -1119,6 +1178,9 @@ def build_parser():
 
     p = sub.add_parser("dispatched", help="mark a pin whose task was claimed")
     p.add_argument("task_id")
+    p.add_argument("--at", metavar="INSTANT",
+                   help="when the claim landed, as YYYY-MM-DDTHH:MM:SSZ; the clock "
+                        "by default. It is the run's start")
     p.set_defaults(run=cmd_dispatched)
 
     p = sub.add_parser("reconcile", help="record every pinned task the queue "

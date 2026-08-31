@@ -217,8 +217,11 @@ class SemanticTest(HomeTest):
         with open(self.at("semantic", task_id or self.TASK, "pin.json")) as fh:
             return json.load(fh)
 
-    def dispatched(self, task_id=None):
-        return self.assertAccepted(self.sem("dispatched", task_id or self.TASK))
+    CLAIMED = "2026-08-30T09:05:00Z"
+
+    def dispatched(self, task_id=None, at=None):
+        return self.assertAccepted(self.sem("dispatched", task_id or self.TASK,
+                                            "--at", at or self.CLAIMED))
 
     def terminal(self, task_id=None, status="done"):
         """The task, carried to a terminal state through the real queue."""
@@ -386,8 +389,11 @@ class Pinning(SemanticTest):
         pin = self.pinned()
         self.assertEqual(pin["pack"]["identity"], self.pack_block()["identity"])
         self.assertEqual(pin["as_of"], self.AS_OF)
-        self.assertEqual(pin["started_at"], self.AS_OF)
         self.assertEqual(pin["response_version"], 1)
+        # No start. A pin is written before the claim and can be reused by a later
+        # dispatch, so the instant it was written at is when the context was fixed
+        # and never when a minion began.
+        self.assertNotIn("started_at", pin)
         self.assertRegex(pin["trace_id"], r"^[0-9a-f]{32}$")
         self.assertRegex(pin["span_id"], r"^[0-9a-f]{16}$")
         self.assertEqual(pin["binding"]["agent"], self.AGENT)
@@ -409,6 +415,24 @@ class Pinning(SemanticTest):
         self.assertAccepted(self.pin())
         self.bound(target="somebody/else")
         self.assertRefused(self.pin(), "different binding")
+
+    def test_a_pin_is_never_reused_once_its_pack_has_gone_stale(self):
+        # A dispatch that pinned and then refused leaves a pin behind, and a pack is
+        # fresh for about a day. Reusing it later would brief a minion from a
+        # description of a world that has moved on, and nothing downstream would
+        # ever say so: the pack still verifies against the instant it was pinned at.
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.assertRefused(self.pin(as_of="2026-09-02T09:00:12Z"),
+                           "freshness window")
+        # And nothing was exported a second time to find that out.
+        self.assertEqual(len(self.calls("pack export")), 1)
+
+    def test_a_pin_reused_inside_the_window_is_still_reused(self):
+        self.exporting()
+        self.assertAccepted(self.pin())
+        out = self.assertAccepted(self.pin(as_of="2026-08-30T18:00:00Z"))
+        self.assertTrue(json.loads(out)["reused"])
 
     def test_a_task_with_no_project_cannot_have_a_binding(self):
         self.task("unowned", project=None)
@@ -739,6 +763,40 @@ class Reconciling(SemanticTest):
         self.assertIn("1 not terminal yet", out)
         self.assertEqual(self.calls("trace record"), [])
 
+    def test_the_run_starts_when_the_claim_landed_and_not_when_the_pack_verified(self):
+        # A pin is written before the claim and may be reused by a dispatch a day
+        # later, so its own instant dates the context and never the run. Reading a
+        # start off it would file an hour-long run as having taken a day.
+        self.ready_to_record()
+        self.assertAccepted(self.sem("reconcile"))
+        run = self.sent_run()["run"]
+        self.assertEqual(run["started_at"], self.CLAIMED)
+        self.assertEqual(run["spans"][0]["started_at"], self.CLAIMED)
+        self.assertNotEqual(run["started_at"], self.AS_OF)
+
+    def test_a_binding_the_captain_has_removed_stops_the_recording(self):
+        # Everything a recording writes to comes out of the binding: the store it
+        # lands in, the agent it is attributed to, the pack it is filed under. A
+        # binding that is gone is not one to go on writing against, and the pin
+        # stays so somebody can decide what it was for.
+        self.ready_to_record()
+        self.assertAccepted(self.run_cmd(
+            ["datafile", "-f", self.at("semantic.jsonl"),
+             "-c", self.at("schema-semantic.yaml"), "delete", "proj"]))
+        out = self.sem("reconcile")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no semantic binding any more", out.stdout)
+        self.assertEqual(self.calls("trace record"), [])
+        self.assertTrue(os.path.exists(self.at("semantic", self.TASK, "pin.json")))
+
+    def test_a_binding_the_captain_has_repointed_stops_the_recording(self):
+        self.ready_to_record()
+        self.bound(store=self.at("somewhere-else.sqlite3"))
+        out = self.sem("reconcile")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("has moved since", out.stdout)
+        self.assertEqual(self.calls("trace record"), [])
+
     def test_a_pin_whose_task_left_the_queue_is_kept_and_not_recorded(self):
         self.ready_to_record()
         self.assertAccepted(self.run_cmd(
@@ -880,6 +938,20 @@ class Status(SemanticTest):
         self.assertIn(self.TASK, out.stdout)
         self.assertIn("siana-semantic reconcile", out.stdout)
 
+    def test_pins_are_still_reported_once_the_last_binding_is_gone(self):
+        # The one thing `status` must not do is go quiet about work `reconcile`
+        # still has something to say about. Two commands disagreeing about the same
+        # directory is worse than either answer on its own.
+        self.ready_to_record()
+        self.assertAccepted(self.run_cmd(
+            ["datafile", "-f", self.at("semantic.jsonl"),
+             "-c", self.at("schema-semantic.yaml"), "delete", "proj"]))
+        out = self.sem("status")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("disabled (no bindings)", out.stdout)
+        self.assertIn("terminal and unrecorded", out.stdout)
+        self.assertIn(self.TASK, out.stdout)
+
     def test_it_records_nothing_while_reporting(self):
         # Doctor runs this, so it has to be safe to run at any moment. It reads
         # configuration and pins, and it never asks the layer anything.
@@ -980,13 +1052,13 @@ class Documents(unittest.TestCase):
         with self.assertRaises(s.Refusal):
             s.queue_instant({"id": "x", "updated": "sometime last week"})
 
-    def test_a_run_cannot_end_before_the_pin_that_started_it(self):
-        pin = {"task": "x", "started_at": "2026-08-30T09:00:00Z",
-               "trace_id": "0" * 32, "span_id": "0" * 16,
+    def test_a_run_cannot_end_before_the_claim_that_started_it(self):
+        pin = {"task": "x", "trace_id": "0" * 32, "span_id": "0" * 16,
                "binding": {"agent": "https://x/agent"}}
         with self.assertRaises(s.Refusal):
             s.run_document(pin, {"status": "done",
-                                 "updated": "2026-08-30T08:00:00Z"})
+                                 "updated": "2026-08-30T08:00:00Z"},
+                           "2026-08-30T09:00:00Z")
 
 
 if __name__ == "__main__":
