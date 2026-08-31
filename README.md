@@ -28,7 +28,8 @@ has been run on an operating system other than macOS.
 | ---------- | ---------- | ----------------------------------------------------- |
 | `python3`  | 3.13.13    | every `siana-*` command that is not bash or node      |
 | `bash`     | 5.3.9      | `siana`, `siana-brief`, and the recipes in `justfile` |
-| `node`     | 26.7.0     | `siana-console`; no other command here needs it       |
+| `node`     | 26.7.0     | `siana-console` and its browser app; nothing else     |
+| `npm`      | 11.19.0    | `just build`, which builds that app; nothing else      |
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
 | `datafile` | 0.1.1      | every record store: queue, registry, obligations      |
@@ -37,7 +38,8 @@ has been run on an operating system other than macOS.
 | `herdr`    | 0.8.0      | the session manager minions are started in            |
 | `claude`   | 2.1.231    | the harness minions run in, and the other of the two  |
 
-Verified on macOS 26.6.2 (Darwin 25.6) on 2026-08-28.
+Verified on macOS 26.6.2 (Darwin 25.6) on 2026-08-28, except `npm`, which was
+verified on 2026-08-31.
 
 `datafile` and `tasks` are checkouts you install yourself:
 
@@ -594,11 +596,31 @@ what you wanted.
 `~/.siana/review.md` is what that reviewer is told. It is yours to edit, like every
 other instruction file in the home.
 
+## Build the browser console
+
+    just build
+
+`npm ci` and then a production build, into `console/dist/`, which is what
+`siana-console` serves and what the suite tests. Run it after a fresh clone, and after
+a `git pull` that changed anything under `console/`. `just test` runs it first, so an
+ordinary check builds what it is about to test.
+
+Neither the installed packages nor the build output is committed.
+`console/package-lock.json` is what makes the install reproducible, and the same
+source builds to the same bytes twice, which is what makes "the suite tested what is
+served" mean anything. Without a build, the console still serves its API and says on
+startup that it has no application to serve; `just doctor` reports the same thing.
+
+Without `npm`, `just build` says so and does nothing, and the frontend half of the
+suite skips itself. Nothing else here needs one.
+
 ## Validate a change to the distro
 
     just test
 
-Standard-library `unittest`, no dependencies to install. It drives the pure
+Standard-library `unittest` for the distro itself, no dependencies to install. It
+builds the browser console first and then drives that application's own tests, which
+run on node against the built bundle. It drives the pure
 mechanics in-process and drives the commands as real processes against a real
 `tasks` and `datafile`, into throwaway homes, because a stubbed store would only
 ever agree with the suite. Unittest arguments pass through, so `just test -v` is
@@ -803,18 +825,24 @@ anything is built on top of it: a `datafile` read may rewrite the `.idx` cache
 beside a store. That write is atomic and it is a cache. No authoritative record is
 ever changed.
 
-## Read the fleet over loopback HTTP
+## Read the fleet from a browser
 
     SIANA_CONSOLE_PORT=8787 siana-console
 
+Then open `http://127.0.0.1:8787/` on this machine, or add it to a phone's home
+screen over the same loopback address.
+
 `siana-read` answers one question and exits, which a phone cannot run. This is the
-smallest process that puts those same documents on a socket, and it is the whole of
-what it does. You start it yourself, and you stop it with Ctrl-C or `kill`. Nothing
-in the fleet starts it, nothing in the fleet depends on it, and stopping it leaves
-SIANA, the watcher, every minion and every store exactly as they were.
+smallest process that puts those same documents on a socket, and serves the
+application that reads them. You start it yourself, and you stop it with Ctrl-C or
+`kill`. Nothing in the fleet starts it, nothing in the fleet depends on it, and
+stopping it leaves SIANA, the watcher, every minion and every store exactly as they
+were.
 
 It is the one command here that runs on `node`, so `just doctor` reports whether
-there is one to run it on.
+there is one to run it on. The application it serves is built rather than committed,
+so `just doctor` reports that too, and the console says on startup when there is
+nothing to serve.
 
 Read what it is before you run it:
 
@@ -832,10 +860,24 @@ Read what it is before you run it:
 `SIANA_CONSOLE_PORT` has no default, and the console refuses to start without it. A
 port every machine used would be a port something else is one day holding.
 
-It serves two routes and refuses everything else, every other method included:
+It serves these and refuses everything else, every other method included:
 
-    GET /api/state?rev=<opaque>    every source, in one document
+    GET /                         the application
+    GET /manifest.webmanifest     what makes it installable
+    GET /sw.js                    the offline shell
+    GET /assets/<built>           the one script and the one stylesheet
+    GET /icons/<built>            the app icons
+    GET /api/state?rev=<opaque>   every source, in one document
     GET /api/stream               server-sent events announcing a new revision
+
+That list is the whole route table. Nothing turns a request into a filesystem path:
+the bundle is read once at startup into memory, every file in it has to be one this
+command knows, and a request is a lookup in that table or a refusal. A build that
+emitted something else is refused whole rather than half served, and the console says
+which file it did not recognise.
+
+Every screen of the application is a fragment of `/`, so there is no fallback route
+under it. `/task/<id>` is a 404; `/#/task/<id>` is a screen.
 
 `/api/state` runs all six `siana-read` commands and returns what each of them said:
 the whole document, its exit code, and when it was asked. Nothing is folded, and no
@@ -852,6 +894,34 @@ untouched stores hands back the revision you already have.
 It carries no state and no event id: there is nothing to replay, a reconnecting
 client is told the current revision, and `/api/state` is complete on its own when
 the stream is disconnected.
+
+### What the application shows, and what it will not do
+
+Four panels, in the order a captain needs them. **Needs you** is open decisions and
+blocked tasks, and it says out loud when it is empty. **In flight** is what is being
+worked on, with what herdr says each minion is doing beside it. **Ready** is unstarted
+work whose dependencies are met. **Coverage** is whether anyone is at the helm, as
+evidence with an age on it rather than as a green tick. Under those are the registry,
+one project, one task, what is owed, and the decision log.
+
+A source that could not be read is shown as one. `siana-read` refuses an unreadable
+store rather than answering an empty one, and the application keeps that distinction:
+a red panel says what went wrong and shows nothing, instead of an empty list that
+reads as a fleet with nothing in it. A corrupt store shows its bad lines beside the
+records that were readable. An unreachable herdr is "minion unknown" and never "no
+minions".
+
+A bar across the top says `connected`, `polling`, `reconnecting` or `offline`, with
+the age of the last successful read, and turns loud when what is on screen stops
+being current. Installed, it opens offline: a service worker holds the application
+shell and the last `/api/state` it saw, and a snapshot served from there is banded as
+a saved copy rather than shown as live.
+
+**It only reads.** There is no button anywhere in it, online or offline, because
+there is nothing behind one: this console cannot answer a decision, unblock a task or
+send SIANA a message. Answering any of that is done at the helm. Every asset it
+serves is local - no CDN, no remote font, no remote script, no analytics - and the
+build refuses to emit a byte naming an origin that is not this console.
 
 One console runs per home. It claims `$SIANA_HOME/inbox/console` before it binds,
 recording the pid, the `ps` command and the port it owns, and a second one refuses
@@ -874,6 +944,8 @@ deleted. Your home is left alone, queue and all. Delete it by hand when you mean
 
     bin/        the commands. Mechanics only: they stop and report when the
                 world surprises them, and never adjudicate meaning.
+    console/    the browser application `siana-console` serves: React and
+                Tailwind, built by `just build` into console/dist/.
     template/   what an install copies into the home: SIANA's instructions, the
                 standing orders every minion is started with, the brief and
                 handoff templates, and the store contracts.

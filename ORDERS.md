@@ -1,9 +1,10 @@
 # Project orders: siana
 
 This project is SIANA's own distro: deterministic scripts, the instruction files an
-agent reads, and the justfile that installs them. There is no application here. Every
-change you make is either mechanics a script owns or judgment an instruction shapes,
-and the line between those two is the project's whole design.
+agent reads, the justfile that installs them, and one browser application that reads
+the fleet and cannot act on it. Every change you make is either mechanics a script
+owns or judgment an instruction shapes, and the line between those two is the
+project's whole design.
 
 ## What is where
 
@@ -13,7 +14,17 @@ and the line between those two is the project's whole design.
   instructions, the minion orders you are reading a copy of, the brief and handoff
   templates, and the store contracts. Changing one changes what every future SIANA
   and every future minion is told.
-- `tests/` is the suite. Standard-library `unittest`, no dependencies.
+- `console/` is the browser application `bin/siana-console` serves: React and
+  Tailwind, built by `just build` into `console/dist/`, which is not committed. It is
+  the only npm dependency tree in this repository and the only place one may live.
+  Three rules hold there. Every asset is local - no CDN, no remote font, no remote
+  script, no analytics - and the build refuses to emit a byte naming an origin that
+  is not the console. The lockfile is committed and every dependency is pinned to an
+  exact version. And the application reads: it has no button, no form and no write
+  request, because there is nothing behind one.
+- `tests/` is the suite. Standard-library `unittest`, no dependencies. The frontend
+  has its own, in `console/test/`, driven from `tests/test_app.py` so that
+  `just test` stays the one thing that has to be green.
 - `VISION.md` says what the fleet is for. Read it before you argue with a design
   choice in here, because most of them are downstream of it.
 - `README.md` is the captain's install and operating guide. A change to what `init`
@@ -29,6 +40,11 @@ this file is how you drive it. The first thing a run of it executes is the suite
 It drives the pure mechanics in-process and drives the commands as real processes
 against a real `tasks` and `datafile`, because a stubbed store would only ever
 agree with the suite.
+
+It builds the browser application first (`just build`), so what the frontend tests
+run against is what `siana-console` serves rather than a development server nobody
+ships. Without `npm` that build says so and does nothing, and the frontend half of
+the suite skips itself.
 
 That makes it latency-bound rather than CPU-bound - it spent 0.75 of one core for
 the whole of a ten-minute serial run - so `tests/run.py` runs it across a pool of
