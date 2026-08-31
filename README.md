@@ -829,12 +829,19 @@ ever changed.
 
     SIANA_CONSOLE_PORT=8787 siana-console
 
-Then open `http://127.0.0.1:8787/` on this machine, or add it to a phone's home
-screen over the same loopback address. **That exact address, and not `localhost`:**
-the console answers to the name it binds and refuses every other one, for the reason
-below.
+Then open `http://127.0.0.1:8787/` in a browser **on this machine**. That exact
+address and not `localhost`: the console answers to the name it binds and refuses
+every other one, for the reason below.
 
-`siana-read` answers one question and exits, which a phone cannot run. This is the
+Nothing else can reach it yet, a phone included. The listener is loopback-only, there
+is no tunnel here and no way to ask for one, so `127.0.0.1` on another device is that
+device's own loopback and reaches nothing. What the application is today is a console
+shaped for a phone - one thumb-reachable column, installable to a home screen, and
+readable with its shell cached offline - waiting on the exposure that is not in this
+distro. Install it from a browser on this machine if you want the standalone window;
+it is the same application either way.
+
+`siana-read` answers one question and exits, which no browser can run. This is the
 smallest process that puts those same documents on a socket, and serves the
 application that reads them. You start it yourself, and you stop it with Ctrl-C or
 `kill`. Nothing in the fleet starts it, nothing in the fleet depends on it, and
