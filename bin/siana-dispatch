@@ -53,6 +53,7 @@ import socket
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 
 # Only claude is verified end to end (2026-08-26, herdr 0.8.0, protocol 19). Other
 # kinds are refused rather than guessed: a wrong flag here starts an agent that
@@ -316,6 +317,14 @@ def resolve(projects: dict, handle: str, store: str):
 # and `siana-fact status` is what reports every record failing it at once.
 FACT_KINDS = {"url": ("value",), "text": ("value",), "credential": ("account",)}
 
+# What a `url` fact's value has to be, and the same answer `siana-fact` gives. The
+# contract bounds the value and forbids a control character in it and can say
+# nothing about a scheme, so a record written around `siana-fact` reaches here with
+# whatever it likes. Two readers that disagreed about one record would be worse than
+# either rule alone: `siana-fact status` would call it broken while a dispatch
+# handed it over as somewhere to go.
+URL_SCHEME = "https"
+
 # The two names `siana-fact exec` puts into the authorised child, repeated here
 # because this is where a minion reads them. It is told rather than left to
 # discover: a name a minion has to guess is one it gets wrong, and the failure
@@ -383,6 +392,14 @@ def check_fact(fact: dict, handle: str, store: str) -> None:
             f"it was read as one of {handle}'s, and a fact whose own record",
             "disagrees about which project it is in is one nothing may hand to a",
             "minion working in either")
+    if kind == "url":
+        parsed = urlparse(str(fact.get("value")))
+        if parsed.scheme != URL_SCHEME or not parsed.netloc:
+            die(f"{store} records {rid} with a value that is not an "
+                f"{URL_SCHEME} URL",
+                "a minion is handed this as somewhere to go, and anything on the",
+                f"path can rewrite somewhere that is not {URL_SCHEME}",
+                "run `siana-fact status` to see every record in this state")
     if any(ch < " " or ch == "\x7f" for ch in str(fact.get("value") or "")
            + str(fact.get("account") or "") + str(fact.get("note") or "")):
         die(f"{store} records {rid} with a control character in it",
@@ -444,6 +461,13 @@ def facts_section(home: str, handle: str, task_id: str) -> str:
                 "the fact was dropped and the grant was not, so what this minion",
                 "was authorised to use no longer exists",
                 f"withdraw it: siana-fact revoke {task_id} {grant.get('fact')}")
+        # The grant said this project and the fact is reached through the grant, so
+        # a record whose two halves disagree would otherwise arrive here unchecked:
+        # `mine` above only ever held facts already in this project, so nothing has
+        # looked at this one. That is the cross-project delivery this whole section
+        # exists to make impossible, and it is also what turns a credential with no
+        # account into a KeyError below rather than into a refusal.
+        check_fact(fact, handle, store)
         if fact.get("kind") != "credential":
             die(f"{task_id} is granted {grant.get('fact')}, which is a "
                 f"{fact.get('kind')} fact",

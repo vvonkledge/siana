@@ -246,6 +246,34 @@ class Refusals(Section):
         self.assertIn("for project 'elsewhere', and works in demo", said)
         self.assertIn("siana-fact revoke ship-it demo/test-user", said)
 
+    def test_a_url_whose_scheme_was_never_https(self):
+        # The contract bounds the value and can say nothing about a scheme, so a
+        # record written around `siana-fact` reaches here with whatever it likes.
+        # `siana-fact status` calls it broken, and a dispatch that handed it over
+        # would be the second reader disagreeing with the first about one record.
+        self.store("facts.jsonl", url("staging", "http://staging.example.test"))
+        self.assertIn("not an https URL", self.refusal())
+
+    def test_a_grant_whose_fact_belongs_to_another_project(self):
+        # The two halves of the grant disagree: its `project` is this task's, and
+        # its `fact` points somewhere else. Reached only through the grant, so
+        # nothing else here has looked at that fact, and delivering it would put
+        # another project's credential into this minion's orders.
+        self.store("facts.jsonl", dict(CREDENTIAL, id="other/test-user",
+                                       project="other"))
+        self.store("grants.jsonl", grant("ship-it", fact="other/test-user"))
+        self.assertIn("as belonging to 'other'", self.refusal())
+
+    def test_a_cross_project_credential_with_no_account_refuses_rather_than_raising(self):
+        # `account` is optional in the contract, and the section builder indexes it.
+        # Unchecked, this record left siana-dispatch as a KeyError instead of as a
+        # refusal anybody could act on.
+        record = dict(CREDENTIAL, id="other/test-user", project="other")
+        record.pop("account")
+        self.store("facts.jsonl", record)
+        self.store("grants.jsonl", grant("ship-it", fact="other/test-user"))
+        self.assertIn("with no account", self.refusal())
+
     def test_a_grant_naming_a_fact_that_has_been_dropped(self):
         self.store("grants.jsonl", grant("ship-it"))
         self.assertIn("which is not in", self.refusal())
