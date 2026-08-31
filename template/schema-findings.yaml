@@ -196,7 +196,17 @@ fields:
     default: []
     description: >-
       the fields that applied here and could not be established. A field that is
-      null and is not named here does not apply; one that is null and is named here
-      is a hole this fleet knows about. `siana-findings` refuses a name that is not
-      a field of this contract and refuses naming a field that is non-null, so no
-      sentinel value ever has to be invented to fill a gap
+      null and is not named here does not apply - a review of a document rejects no
+      branch; one that is null and is named here is a hole this fleet knows about.
+      So no sentinel value ever has to be invented to fill a gap.
+
+
+      Entries take two forms. A bare field name, `head`, says that field applied and
+      was not established, and `siana-findings` refuses it unless that field really
+      is null. A qualified name, `evidence:rejected-handoff`, says one member of a
+      list field is missing and says nothing about the rest of the list, so it is
+      accepted against a list that holds other entries: it is how a partly-lost
+      evidence set is recorded, which is the case where a rejected document was
+      overwritten before it could be archived. Both forms are refused if the part
+      before the colon is not a field of this contract, and a qualified form is
+      refused unless that field is a list
