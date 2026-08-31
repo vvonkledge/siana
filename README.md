@@ -525,18 +525,31 @@ core for its whole length, with the rest of the machine idle. So `tests/run.py`
 hands whole test classes to a pool of worker processes, and the first line of a run
 says how many workers it got.
 
-Measured on an eleven-core M3 Pro at `6906b6a`, 912 tests, interleaving the two
-modes on a machine whose load average moved between 14 and 26 throughout:
+Measured by an independent reviewer at `0773dde`, the commit this section sits on
+top of, on an eleven-core M3 Pro: 912 tests, four runs green, one warm worktree,
+no cache cleared and no two of them overlapping.
 
-    one worker      1115s,          0.64 cores, 153 MB
-    five workers    199s to 551s,   3.3 cores,  160 MB, median 296s
+    one worker (control)    635.3s    461.4s CPU    0.73 cores    168 MB
+    pool, default (5)       240.6s    763.3s CPU    3.17 cores    168 MB
+    pool, shuffled          231.6s    737.1s CPU    3.18 cores    167 MB
+    pool, buffered (-b)     192.3s    668.0s CPU    3.47 cores    168 MB
 
-That is a 73% cut against the median. Read every column as a range: the pool's
-three runs here span 199s to 551s with no change but what else the machine was
-doing, and across this work the one-worker control has measured anywhere from 703s
-to 1115s. This machine's own variation is larger than most of what could be
-measured against it. Expect three to nine minutes from the pool and twelve to
-nineteen from one worker, and re-measure rather than trusting a single number.
+The median pool run against that control is a 63.5% cut: 635.3s to 231.6s, ten and
+a half minutes to under four. That is the figure to quote, because it is the only
+like-for-like one here - same head, same machine, same warm caches - and it errs
+low rather than high. Load was not sampled at every start; what was observed put
+the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6.6
+rising to 15.7 during a pool run, with another agent running this same suite on the
+box for part of the window.
+
+So on a quiet machine expect about four minutes from the pool and about eleven from
+one worker. Both stretch under fleet load, and this machine's own variation is
+wider than the gap between any two pool sizes: measured separately by the author of
+the pool at `6906b6a`, interleaving the two modes while the load average moved
+between 14 and 26, one worker took 703s to 1115s and the pool 199s to 551s. Those
+are observations of what load does, not a second speed claim - they are not
+comparable with the four runs above and are not combined with them. Re-measure
+rather than trusting any single number here.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like

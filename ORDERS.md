@@ -39,10 +39,12 @@ the pool out of the picture:
     SIANA_TEST_WORKERS=1 just test
 
 That is `unittest`, serially, in one process, and it is the control every timing
-here is measured against. It is also much the slower of the two now: the runner's
-own tests roughly doubled it, and one worker measures twelve to nineteen minutes
-against the pool's three to nine. Reach for it to answer a question, not to run the
-suite.
+here is measured against. It is much the slower of the two: measured at `0773dde`
+on the captain's machine while it was quiet, one worker ran the 912 tests in
+635.3s against a 231.6s median for the pool. The runner's own tests are a part of
+that cost and not the cause of it - the 56 of them take 48.097s on their own, 7.8%
+on top of the 619s serial run `tests/run.py` records for the base commit. Reach
+for one worker to answer a question, not to run the suite.
 
 Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
 and answers when it answers, so the answers that matter most - herdr slow, wrong, or
