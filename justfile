@@ -265,7 +265,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-console; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -517,6 +517,13 @@ doctor: _contract-drift
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
     done
+    # What `siana-console` runs on, and the only thing here that needs it. Absent is
+    # a console this captain cannot start rather than a fault, and it is said in
+    # those words: reported as `missing` beside `tasks` it would read as a broken
+    # install on every machine that has never wanted a console.
+    p="$(command -v node || true)"
+    if [ -n "$p" ]; then echo "  ok      node -> $p"
+    else echo "  none    node (only siana-console needs it)"; fi
     # What `siana` can start in. A harness needs both the command and the queue
     # integration `init` wrote into this home for it, so they are reported as the
     # one fact they make: a session started with either half missing has no fleet
@@ -644,7 +651,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-console; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

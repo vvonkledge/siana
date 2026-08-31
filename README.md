@@ -26,8 +26,9 @@ has been run on an operating system other than macOS.
 
 | Tool       | Verified   | Why it is needed                                      |
 | ---------- | ---------- | ----------------------------------------------------- |
-| `python3`  | 3.13.13    | every `siana-*` command but `siana` and `siana-brief` |
+| `python3`  | 3.13.13    | every `siana-*` command that is not bash or node      |
 | `bash`     | 5.3.9      | `siana`, `siana-brief`, and the recipes in `justfile` |
+| `node`     | 26.7.0     | `siana-console`; no other command here needs it       |
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
 | `datafile` | 0.1.1      | every record store: queue, registry, obligations      |
@@ -117,8 +118,8 @@ so a contract with no `.jsonl` beside it is an empty store and not a broken inst
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
 `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
-`siana-read`. They are links, so a `git pull` here updates the commands with no
-reinstall. It does not update the home; `just upgrade` does that.
+`siana-read`, `siana-console`. They are links, so a `git pull` here updates the
+commands with no reinstall. It does not update the home; `just upgrade` does that.
 
 ### The queue integration
 
@@ -801,6 +802,65 @@ It is not literally read-only on disk, and it is worth saying so plainly before
 anything is built on top of it: a `datafile` read may rewrite the `.idx` cache
 beside a store. That write is atomic and it is a cache. No authoritative record is
 ever changed.
+
+## Read the fleet over loopback HTTP
+
+    SIANA_CONSOLE_PORT=8787 siana-console
+
+`siana-read` answers one question and exits, which a phone cannot run. This is the
+smallest process that puts those same documents on a socket, and it is the whole of
+what it does. You start it yourself, and you stop it with Ctrl-C or `kill`. Nothing
+in the fleet starts it, nothing in the fleet depends on it, and stopping it leaves
+SIANA, the watcher, every minion and every store exactly as they were.
+
+It is the one command here that runs on `node`, so `just doctor` reports whether
+there is one to run it on.
+
+Read what it is before you run it:
+
+- **Local only.** It binds `127.0.0.1` and there is no flag, variable or fallback
+  that moves it. Nothing else on your network can reach it.
+- **Unauthenticated.** Anything already running on this machine as you can read it.
+  That is the same reach that anything running as you already has over the home
+  itself, so it adds nothing locally and would add everything remotely, which is why
+  the address is not configurable.
+- **Read-only where it matters.** It has no write endpoint. Every request it serves
+  reaches the fleet through `siana-read` and through nothing else, so no request can
+  change an authoritative record. It writes one file of its own: the claim below.
+  `siana-read` and `datafile` disclose the rest, which is a store's `.idx` cache.
+
+`SIANA_CONSOLE_PORT` has no default, and the console refuses to start without it. A
+port every machine used would be a port something else is one day holding.
+
+It serves two routes and refuses everything else, every other method included:
+
+    GET /api/state?rev=<opaque>    every source, in one document
+    GET /api/stream               server-sent events announcing a new revision
+
+`/api/state` runs all six `siana-read` commands and returns what each of them said:
+the whole document, its exit code, and when it was asked. Nothing is folded, and no
+field of a source document is read, because `siana-read`'s refusals do not share one
+shape. A source that could not be read arrives as a source that could not be read,
+so a silent herdr is `state: "unknown"` here exactly as it is there.
+
+`rev` is a cache validator. Pass back the `revision` you last saw and an unchanged
+fleet answers `204` with no body. It is opaque, it changes when any source's answer
+changes, and it is the same for the same answers, so a console restarted against
+untouched stores hands back the revision you already have.
+
+`/api/stream` says a new revision exists so that a client can refetch `/api/state`.
+It carries no state and no event id: there is nothing to replay, a reconnecting
+client is told the current revision, and `/api/state` is complete on its own when
+the stream is disconnected.
+
+One console runs per home. It claims `$SIANA_HOME/inbox/console` before it binds,
+recording the pid, the `ps` command and the port it owns, and a second one refuses
+and names the first. A claim whose process is gone, or whose pid is now something
+else, is taken over and says so. A claim it cannot read, or cannot prove has
+stopped, is refused rather than taken: the console that wrote it may still be
+serving that port. Nothing is ever killed to recover one. Stopping releases the
+claim; a `kill -9` leaves it behind, and the next start proves it stale and takes
+it.
 
 ## Uninstall
 
