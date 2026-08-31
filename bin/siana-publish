@@ -1483,7 +1483,12 @@ def main() -> None:
         # `repair_publish` reads the request as closed and refuses - which is safe,
         # and describes a request that landed as a review thread nobody will read
         # again. The ordinary path asks the same question below.
-        if method:
+        # `not missing`, because this is the first thing on either path that would
+        # reach a client, and `subprocess.run` raises rather than returning nonzero
+        # when the binary is not there. `repair_publish` below is what decides what a
+        # machine with no client gets - a readable dry run, or a refusal naming the
+        # client - and a traceback here would take that decision away from it.
+        if method and not missing:
             kind, merged, _ = one_request(forge, path, repair[1], head)
             if kind == "merged":
                 print(f"already merged: {merged['url']}")

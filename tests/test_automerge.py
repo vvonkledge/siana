@@ -1060,6 +1060,26 @@ class ARepair(Fleet):
         self.assertEqual(self.remote(self.ship_branch), self.accepted,
                          "the repair did not reach the request")
 
+    def test_a_machine_with_no_client_refuses_and_never_traces_back(self):
+        """`subprocess.run` raises when the binary is absent rather than returning
+        nonzero, so the first thing on this path that reaches a client has to be
+        after the check for one. A missing client is a refusal that names it."""
+        out = self.run_bin("siana-publish", f"qa-{self.FIX}",
+                           env={"PATH": self.path_with_no_forge_client(),
+                                "FAKE_FORGE": self.forge})
+        self.assertRefused(out, "gh is not installed")
+        self.assertNotIn("Traceback", out.stdout + out.stderr)
+        self.assertEqual(self.remote(self.ship_branch), self.published)
+
+    def test_a_dry_run_with_no_client_still_describes_the_repair(self):
+        text = self.assertAccepted(self.run_bin(
+            "siana-publish", f"qa-{self.FIX}", "--dry-run",
+            env={"PATH": self.path_with_no_forge_client(),
+                 "FAKE_FORGE": self.forge}))
+        self.assertIn("automerge: squash", text)
+        self.assertIn("not installed here", text)
+        self.assertNotIn("Traceback", text)
+
     def test_a_dry_run_arms_nothing_and_advances_nothing(self):
         text = self.assertAccepted(self.publish("--dry-run"))
         self.assertIn("automerge: squash", text)
