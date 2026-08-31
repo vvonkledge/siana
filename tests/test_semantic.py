@@ -223,6 +223,9 @@ class SemanticTest(HomeTest):
         return self.assertAccepted(self.sem("dispatched", task_id or self.TASK,
                                             "--at", at or self.CLAIMED))
 
+    def released(self, task_id=None):
+        return self.assertAccepted(self.sem("released", task_id or self.TASK))
+
     def terminal(self, task_id=None, status="done"):
         """The task, carried to a terminal state through the real queue."""
         task_id = task_id or self.TASK
@@ -937,6 +940,34 @@ class Reconciling(SemanticTest):
         self.assertEqual(len(self.calls("trace record")), 1)
         self.assertEqual(json.loads(self.calls("trace record")[0]["stdin"])
                          ["run"]["trace_id"], self.pinned()["trace_id"])
+
+    def test_a_mark_taken_back_leaves_nothing_to_report_as_lost(self):
+        # Everything after the queue claim can still refuse, and the dispatch gives
+        # the claim back when it does. `released` takes the mark with it, so the pin
+        # is unclaimed again rather than reading forever as a run whose ending
+        # nobody wrote down.
+        self.bound()
+        self.queued()
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.dispatched()
+        self.released()
+
+        out = self.assertAccepted(self.sem("reconcile"))
+
+        self.assertNotIn("LOST", out)
+        self.assertIn("1 not terminal yet", out)
+        self.assertAccepted(self.sem("status"))
+
+    def test_taking_back_a_mark_that_is_not_there_is_a_no_op(self):
+        # It runs on a path that is already reporting some other failure, so a
+        # refusal thrown from here would reach the captain instead of that one.
+        self.bound()
+        self.queued()
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.released()
+        self.released()
 
     def test_a_run_reset_before_it_was_recorded_is_named_and_never_invented(self):
         # The one loss this cannot prevent, so the one it must never hide. The queue

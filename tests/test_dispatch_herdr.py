@@ -1006,6 +1006,50 @@ class SemanticContext(DispatchTest):
         self.assertEqual(self.herdr.calls, [])
         self.assertEqual(self.record(task_id)["status"], "todo")
 
+    def test_a_claim_given_up_again_leaves_the_pin_unclaimed(self):
+        # `agent.start` is the first thing that can refuse holding a claim, and the
+        # dispatch gives the claim back. No minion ran, so the mark has to go with
+        # it: left standing it says a run began here, and reconcile would report
+        # that run's ending as lost on every wake, forever, about an execution that
+        # never happened.
+        self.shared_project()
+        self.bind()
+        self.herdr.reply("agent.start", TAKEN)
+        self.scripted({"doc": fake_semantic.response("pack export", self.export())})
+        task_id = self.task()
+
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNotNone(result.refusal)
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        self.assertTrue(os.path.exists(self.at("semantic", task_id, "pin.json")))
+        self.assertFalse(os.path.exists(self.at("semantic", task_id, "dispatched")))
+
+    def test_the_pin_a_released_claim_left_is_the_one_the_retry_uses(self):
+        # And the whole point of taking the mark back: the pin is unclaimed again,
+        # so the retry reuses it rather than minting a second pin and a second
+        # trace id for an interruption that never produced a run.
+        self.shared_project()
+        self.bind()
+        self.herdr.reply("agent.start", TAKEN)
+        self.scripted({"doc": fake_semantic.response("pack export", self.export())})
+        task_id = self.task()
+        self.dispatch(task_id, env=self.env())
+        with open(self.at("semantic", task_id, "pin.json")) as fh:
+            first = json.load(fh)["trace_id"]
+
+        self.herdr.reply("workspace.create", {"workspace": {"workspace_id": "ws2"},
+                                              "root_pane": {"pane_id": "w2:p1"}})
+        self.herdr.reply("agent.start", {})
+        self.herdr.reply("agent.get", seen(), seen(status="working"))
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNone(result.refusal, result.said + result.err)
+        with open(self.at("semantic", task_id, "pin.json")) as fh:
+            self.assertEqual(json.load(fh)["trace_id"], first)
+        self.assertFalse(os.path.exists(self.at("semantic", f"{task_id}.1")))
+        self.assertEqual(len(self.calls()), 1)
+
     def test_a_pin_whose_claim_never_landed_is_not_marked_as_dispatched(self):
         # The queue refuses a task another minion already holds, and the pin was
         # written before the claim was tried. It is kept, because a re-dispatch has

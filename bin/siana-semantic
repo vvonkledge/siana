@@ -879,6 +879,33 @@ def cmd_dispatched(args, home):
     return 0
 
 
+def cmd_released(args, home):
+    """Take back a mark whose claim was given up again.
+
+    `dispatched` records that the queue claim landed, and everything after it can
+    still refuse: herdr can decline to start the agent, and the dispatch then
+    releases the claim and puts the task back. No minion ran, so the pin is
+    unclaimed again and reusable again - which is what keeps an interrupted dispatch
+    to one pin and one trace id.
+
+    Left standing, the mark says the opposite: a claimed pin with no recording whose
+    task is not terminal reads as a run whose ending was lost, and reconcile would
+    report that on every wake, forever, about an execution that never happened.
+
+    Idempotent, and never a refusal for a mark that is not there: it is called on a
+    path that is already reporting some other failure, and a second one thrown from
+    here would reach the captain in place of the first."""
+    if read_pin(home, args.task_id) is None:
+        die(f"{args.task_id} has no pin to unmark",
+            f"nothing is at {pin_path(home, args.task_id)}")
+    try:
+        os.remove(dispatched_marker(home, args.task_id))
+    except FileNotFoundError:
+        pass
+    flush(pin_path(home, args.task_id))
+    return 0
+
+
 def dispatched_at(home, task_id):
     """When this pin's task was claimed, or None when it never was."""
     try:
@@ -1319,6 +1346,11 @@ def build_parser():
                    help="when the claim landed, as YYYY-MM-DDTHH:MM:SSZ; the clock "
                         "by default. It is the run's start")
     p.set_defaults(run=cmd_dispatched)
+
+    p = sub.add_parser("released", help="take back a mark whose claim was "
+                                        "given up again")
+    p.add_argument("task_id")
+    p.set_defaults(run=cmd_released)
 
     p = sub.add_parser("reconcile", help="record every pinned task the queue "
                                          "now says is terminal")

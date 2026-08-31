@@ -392,14 +392,38 @@ def mark_dispatched(home: str, tasks_file: str, task_id: str) -> None:
     fatal: the minion is running by now, and taking a live dispatch down over a
     marker file would cost the work to save the bookkeeping. What is lost without it
     is one run going unrecorded, and `siana-semantic status` says so out loud."""
-    out = subprocess.run([SEMANTIC, "dispatched", task_id],
+    semantic_mark(home, tasks_file, task_id, "dispatched",
+                  f"the semantic pin for {task_id} is not marked as dispatched, so "
+                  f"nothing will record what this run did")
+
+
+def unmark_dispatched(home: str, tasks_file: str, task_id: str) -> None:
+    """Take the mark back, because the claim it recorded was given up again.
+
+    Everything after the claim can still refuse, and a refusal there releases the
+    claim and puts the task back in the queue. No minion ran, so the pin is
+    unclaimed again and the next dispatch reuses it, keeping one pin and one trace
+    id. Left standing, the mark would say the opposite for good: a claimed pin with
+    no recording whose task is not terminal reads as a run whose ending was lost,
+    and that is reported on every wake."""
+    semantic_mark(home, tasks_file, task_id, "released",
+                  f"the semantic pin for {task_id} is still marked as dispatched, "
+                  f"and no minion ran against it")
+
+
+def semantic_mark(home: str, tasks_file: str, task_id: str, verb: str,
+                  warning: str) -> None:
+    """One mark on a pin, reported and never fatal.
+
+    Both callers are already carrying some other outcome to the captain - a running
+    minion, or the refusal that ended the dispatch - and a failure to write a marker
+    file must not arrive in place of either."""
+    out = subprocess.run([SEMANTIC, verb, task_id],
                          env={**os.environ, "SIANA_HOME": home,
                               "SIANA_TASKS_FILE": tasks_file},
                          capture_output=True, text=True, check=False)
     if out.returncode != 0:
-        print(f"warning: the semantic pin for {task_id} is not marked as "
-              f"dispatched, so nothing will record what this run did",
-              file=sys.stderr)
+        print(f"warning: {warning}", file=sys.stderr)
         for line in (out.stderr or out.stdout).splitlines():
             print(f"  {line}", file=sys.stderr)
 
@@ -714,6 +738,11 @@ def main() -> None:
             # The one action on this path the captain performs by hand, so it is
             # given whole: `--reason` is required, and a hint without it exits
             # USAGE_ERROR when it is typed back.
+            if released.returncode == 0 and semantic.get("state") == "pinned":
+                # The claim is gone, so the pin is unclaimed again and the next
+                # dispatch reuses it. Only on a release that landed: a task still
+                # held is one a minion may yet be working in.
+                unmark_dispatched(home, tasks_file, args.task_id)
             hints.append(
                 f"{args.task_id} is back in the queue; nothing holds it"
                 if released.returncode == 0 else
