@@ -237,6 +237,15 @@ class Refusals(Section):
                                    "recorded": "2026-08-31T00:00:00Z"})
         self.assertIn("control character", self.refusal())
 
+    def test_a_control_character_in_a_slug_and_not_only_in_a_value(self):
+        # The slug is printed on the fact's own line and again in the `siana-fact
+        # exec` invocation, and `id` and `slug` are both hand-editable, so a newline
+        # in both agrees with itself and passes every id check.
+        self.store("facts.jsonl", {"id": "demo/x\ny", "project": "demo",
+                                   "slug": "x\ny", "kind": "text", "value": "ok",
+                                   "recorded": "2026-08-31T00:00:00Z"})
+        self.assertIn("control character in its slug", self.refusal())
+
     def test_a_grant_recording_a_different_project_than_the_task_works_in(self):
         # The one record that could hand a minion the keys to somewhere it is not
         # working, so nothing here picks whichever project it likes.

@@ -325,6 +325,13 @@ FACT_KINDS = {"url": ("value",), "text": ("value",), "credential": ("account",)}
 # handed it over as somewhere to go.
 URL_SCHEME = "https"
 
+# Every field of a fact that is printed into a minion's orders. The slug is one of
+# them - it names the fact on its own line and again in the `siana-fact exec`
+# invocation - so leaving it out left the one field an id check cannot catch: `id`
+# and `slug` are both hand-editable, so a newline in both agrees with itself and
+# passes. `siana-fact`'s `malformed` holds the twin of this list.
+PRINTED = ("slug", "value", "account", "note")
+
 # The two names `siana-fact exec` puts into the authorised child, repeated here
 # because this is where a minion reads them. It is told rather than left to
 # discover: a name a minion has to guess is one it gets wrong, and the failure
@@ -400,11 +407,11 @@ def check_fact(fact: dict, handle: str, store: str) -> None:
                 "a minion is handed this as somewhere to go, and anything on the",
                 f"path can rewrite somewhere that is not {URL_SCHEME}",
                 "run `siana-fact status` to see every record in this state")
-    if any(ch < " " or ch == "\x7f" for ch in str(fact.get("value") or "")
-           + str(fact.get("account") or "") + str(fact.get("note") or "")):
-        die(f"{store} records {rid} with a control character in it",
-            "a fact is appended to a minion's orders as data, and a newline in one",
-            "is a fact that can forge the section around it")
+    for field in PRINTED:
+        if any(ch < " " or ch == "\x7f" for ch in str(fact.get(field) or "")):
+            die(f"{store} records {rid} with a control character in its {field}",
+                "a fact is appended to a minion's orders as data, and a newline in",
+                "one is a fact that can forge the section around it")
 
 
 def facts_section(home: str, handle: str, task_id: str) -> str:

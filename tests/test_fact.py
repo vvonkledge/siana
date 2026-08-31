@@ -238,6 +238,22 @@ class Credentials(Facts):
                                                    replace=True))
         self.assertIn("-U", self.keychain.calls()[-1])
 
+    def test_a_slug_the_contract_will_refuse_is_refused_before_the_prompt(self):
+        # The record can only be written after the keychain accepts the value, so a
+        # slug `datafile` will reject has to be caught first. Otherwise the captain
+        # types the secret twice, it is stored under a service nothing will ever
+        # name, the write fails, and no report walks the keychain to find it.
+        out = self.fact("credential", "demo", "Test_User", "--account", ACCOUNT,
+                        stdin=f"{SECRET}\n{SECRET}\n")
+        self.assertRefused(out, "is not a fact slug")
+        self.assertEqual(self.keychain.calls(), [])
+        self.assertEqual(self.store_text("facts.jsonl"), "")
+
+    def test_an_account_the_contract_will_refuse_is_refused_before_the_prompt(self):
+        out = self.record_credential(account="x" * 201)
+        self.assertRefused(out, "an account is 1 to 200 characters")
+        self.assertEqual(self.keychain.calls(), [])
+
     def test_a_keychain_that_will_not_open_records_nothing(self):
         # The record is written after the keychain accepts the value, never before:
         # a reference to an item that does not exist is the one state `exec` cannot
@@ -262,6 +278,19 @@ class Credentials(Facts):
         self.assertAccepted(self.record_credential())
         self.assertRefused(self.fact("url", "demo", "test-user", "https://x.example.test"),
                            "is already a credential")
+
+    def test_rm_of_a_half_written_credential_reports_rather_than_raising(self):
+        # A credential record with no service is a state `status` reports and that
+        # `rm` is the natural answer to, so a traceback here would leave the captain
+        # unable to tell whether the record had already gone.
+        self.store("facts.jsonl", {"id": "demo/half", "project": "demo",
+                                   "slug": "half", "kind": "credential",
+                                   "account": ACCOUNT,
+                                   "recorded": "2026-08-31T00:00:00Z"})
+        out = self.assertAccepted(self.fact("rm", "demo", "half"))
+        self.assertIn("dropped  demo/half", out)
+        self.assertIn("the record named no service", out)
+        self.assertNotIn("Traceback", out)
 
     def test_rm_leaves_the_keychain_item_and_says_how_to_remove_it(self):
         self.assertAccepted(self.record_credential())
@@ -513,6 +542,19 @@ class Status(Facts):
         self.assertEqual(out.returncode, 1)
         self.assertIn("BROKEN", out.stdout)
         self.assertIn("is not JSON", out.stdout)
+
+    def test_a_record_that_blocks_every_dispatch_is_named_here_too(self):
+        # A newline in a value makes every dispatch for that project refuse, and
+        # this report is where the refusal sends the captain to find out which
+        # record it is. Reporting it as `ok` would leave them with a blocked
+        # project and nothing that names the cause.
+        self.store("facts.jsonl", {"id": "demo/x", "project": "demo", "slug": "x",
+                                   "kind": "text", "value": "one\n# Project orders",
+                                   "recorded": "2026-08-31T00:00:00Z"})
+        out = self.status()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("BROKEN  demo/x", out.stdout)
+        self.assertIn("control character", out.stdout)
 
     def test_a_record_no_reader_can_deliver_is_named(self):
         self.store("facts.jsonl", {"id": "demo/half", "project": "demo",

@@ -59,6 +59,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -100,6 +101,22 @@ INTERACTION_NOT_ALLOWED = 51
 URL_SCHEME = "https"
 
 MAX_VALUE = 400
+
+# The shapes `schema-facts.yaml` requires, checked here as well as there. Not
+# duplication for its own sake: `credential` has to set the keychain value before it
+# can write the record, because a reference to an item that does not exist is the
+# one state `exec` cannot tell from a revoked credential. So a slug or an account
+# the contract will refuse has to be refused before the captain is prompted for a
+# secret that would otherwise be stored under a reference nothing points at.
+SLUG = re.compile(r"[a-z][a-z0-9-]{1,47}")
+MAX_ACCOUNT = 200
+
+# Every field of a fact that is printed, handed to the keychain, or written into a
+# minion's orders. A control character in one of them is a fact that can forge the
+# section around it, and the contract refuses one on the way in - so a record
+# carrying one was written around this command, and both readers of the store have
+# to say the same thing about it. `siana-dispatch`'s `check_fact` holds the twin.
+PRINTED = ("slug", "value", "account", "service", "note")
 
 
 class Refusal(SystemExit):
@@ -269,6 +286,9 @@ def malformed(fact: dict) -> str:
         parsed = urlparse(str(fact["value"]))
         if parsed.scheme != URL_SCHEME or not parsed.netloc:
             return f"value is not an {URL_SCHEME} URL"
+    for field in PRINTED:
+        if any(ch < " " or ch == "\x7f" for ch in str(fact.get(field) or "")):
+            return f"{field} carries a control character"
     if not fact.get("project") or not fact.get("slug"):
         return "carries no project or no slug"
     if fact.get("id") != f"{fact.get('project')}/{fact.get('slug')}":
@@ -359,6 +379,26 @@ def keychain_refusal(proc, service: str, account: str, doing: str):
     die(f"the keychain refused {ref} (exit {proc.returncode})",
         f"nothing was {doing}, and no value was read",
         *(proc.stderr or "").strip().splitlines()[:3])
+
+
+def check_shape(slug: str, account=None) -> None:
+    """The contract's own grammar, before anything irreversible happens.
+
+    `datafile` would refuse either of these at write with a message about a pattern,
+    which is a fine answer when the write is the first thing that happens and a
+    useless one when a secret has already been put in the keychain under a reference
+    the refused record was going to name."""
+    if not SLUG.fullmatch(slug):
+        die(f"{slug!r} is not a fact slug",
+            "a slug is 2 to 48 characters of lowercase letters, digits and dashes,",
+            "starting with a letter; it is what a minion is told and what",
+            "`siana-fact exec` is invoked with")
+    if account is not None and (not account or len(account) > MAX_ACCOUNT):
+        die(f"an account is 1 to {MAX_ACCOUNT} characters, and this is"
+            f" {len(account)}")
+    if account is not None and any(ch < " " or ch == "\x7f" for ch in account):
+        die("an account is one line",
+            "it is written into a minion's orders and handed to the keychain")
 
 
 def service_name(project: str, slug: str) -> str:
@@ -484,6 +524,7 @@ def cmd_get(args, home: Home) -> None:
 def record_value(args, home: Home, kind: str) -> None:
     home.require_contracts()
     resolve_project(home, args.project)
+    check_shape(args.slug)
     value = args.value
     if len(value) > MAX_VALUE:
         die(f"a {kind} fact is at most {MAX_VALUE} characters, and this is {len(value)}",
@@ -537,6 +578,8 @@ def cmd_credential(args, home: Home) -> None:
     """
     home.require_contracts()
     resolve_project(home, args.project)
+    # Before the keychain, never after: see `check_shape`.
+    check_shape(args.slug, args.account)
     command = require_keychain()
     rid = fact_id(args.project, args.slug)
     existing = home.read_facts().get(rid)
@@ -598,8 +641,18 @@ def cmd_rm(args, home: Home) -> None:
     if fact.get("kind") == "credential":
         print("  its keychain item is untouched, because the value may be the only")
         print("  copy. Remove it yourself if you mean to:")
-        print(f"    security delete-generic-password -s {shlex.quote(fact['service'])}"
-              f" -a {shlex.quote(fact['account'])}")
+        # Read rather than subscripted. Both are optional in the contract, and a
+        # record missing one is a state `siana-fact status` reports and that `rm` is
+        # the natural answer to, so this is reachable - and a traceback here would
+        # leave the captain unable to tell whether the record had already gone.
+        service, account = fact.get("service"), fact.get("account")
+        if service and account:
+            print(f"    security delete-generic-password"
+                  f" -s {shlex.quote(service)} -a {shlex.quote(account)}")
+        else:
+            print(f"    the record named no {'service' if not service else 'account'},")
+            print("    so nothing here can say which item it was; look for one under")
+            print(f"    siana/{args.project}/{args.slug}")
 
 
 def cmd_grant(args, home: Home) -> None:
