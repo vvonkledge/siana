@@ -1332,6 +1332,57 @@ class Status(SemanticTest):
         self.assertIn("none waiting", out)
 
 
+class OneClassification(SemanticTest):
+    """`reconcile` and `status` read the same directories, so they must never say
+    two things about one of them.
+
+    Two copies of that reasoning drifted apart twice before it was one function, in
+    both directions: a run one of them called a hole the other went silent about,
+    and a pin one called finished the other called waiting. These drive the pairs
+    that caught it."""
+
+    def both(self):
+        return (self.assertAccepted(self.sem("reconcile")),
+                self.sem("status").stdout)
+
+    def test_a_lost_run_under_a_task_that_is_running_again_is_named_by_both(self):
+        # The sequence the instructions warn about: blocked, nobody reconciled,
+        # reset, retire, dispatched again. The rolled-aside pin holds a run nothing
+        # can record, and the task is `doing` now - a status classified by the live
+        # task would call the whole home healthy.
+        self.ready_to_record(status="blocked")
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "reset", self.TASK,
+             "--reason", "given to a new minion"]))
+        self.exporting()
+        self.assertAccepted(self.pin())
+        self.dispatched(at="2026-08-30T09:30:00Z")
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "start", self.TASK,
+             "--owner", "claude@w1:p1"]))
+
+        reconcile, status = self.both()
+
+        self.assertIn(f"LOST    {self.TASK}.1", reconcile)
+        self.assertIn("never recorded", status)
+        self.assertIn(f"{self.TASK}.1", status)
+
+    def test_a_claimed_pin_whose_task_left_the_queue_is_lost_to_both(self):
+        # The mirror. A run began here and the queue no longer holds anything to
+        # build its ending from, so it is a hole - and it was counted as one by
+        # status while reconcile called it merely waiting.
+        self.ready_to_record()
+        self.assertAccepted(self.run_cmd(
+            ["tasks", "--file", self.at("tasks.jsonl"), "drop", self.TASK,
+             "--reason", "no longer wanted", "--force"]))
+
+        reconcile, status = self.both()
+
+        self.assertIn(f"LOST    {self.TASK}", reconcile)
+        self.assertIn("never recorded", status)
+        self.assertEqual(self.calls("trace record"), [])
+
+
 class NoPayload(SemanticTest):
     """The privacy guarantee, taken rather than asserted.
 

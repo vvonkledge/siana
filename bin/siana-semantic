@@ -1132,6 +1132,55 @@ def cmd_reconcile(args, home):
     return REFUSED if failed else 0
 
 
+# What one pin directory is, as a word, and the whole vocabulary of it.
+#
+#   recorded   its run is in the trace store; there is nothing left to do
+#   ready      claimed, unrecorded, and the queue holds the terminal record a run
+#              can be built from. This is the one `reconcile` acts on
+#   running    claimed, and a minion is holding the task now
+#   unclaimed  no claim was ever marked, and the task is terminal anyway: either a
+#              claim landed and the mark failed to be written, or somebody took the
+#              task terminal by hand
+#   quiet      no claim was ever marked, and nothing about that is worth saying
+#   lost       claimed, unrecorded, and no terminal record left to build a run from
+PIN_STATES = ("recorded", "ready", "running", "unclaimed", "quiet", "lost")
+
+
+def pin_state(home, name, pin, tasks):
+    """What one pin is, decided in one place.
+
+    `reconcile` and `status` read the same directories, and a doctor reporting
+    nothing waiting while a reconciliation prints `LOST` about the same pin is worse
+    than either answer on its own. Two copies of this reasoning drifted apart twice
+    before it was one function, in both directions, so what each command decides now
+    is only what to do about the word it gets back.
+
+    The queue's status is about the run the live pin belongs to. A spent pin belongs
+    to an earlier one, so nothing the queue says now is about it.
+    """
+    if dispatched_at(home, name) is None:
+        if (name == pin["task"]
+                and (tasks.get(pin["task"]) or {}).get("status") in OUTCOMES):
+            return "unclaimed"
+        return "quiet"
+    if os.path.exists(os.path.join(pin_path(home, name), "recorded.json")):
+        return "recorded"
+    if name != pin["task"]:
+        return "lost"
+    status = (tasks.get(pin["task"]) or {}).get("status")
+    if status in OUTCOMES:
+        return "ready"
+    if status == "doing":
+        return "running"
+    return "lost"
+
+
+# Why a pin is not being acted on, in the words `reconcile` prints.
+WAITING = {"quiet": "never claimed", "unclaimed": "never claimed",
+           "running": "a minion is holding it"}
+LOST = ("claimed, and the queue keeps no terminal record to build a run from")
+
+
 def reconcile_one(home, name, tasks):
     """One pin directory, as `(state, detail)`: `recorded` once it is in the store,
     `already` when this exact run is there, `waiting` when there is nothing to
@@ -1144,55 +1193,28 @@ def reconcile_one(home, name, tasks):
         die(f"{pin_path(home, name)} is not a pin",
             "it holds no pin.json, so nothing here knows what it was for")
     task_id = pin["task"]
-    if name != task_id:
-        # Spent: rolled aside when the task was dispatched again, so it describes a
-        # run that is over. Only the live pin is judged against the queue, because
-        # the queue keeps one record per task and that record is now about the run
-        # after this one. Recording from it would file that later run's ending under
-        # this run's identifier, and comparing against it would report a divergence
-        # that is only the two runs being different runs.
-        already = read_recorded(home, name)
-        if already is not None:
-            return "already", already["trace_id"]
-        if dispatched_at(home, name) is None:
-            return "waiting", "never claimed"
-        return "lost", "claimed, and the queue kept no terminal record of it"
+    state = pin_state(home, name, pin, tasks)
+    if state in WAITING:
+        return "waiting", WAITING[state]
+    if state == "lost":
+        # A hole in the record, named rather than counted with work that is merely
+        # waiting. It is not a refusal: nothing clears it, so a nonzero exit here
+        # would be permanent noise on a command SIANA runs on every wake, and the
+        # only thing that prevents the next one is reconciling before a task is
+        # reset.
+        return "lost", LOST
     started = dispatched_at(home, name)
-    if started is None:
-        # Pinned and never claimed. The task may well be terminal - it can be
-        # dispatched again later, or blocked by hand - and recording a run for it
-        # would be an execution nobody ever performed.
-        return "waiting", "never claimed"
-    # Read before anything is asked of the queue, because a run already in the store
-    # is finished and nothing the queue does afterwards changes that. Reset is the
-    # ordinary thing that happens next - it is the step after reconciling in the
-    # re-dispatch this fleet prescribes - and reading the queue first would report a
-    # correctly recorded run as a hole in the record.
     already = read_recorded(home, name)
     task = tasks.get(task_id)
-    if task is None:
-        # The pin outlived its task. Nothing is recorded and nothing is removed:
-        # the bytes a minion was briefed from are evidence, and a queue that no
-        # longer holds the task is not a reason to throw them away.
-        if already is not None:
-            return "already", already["trace_id"]
-        return "waiting", "no such task"
-    if task.get("status") not in OUTCOMES:
-        if already is not None:
-            return "already", already["trace_id"]
-        if task.get("status") == "doing":
-            return "waiting", "doing"
-        # Claimed, never recorded, and the queue holds no terminal record to build a
-        # run from. The task was reset after the claim, and `updated` names the reset
-        # rather than whatever it did before it: a run that ended here can no longer
-        # be recorded by anything, because when it ended is not written down anywhere.
-        #
-        # Named rather than counted with the ordinary waiting, because it is a hole
-        # in the record and the only thing that can prevent the next one is
-        # reconciling before a task is reset. It is not a refusal: nothing clears
-        # it, so a nonzero exit here would be permanent noise on a command SIANA
-        # runs on every wake.
-        return "lost", "reset before anything was recorded"
+    # A recorded run is only ever re-read to catch the one thing a replay can be: a
+    # divergent one. That needs the live pin and a queue record still terminal, so
+    # anything else is finished and is answered from the recording alone. Reset is
+    # the ordinary next step - it comes straight after reconciling in the
+    # re-dispatch this fleet prescribes - and a spent pin describes an earlier run
+    # that the queue's current record was never about.
+    if state == "recorded" and not (name == task_id
+                                    and (task or {}).get("status") in OUTCOMES):
+        return "already", already["trace_id"]
 
     doc = run_document(pin, task, started)
     body = document(doc)
@@ -1340,37 +1362,20 @@ def cmd_status(args, home):
             continue
         if pin is None:
             continue
-        if os.path.exists(os.path.join(pin_path(home, name), "recorded.json")):
-            continue
-        status = (tasks.get(pin["task"]) or {}).get("status")
-        if not os.path.exists(dispatched_marker(home, name)):
-            # No claim was ever marked here. Ordinarily that is a dispatch that
-            # refused before the queue claim and nothing to say anything about - but
-            # for the live pin, a task that has since gone terminal means either a
-            # run happened and the mark failed to be written, or the task was taken
-            # terminal by hand. Named, because the first of those is a run nobody
-            # will ever record and this is the only place it can be seen at all.
-            #
-            # Only the live pin, because the queue's status is about the run that
-            # pin belongs to and a spent one belongs to an earlier attempt. An
-            # unclaimed pin gets rolled aside whenever its pack goes stale before
-            # anything is dispatched against it, which is ordinary and is not a hole
-            # in anything.
-            if name == pin["task"] and status in OUTCOMES:
-                unclaimed.append(name)
-            continue
-        # A spent pin - rolled aside when its task was dispatched again - is over,
-        # and so is a live one whose task has been reset: the queue keeps one
-        # instant per task, so there is no terminal record left to build a run from
-        # and reconcile will never write one. Counted rather than called stale,
-        # because nothing clears it and a permanent fault here would be a doctor
-        # that can never come back green. `waiting` is only what reconciling fixes.
-        if name != pin["task"] or status not in OUTCOMES:
-            if status != "doing":
-                lost.append(name)
-        else:
+        # The same classification `reconcile` acts on, so the two can never
+        # disagree about a directory. `waiting` is only what reconciling fixes;
+        # the rest is counted rather than called stale, because nothing clears it
+        # and a permanent fault here would be a doctor that can never come green.
+        state = pin_state(home, name, pin, tasks)
+        if state == "ready":
             waiting.append(name)
-    tail = f", {len(lost)} never recorded" if lost else ""
+        elif state == "lost":
+            lost.append(name)
+        elif state == "unclaimed":
+            unclaimed.append(name)
+    # Named and not only counted: a hole in the record is something somebody has to
+    # be able to go and look at, and the directory is where the evidence is.
+    tail = f", {len(lost)} never recorded: {', '.join(lost)}" if lost else ""
     tail += (f", {len(unclaimed)} terminal but never claimed: "
              f"{', '.join(unclaimed)}") if unclaimed else ""
     if not pins:
