@@ -24,19 +24,33 @@ import tempfile
 import threading
 
 
+# What a socket costs under whatever directory it is given: `herdr-XXXXXXXX` from
+# `mkdtemp` and then the socket's own name, with room to spare against the cap.
+SOCKET_COST = len("/herdr-XXXXXXXX/herdr.sock") + 8
+
+
 def socket_dir():
-    """A directory short enough for a socket to live in, whatever `$TMPDIR` says.
+    """A directory a socket still fits under, whatever `$TMPDIR` says.
 
     An `AF_UNIX` path is capped near 104 bytes, and a default macOS temp directory
     already spends most of that. A home under `$TMPDIR` is therefore not somewhere a
     socket can live: point `$TMPDIR` at anything nested and every herdr-facing test
-    in the suite errors in `setUp`, before a single behaviour is exercised. So the
-    socket gets its own short directory and nothing else moves.
+    in the suite errors in `setUp`, before a single behaviour is exercised.
+
+    So the length is measured rather than assumed either way. `$TMPDIR` is used when
+    a socket fits under it, and `/tmp` is the fallback when it does not. Measuring
+    matters because the parallel runner gives every worker a short `$TMPDIR` of its
+    own precisely so that a worker killed mid-test leaves its sockets somewhere the
+    runner can remove wholesale - and a socket that ignored that and went to the
+    shared `/tmp` would be the one thing that survived the sweep.
 
     Asked per socket rather than settled at import, so the answer is the one that
     holds when a `FakeHerdr` is actually built - which is the only place the length
     of `$TMPDIR` can hurt anyone, and the only place a test can hold this."""
-    return "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+    preferred = tempfile.gettempdir()
+    if len(preferred) + SOCKET_COST <= 104:
+        return preferred
+    return "/tmp" if os.path.isdir("/tmp") else preferred
 
 
 # An answer meaning: take the request, then close without saying anything. It is how

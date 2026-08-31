@@ -437,12 +437,22 @@ _contract-drift:
 # Run the distro's tests. Pass unittest arguments through: `just test -v`, or
 # `just test -k slug` for one rule.
 #
-# Through `tests/run.py` rather than `-m unittest` directly, because unittest's own
-# progress is dots with no newline until the summary and a line-oriented reader -
-# the GitHub Actions runner is one - shows none of it. Three CI runs on this project
-# were killed by the hang guard having printed nothing at all. That file is the whole
-# of the difference: a line per test before it runs, and a watchdog that dumps every
-# thread's stack rather than letting a stall eat the job's wall clock in silence.
+# Through `tests/run.py` rather than `-m unittest` directly, for two reasons.
+#
+# unittest's own progress is dots with no newline until the summary, and a
+# line-oriented reader - the GitHub Actions runner is one - shows none of it. Three
+# CI runs on this project were killed by the hang guard having printed nothing at
+# all. So: a line per test before it runs, and a watchdog that dumps every thread's
+# stack rather than letting a stall eat the job's wall clock in silence.
+#
+# And the suite is latency-bound rather than CPU-bound - measured at 0.75 of one
+# core for its whole length - so it is run across a pool of worker processes. See
+# `tests/run.py` for how the pool is sized and why one worker is the control.
+#
+#     SIANA_TEST_WORKERS=1 just test      unittest, serially, in one process
+#
+# That is the mode to reach for when a failure looks like it might be the pool's
+# fault rather than the code's, and it is the control every timing here is against.
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -457,8 +467,9 @@ test *args:
     # directly never writes its own, and the `bin/` commands import stdlib only. What
     # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
     # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner, against a suite that already takes three or four minutes.
-    # Invisible locally, where the captain's uv cache is already warm.
+    # on a cold runner. Invisible locally, where the captain's uv cache is already
+    # warm, and worse than it looks now that a warm run is minutes rather than ten of
+    # them: the pool shortens the wall clock and changes none of that cost.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`

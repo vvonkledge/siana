@@ -507,16 +507,64 @@ other instruction file in the home.
 
     just test
 
-Three or four minutes. Standard-library `unittest`, no dependencies to install. It
-drives the pure mechanics in-process and drives the commands as real processes
-against a real `tasks` and `datafile`, into throwaway homes, because a stubbed store
-would only ever agree with the suite. Unittest arguments pass through, so `just test
--v` is verbose and `just test -k <slug>` runs one rule.
+Standard-library `unittest`, no dependencies to install. It drives the pure
+mechanics in-process and drives the commands as real processes against a real
+`tasks` and `datafile`, into throwaway homes, because a stubbed store would only
+ever agree with the suite. Unittest arguments pass through, so `just test -v` is
+verbose and `just test -k <slug>` runs one rule.
 
 It reports a line per test as it goes, rather than unittest's dots, and puts a
-watchdog around each one: a test that stalls dumps every thread's stack and takes the
-run down instead of sitting there. That is `tests/run.py`, and it is there because a
-run killed by a hang guard printed dots that no line-oriented reader ever showed.
+watchdog around each one: a test that stalls dumps every thread's stack and the run
+is taken down instead of sitting there. That is `tests/run.py`, and it is there
+because a run killed by a hang guard printed dots that no line-oriented reader ever
+showed.
+
+Driving real commands is also what makes the suite slow, and slow in a particular
+way: it waits rather than computes. A serial run spends about three quarters of one
+core for its whole length, with the rest of the machine idle. So `tests/run.py`
+hands whole test classes to a pool of worker processes, and the first line of a run
+says how many workers it got.
+
+Measured by an independent reviewer at `0773dde`, the commit this section sits on
+top of, on an eleven-core M3 Pro: 912 tests, four runs green, one warm worktree,
+no cache cleared and no two of them overlapping.
+
+    one worker (control)    635.3s    461.4s CPU    0.73 cores    168 MB
+    pool, default (5)       240.6s    763.3s CPU    3.17 cores    168 MB
+    pool, shuffled          231.6s    737.1s CPU    3.18 cores    167 MB
+    pool, buffered (-b)     192.3s    668.0s CPU    3.47 cores    168 MB
+
+The median pool run against that control is a 63.5% cut: 635.3s to 231.6s, ten and
+a half minutes to under four. That is the figure to quote, because it is the only
+like-for-like one here - same head, same machine, same warm caches - and it errs
+low rather than high. Load was not sampled at every start; what was observed put
+the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6.6
+rising to 15.7 during a pool run, with another agent running this same suite on the
+box for part of the window.
+
+So expect about four minutes from the pool and about ten and a half from one
+worker. Both stretch under fleet load, and this machine's own variation is wider
+than the gap between any two pool sizes. Measured separately by the author of the
+pool at `6906b6a`, interleaving the two modes: one control of 1115s taken at load
+11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and 26.4.
+Across the whole of that work, at heads and loads that were not held constant, the
+one-worker control measured anywhere from 703s to 1115s. Those are observations of
+what load does, not a second speed claim - they are not comparable with the four
+runs above and are not combined with them. Re-measure rather than trusting any
+single number here.
+
+    SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
+    SIANA_TEST_WORKERS=8 just test      or any number you like
+
+The pool is sized from the machine and capped, deliberately below the core count:
+this machine also runs the fleet, and a suite that took most of it would slow down
+everything else on the box. One worker is the control. It is the mode to reach for
+when a failure looks like it might be the pool's fault rather than the code's, and
+it is what every timing here was measured against.
+
+Each worker gets a temporary directory of its own, and the run removes the lot when
+it ends - on success, on failure, on a stall, and on Ctrl-C. Nothing it started
+outlives it.
 
 `ORDERS.md` is the rest of the contract for changing anything here, and the parts of
 it that can be checked exactly are checked by the suite.

@@ -26,9 +26,27 @@ this file is how you drive it. The first thing a run of it executes is the suite
 
     just test
 
-Three or four minutes. It drives the pure mechanics in-process and drives the
-commands as real processes against a real `tasks` and `datafile`, because a stubbed
-store would only ever agree with the suite.
+It drives the pure mechanics in-process and drives the commands as real processes
+against a real `tasks` and `datafile`, because a stubbed store would only ever
+agree with the suite.
+
+That makes it latency-bound rather than CPU-bound - it spent 0.75 of one core for
+the whole of a ten-minute serial run - so `tests/run.py` runs it across a pool of
+worker processes sized from the machine. It prints the pool size on its first line.
+When a failure looks like it might be the pool's fault rather than the code's, take
+the pool out of the picture:
+
+    SIANA_TEST_WORKERS=1 just test
+
+That is `unittest`, serially, in one process, and it is the control every timing
+here is measured against. It is much the slower of the two: measured at `0773dde`
+on the captain's eleven-core machine, one worker ran the 912 tests in 635.3s
+against a 231.6s median for the pool. `README.md` has the rest of those runs and
+says which of them the load was observed for, because it was not sampled at every
+start. The runner's own tests are a part of that cost and not the cause of it -
+the 56 of them take 48.097s on their own, 7.8% on top of the 619s serial run
+`tests/run.py` records for the base commit. Reach for one worker to answer a
+question, not to run the suite.
 
 Herdr is the one exception, in `tests/fake_herdr.py`. A live server wants a terminal
 and answers when it answers, so the answers that matter most - herdr slow, wrong, or
