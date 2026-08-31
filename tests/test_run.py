@@ -487,9 +487,14 @@ class Filters(Fixture):
         self.assertEqual(sorted(parallel), ["test_mixed.Mixed.test_passes"])
 
     def test_k_that_matches_nothing_runs_nothing_and_says_so(self):
-        out = self.go(self.where, "-k", "nothing-matches-this", workers=3)
-        self.assertEqual(out.returncode, 0, out.stdout)
-        self.assertIn("Ran 0 tests", out.stdout)
+        # Both modes, and the word matters: unittest says NO TESTS RAN rather
+        # than OK, so a `-k` with a typo in it cannot read as a passing run.
+        for workers in (1, 3):
+            out = self.go(self.where, "-k", "nothing-matches-this", workers=workers)
+            self.assertEqual(out.returncode, 0, out.stdout)
+            self.assertIn("Ran 0 tests", out.stdout)
+            self.assertIn("NO TESTS RAN", out.stdout)
+            self.assertNotRegex(out.stdout, r"^OK$")
 
     def test_verbose_reports_the_outcome_of_every_test(self):
         out = self.go(self.where, "-v", workers=3)

@@ -864,7 +864,17 @@ def report(ids, outcomes, subs, wall, verbosity, stream):
              (("failures", "fail"), ("errors", "error"), ("skipped", "skip"),
               ("expected failures", "xfail"), ("unexpected successes", "uxsuccess"))]
     detail = ", ".join(f"{name}={n}" for name, n in tally if n)
-    stream.write(("FAILED" if bad else "OK") + (f" ({detail})" if detail else "") + "\n")
+    if bad:
+        verdict = "FAILED"
+    elif not ids and not detail:
+        # unittest says this rather than `OK`, and the difference is the whole
+        # point of it: a `-k` with a typo in it selects nothing, and a run that
+        # answered `OK` would be more reassuring about having done nothing than
+        # the control is. `just test -k <slug>` is a documented invocation.
+        verdict = "NO TESTS RAN"
+    else:
+        verdict = "OK"
+    stream.write(verdict + (f" ({detail})" if detail else "") + "\n")
     stream.flush()
     return bad == 0
 
