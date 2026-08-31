@@ -332,9 +332,12 @@ upgrade: _initialized init
     # upgrade has nothing to say about them. Neither contract is rewritten either: a
     # field dropped from a live contract makes every record still carrying it
     # unreadable, so a contract only ever grows, by hand, once the captain has seen
-    # what it would cost. Task-contract drift is reported by `_contract-drift`;
-    # project-contract drift announces itself, because `datafile` names the field it
-    # rejected and `siana` refuses to start on a registry it cannot read.
+    # what it would cost. `_contract-drift` reports both, above, because this recipe
+    # reaches it through `init` - and it is what announces project-contract drift
+    # now that `siana` starts on a home whose contract predates `automerge` instead
+    # of refusing. `siana` says it again in a `stale` line at every start, so the
+    # captain meets it where the setting they cannot make would be made, and
+    # `datafile` still names the field it rejected at the write.
     echo "kept     $home/projects.jsonl (the captain's registry)"
     for c in schema-projects schema-obligations schema-decisions schema-tasks; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
