@@ -703,6 +703,13 @@ def cases_of(records):
                   reverse=True)
 
 
+def count(n, noun):
+    """A count and its noun, agreeing. One helper rather than the same conditional
+    spelled out at every line that prints one: it was spelled out five times and
+    left out of the sixth, where a one-round case read as `1 rounds`."""
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
 def cell(value):
     """One field, as the view can print it.
 
@@ -733,12 +740,10 @@ def view(world):
         print("findings empty; nothing has been archived yet")
         return
     groups = cases_of(records)
-    print(f"findings {len(records)} in {len(groups)} case"
-          f"{'' if len(groups) == 1 else 's'}")
+    print(f"findings {len(records)} in {count(len(groups), 'case')}")
     for name, rounds in groups:
         project = cell(rounds[0].get("project"))
-        print(f"  {cell(name)}  ({project}, {len(rounds)} round"
-              f"{'' if len(rounds) == 1 else 's'})")
+        print(f"  {cell(name)}  ({project}, {count(len(rounds), 'round')})")
         wid = max(len(r.get("id") or "") for r in rounds)
         for rec in rounds:
             print(f"    {cell(rec.get('round'))}  {cell(rec.get('id')):<{wid}}"
@@ -818,7 +823,8 @@ def case_view(world, name):
         die(f"no case under that name: {name}",
             "`siana-findings` lists the cases there are")
     rounds.sort(key=lambda r: (r.get("round") or 0, r.get("id") or ""))
-    print(f"case     {name}  ({rounds[0].get('project')}, {len(rounds)} rounds)")
+    print(f"case     {name}  ({cell(rounds[0].get('project'))},"
+          f" {count(len(rounds), 'round')})")
     for rec in rounds:
         print(f"  round {rec.get('round')}  {rec.get('id')}  ({rec.get('kind')})")
         print(f"    found    {rec.get('summary')}")
@@ -919,8 +925,8 @@ def verify(world, only=None):
              [Problem("(the log)", "append-only", d) for d in store_level]
     unverifiable = [p for p in problems if not p.verifiable]
     groups = cases_of(records)
-    print(f"verify   {len(records)} record{'' if len(records) == 1 else 's'} in"
-          f" {len(groups)} case{'' if len(groups) == 1 else 's'}")
+    print(f"verify   {count(len(records), 'record')} in"
+          f" {count(len(groups), 'case')}")
     for problem in failed:
         print(f"  failed        {problem.record_id}  {problem}")
     for problem in unverifiable:
@@ -1263,8 +1269,7 @@ def archive(world, plan_path: str):
             *(f"{p.record_id}  {p}" for p in problems), *superseded,
             "nothing has been written and nothing dropped")
 
-    print(f"archive  {case_name}  {len(records)} record"
-          f"{'' if len(records) == 1 else 's'}")
+    print(f"archive  {case_name}  {count(len(records), 'record')}")
 
     # 2. Every blob, before any ledger write. A blob already present under the right
     #    digest is kept: same bytes archived twice is one blob, and a re-run after a
@@ -1344,9 +1349,8 @@ def archive(world, plan_path: str):
     if not fresh and not removed:
         print(f"archived {case_name}  already archived")
     else:
-        print(f"archived {case_name}  {len(records)} record"
-              f"{'' if len(records) == 1 else 's'}, {removed} task"
-              f"{'' if removed == 1 else 's'} removed")
+        print(f"archived {case_name}  {count(len(records), 'record')},"
+              f" {count(removed, 'task')} removed")
     return 0
 
 

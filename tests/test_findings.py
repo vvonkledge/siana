@@ -1020,6 +1020,18 @@ class Views(Ledger):
         self.assertEqual(self.assertAccepted(self.findings("list")),
                          self.assertAccepted(self.findings()))
 
+    def test_a_count_of_one_reads_as_one(self):
+        # Two of the four real cases this store was designed for have exactly one
+        # round, so `1 rounds` is what a captain would have met first.
+        self.archived()
+        for out in (self.assertAccepted(self.findings()),
+                    self.assertAccepted(self.findings("case", "demo-case")),
+                    self.assertAccepted(self.findings("verify"))):
+            self.assertNotIn("1 rounds", out)
+            self.assertNotIn("1 records", out)
+            self.assertNotIn("1 cases", out)
+        self.assertIn("1 round", self.assertAccepted(self.findings()))
+
     def test_show_names_a_finding_that_is_not_there(self):
         self.assertRefused(self.findings("show", "qa-nothing"),
                            "no finding under that id")
