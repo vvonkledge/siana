@@ -294,6 +294,24 @@ class Credentials(Facts):
         self.assertEqual(self.keychain.calls(), [])
         self.assertEqual(self.store_text("facts.jsonl"), "")
 
+    def test_re_recording_under_a_new_account_says_what_it_left_behind(self):
+        # A keychain item is keyed by service and account together, so this does not
+        # collide with the old item, needs no --replace, and leaves a secret nothing
+        # points at. `status` walks records rather than items, so nothing else would
+        # ever mention it.
+        self.assertAccepted(self.record_credential())
+        out = self.assertAccepted(
+            self.record_credential(secret="a-different-one", account="new@example.test"))
+        self.assertIn(f"the account changed from {ACCOUNT}", out)
+        self.assertIn(f"security delete-generic-password -s siana/demo/test-user"
+                      f" -a {ACCOUNT}", out)
+
+    def test_re_recording_under_the_same_account_says_nothing_was_left(self):
+        self.assertAccepted(self.record_credential())
+        out = self.assertAccepted(self.record_credential(secret="a-different-one",
+                                                         replace=True))
+        self.assertNotIn("the account changed", out)
+
     def test_a_keychain_that_will_not_open_records_nothing(self):
         # The record is written after the keychain accepts the value, never before:
         # a reference to an item that does not exist is the one state `exec` cannot
@@ -427,6 +445,26 @@ class Grants(Facts):
         self.assertIn("revoked  demo/test-user from ship-it", out)
         self.assertAccepted(self.fact("status"))
 
+    def test_a_grant_whose_project_the_task_has_left_can_still_be_withdrawn(self):
+        # The third way a grant outlives its surroundings: the task is dropped and
+        # re-added under another project, since `tasks` cannot edit one in place.
+        # `siana-dispatch` refuses that task and prints this exact command, so it
+        # had to be one that works.
+        self.task("ship-it")
+        self.assertAccepted(self.fact("grant", "ship-it", "test-user"))
+        self.project("other", path=self.home)
+        self.task("ship-it", project="other")
+        out = self.assertAccepted(self.fact("revoke", "ship-it", "demo/test-user"))
+        self.assertIn("revoked  demo/test-user from ship-it", out)
+        self.assertAccepted(self.fact("status"))
+
+    def test_a_revoke_that_matches_nothing_names_what_the_task_does_hold(self):
+        self.task("ship-it")
+        self.assertAccepted(self.fact("grant", "ship-it", "test-user"))
+        self.assertRefused(self.fact("revoke", "ship-it", "demo/other-thing"),
+                           "nothing grants demo/other-thing to ship-it",
+                           "ship-it holds: demo/test-user")
+
     def test_a_revoke_naming_neither_a_task_nor_a_grant_is_still_refused(self):
         self.assertRefused(self.fact("revoke", "never-existed", "test-user"),
                            "nothing grants anything to never-existed")
@@ -436,7 +474,7 @@ class Grants(Facts):
         # the worst possible answer to give somebody withdrawing a credential.
         self.task("ship-it")
         self.assertRefused(self.fact("revoke", "ship-it", "test-user"),
-                           "nothing grants demo/test-user to ship-it")
+                           "nothing grants anything to ship-it")
 
 
 class Exec(Facts):

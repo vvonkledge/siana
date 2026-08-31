@@ -410,6 +410,30 @@ def check_shape(slug: str, account=None, note=None) -> None:
                 "that can forge the section around it")
 
 
+def say_orphan(service, account, under: str) -> None:
+    """A keychain item with nothing pointing at it, and the command that removes it.
+
+    Never removed here: the value may be the only copy, and the record naming it is
+    the cheap half to recreate. Shared by `rm` and by a credential re-recorded under
+    a new account, because both leave exactly this behind and only the first of them
+    used to say so.
+    """
+    if not service or not account:
+        print(f"    the record named no {'service' if not service else 'account'},")
+        print("    so nothing here can say which item it was; look for one under")
+        print(f"    {under}")
+    elif safe(service) != service or safe(account) != account:
+        # `shlex.quote` makes these shell-safe and not terminal-safe: quoting a
+        # control character prints it. Escaping one instead would print a command
+        # that no longer names the item, so there is no command here.
+        print(f"    it names {safe(service)} / {safe(account)}, and a control")
+        print("    character in either means there is no command to print that")
+        print("    would still name the item; find it in your keychain by hand")
+    else:
+        print(f"    security delete-generic-password"
+              f" -s {shlex.quote(service)} -a {shlex.quote(account)}")
+
+
 def service_name(project: str, slug: str) -> str:
     """The keychain item's service. Derived, never typed: it is how a captain looking
     at their keychain sees which fact an item belongs to, and how this command finds
@@ -659,6 +683,16 @@ def cmd_credential(args, home: Home) -> None:
     write(home.facts, home.facts_schema, record)
     print(f"recorded {rid} (credential)")
     print(f"  keychain {service} / {args.account}")
+    # A keychain item is keyed by service and account together, so recording the
+    # same slug under a different account does not collide with the old item, needs
+    # no --replace, and leaves a secret on the machine that nothing now points at.
+    # `status` walks records rather than keychain items, so it would never mention
+    # it. `rm` goes to some length over exactly this state; so does this.
+    was = (existing or {}).get("account")
+    if was and was != args.account:
+        print(f"  the account changed from {safe(was)}, and the item it named is")
+        print("  still in the keychain with nothing pointing at it:")
+        say_orphan(existing.get("service"), was, service)
     print(f"  no minion has it: `siana-fact grant <task-id> {args.slug}` while that"
           f" task is still todo")
 
@@ -694,21 +728,8 @@ def cmd_rm(args, home: Home) -> None:
         # record missing one is a state `siana-fact status` reports and that `rm` is
         # the natural answer to, so this is reachable - and a traceback here would
         # leave the captain unable to tell whether the record had already gone.
-        service, account = fact.get("service"), fact.get("account")
-        if not service or not account:
-            print(f"    the record named no {'service' if not service else 'account'},")
-            print("    so nothing here can say which item it was; look for one under")
-            print(f"    siana/{args.project}/{args.slug}")
-        elif safe(service) != service or safe(account) != account:
-            # `shlex.quote` makes these shell-safe and not terminal-safe: quoting a
-            # control character prints it. Escaping one instead would print a
-            # command that no longer names the item, so there is no command here.
-            print(f"    it names {safe(service)} / {safe(account)}, and a control")
-            print("    character in either means there is no command to print that")
-            print("    would still name the item; find it in your keychain by hand")
-        else:
-            print(f"    security delete-generic-password"
-                  f" -s {shlex.quote(service)} -a {shlex.quote(account)}")
+        say_orphan(fact.get("service"), fact.get("account"),
+                   service_name(args.project, args.slug))
 
 
 def cmd_grant(args, home: Home) -> None:
@@ -747,42 +768,50 @@ def cmd_revoke(args, home: Home) -> None:
     that silently succeeded against one would read as the credential being safe."""
     home.require_contracts()
     grants = home.read_grants()
-    # The queue is asked and never required. SIANA drops a task it decides not to
-    # run, and a grant on a dropped task is exactly the record that most needs
-    # withdrawing: `status` calls it broken and nothing else deletes a grant, so a
-    # revoke that insisted on the task left the captain a permanently red report
-    # with no command to clear it. `rm` printing this very command as the remedy
-    # made that worse.
-    handle = (fold(home.tasks, "id").get(args.task) or {}).get("project")
-    if not handle:
-        held = {str(g.get("project")) for g in grants.values()
-                if g.get("task") == args.task}
-        if not held:
-            die(f"nothing grants anything to {args.task}",
-                "no task by that id is in the queue and no grant names it either;",
-                "check the id, because a revocation that matched nothing would read",
-                "as one that worked")
-        if len(held) > 1:
-            die(f"{args.task} holds grants in more than one project: "
-                f"{', '.join(sorted(safe(h) for h in held))}",
-                "the task is not in the queue to say which was meant, so name the",
-                "fact in full: siana-fact revoke <task> <project>/<slug>")
-        handle = held.pop()
-    rid = fact_reference(handle, args.fact)
+    mine = {gid: g for gid, g in grants.items() if g.get("task") == args.task}
+    if not mine:
+        # Said before anything asks which of them was meant, because "which fact?"
+        # is a strange question to be asked about a task that holds none.
+        die(f"nothing grants anything to {args.task}",
+            "no grant names that task; check the id, because a revocation that",
+            "matched nothing would read as one that worked")
+    # Matched against the grants this task actually holds, and never against what
+    # the queue says the task is today. Every record that authorises nothing is one
+    # somebody has to be able to withdraw, and each of the three ways a grant
+    # outlives its surroundings used to be a record `status` called broken with no
+    # command that would clear it: the fact dropped, the task dropped, and the task
+    # re-added under another project. The last is why a fully qualified reference is
+    # taken as written - it is what `siana-dispatch` prints when it refuses one.
+    if "/" in args.fact:
+        rid = args.fact
+    else:
+        handle = (fold(home.tasks, "id").get(args.task) or {}).get("project")
+        if not handle:
+            held = {str(g.get("project")) for g in mine.values()}
+            if len(held) != 1:
+                die(f"which fact of {args.task}'s?",
+                    f"{args.task} is not in the queue to say which project it"
+                    f" worked in, and it holds: "
+                    f"{', '.join(sorted(safe(g.get('fact')) for g in mine.values()))}",
+                    "name the fact in full: siana-fact revoke <task> <project>/<slug>")
+            handle = held.pop()
+        rid = fact_id(handle, args.fact)
     gid = grant_id(args.task, rid)
     grant = grants.get(gid)
     if grant is None:
-        die(f"nothing grants {rid} to {args.task}",
-            "there is no authorisation here to withdraw; check the task id and the",
-            "fact, because a revocation that matched nothing would read as one that",
-            "worked")
+        die(f"nothing grants {safe(rid)} to {args.task}",
+            f"{args.task} holds: "
+            f"{', '.join(sorted(safe(g.get('fact')) for g in mine.values()))}",
+            "there is no authorisation here to withdraw, and a revocation that",
+            "matched nothing would read as one that worked")
     if grant.get("status") == "revoked":
-        print(f"revoked  {rid} from {args.task} (already, at {grant.get('revoked')})")
+        print(f"revoked  {safe(rid)} from {args.task}"
+              f" (already, at {grant.get('revoked')})")
         return
     record = dict(grant)
     record.update(status="revoked", revoked=now())
     write(home.grants, home.grants_schema, record)
-    print(f"revoked  {rid} from {args.task}")
+    print(f"revoked  {safe(rid)} from {args.task}")
 
 
 def grant_state(grant: dict, facts: dict, tasks: dict) -> str:
