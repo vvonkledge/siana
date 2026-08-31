@@ -778,6 +778,35 @@ class Converge(TwoRounds):
         for task_id in ("qa-one", "qa-two"):
             self.assertEqual(self.record(task_id)["status"], "blocked")
 
+    def test_a_task_that_merely_reuses_an_archived_id_is_never_dropped(self):
+        # A queue id is derived from the title against the live fold, so a dropped
+        # one is free again and re-briefing under the same title reclaims it. A
+        # re-run is advertised as safe from any state, so without this it would have
+        # removed live work under a reason naming a record that is not about it -
+        # and a waiting task goes without a word, since the queue only guards work
+        # that is in flight.
+        one, two = self.rounds()
+        self.archived(one, two)
+        self.assertAccepted(self.tasks("add", "qa one", "--verify", "true",
+                                       "--project", "demo"))
+        self.assertEqual(self.record("qa-one")["status"], "todo")
+        out = self.assertRefused(self.archive(one, two),
+                                 "a task this record did not archive")
+        self.assertIn("new task wearing an archived name", out)
+        self.assertEqual(self.record("qa-one")["status"], "todo")
+
+    def test_the_crash_window_this_guard_has_to_tolerate_still_converges(self):
+        # The queue holding the very task `source` is a copy of is the state a crash
+        # between the writes and the drops leaves, and re-running is how it is
+        # cleared. Presence alone could not tell the two apart, which is why the
+        # guard compares rather than counts.
+        one, two = self.rounds()
+        with self.killed_after("drop", 0):
+            self.crash("archive", "--plan", self.plan(one, two))
+        self.assertEqual(self.record("qa-one")["status"], "blocked")
+        self.archived(one, two)
+        self.assertTrue(self.record("qa-one").get("_deleted"))
+
     def test_a_task_gone_from_the_queue_and_absent_here_is_a_fault(self):
         one, two = self.rounds()
         self.assertAccepted(self.tasks("drop", "qa-one", "--reason", "by hand"))

@@ -1202,6 +1202,36 @@ def drop(tasks_file: str, task_id: str, record_id: str):
                for line in proc.stdout.splitlines())
 
 
+def check_reused_id(rec, world, fresh: bool):
+    """That the task about to be dropped is the one this record archived.
+
+    Only a re-run can get this wrong, and only for a record already in the ledger.
+    Its id is a queue id, and a queue id is derived from the title against the live
+    fold, so a dropped one is free again: re-briefing work under the same title
+    reclaims it. A re-run of the same plan is advertised as safe from any state, so
+    it would then have dropped a live task nothing had archived, with a reason
+    naming a record that is not about it - and `tasks drop` only guards work that is
+    in flight, so a waiting one would have gone without a word.
+
+    Presence is not the question, because in the crash window this exists to
+    tolerate the queue still holds the very task `source` is a copy of. Equality is:
+    `source` is that record verbatim, so anything else under the id is something
+    else."""
+    if fresh:
+        return []                      # `source` was just folded from this task
+    task = world.queue.get(rec["id"])
+    if task is None or task == rec.get("source"):
+        return []
+    archived, live = rec.get("source") or {}, task
+    return [f"{rec['id']} is in the queue as a task this record did not archive:"
+            f" {live.get('title')!r} ({live.get('status')}, updated"
+            f" {live.get('updated')}), where the record archived"
+            f" {archived.get('title')!r} ({archived.get('status')}, updated"
+            f" {archived.get('updated')}). A queue id is free again once it is"
+            " dropped, so this is a new task wearing an archived name and dropping"
+            " it would remove work nothing here has a record of"]
+
+
 def check_superseded(rec, world, fresh: bool):
     """The four conditions under which a waiting task goes with the record.
 
@@ -1294,7 +1324,9 @@ def archive(world, plan_path: str):
 
     problems = check_case(records, world, "archive")
     superseded = [p for rec in records
-                  for p in check_superseded(rec, world, rec["id"] in fresh)]
+                  for p in check_superseded(rec, world, rec["id"] in fresh)
+                  ] + [p for rec in records
+                       for p in check_reused_id(rec, world, rec["id"] in fresh)]
     if problems or superseded:
         die(f"{case_name} is not a case this may archive",
             *(f"{p.record_id}  {p}" for p in problems), *superseded,
