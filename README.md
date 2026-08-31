@@ -543,13 +543,15 @@ rising to 15.7 during a pool run, with another agent running this same suite on 
 box for part of the window.
 
 So on a quiet machine expect about four minutes from the pool and about eleven from
-one worker. Both stretch under fleet load, and this machine's own variation is
-wider than the gap between any two pool sizes: measured separately by the author of
-the pool at `6906b6a`, interleaving the two modes while the load average moved
-between 14 and 26, one worker took 703s to 1115s and the pool 199s to 551s. Those
-are observations of what load does, not a second speed claim - they are not
-comparable with the four runs above and are not combined with them. Re-measure
-rather than trusting any single number here.
+one worker. Both stretch under fleet load, and this machine's own variation is wider
+than the gap between any two pool sizes. Measured separately by the author of the
+pool at `6906b6a`, interleaving the two modes: one control of 1115s taken at load
+11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and 26.4.
+Across the whole of that work, at heads and loads that were not held constant, the
+one-worker control measured anywhere from 703s to 1115s. Those are observations of
+what load does, not a second speed claim - they are not comparable with the four
+runs above and are not combined with them. Re-measure rather than trusting any
+single number here.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like
