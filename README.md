@@ -790,16 +790,20 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-So expect about four minutes from the pool and about ten and a half from one
-worker. Both stretch under fleet load, and this machine's own variation is wider
-than the gap between any two pool sizes. Measured separately by the author of the
-pool at `6906b6a`, interleaving the two modes: one control of 1115s taken at load
-11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and 26.4.
-Across the whole of that work, at heads and loads that were not held constant, the
-one-worker control measured anywhere from 703s to 1115s. Those are observations of
-what load does, not a second speed claim - they are not comparable with the four
-runs above and are not combined with them. Re-measure rather than trusting any
-single number here.
+Those four runs are that head's, and that head had 912 tests. This tree has 1390, so
+expect longer on the one you are standing on: measured on the merged tree on the same
+eleven-core machine, about six minutes from the default pool with the box quiet, about
+eight and a half with other work running alongside it, and about nine and a half at the
+three workers a four-core runner gets. One worker is slower again in proportion, and
+stays a control to reach for rather than a way to run the suite. All of them stretch
+under fleet load, and this machine's own variation is wider than the gap between any two
+pool sizes. Measured separately by the author of the pool at `6906b6a`, interleaving the
+two modes: one control of 1115s taken at load 11.8, against pool runs of 199s, 296s and
+551s taken at loads 14.3, 19.7 and 26.4. Across the whole of that work, at heads and
+loads that were not held constant, the one-worker control measured anywhere from 703s to
+1115s. Those are observations of what load does, not a second speed claim - they are not
+comparable with the four runs above and are not combined with them. Re-measure rather
+than trusting any single number here.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like
