@@ -1,0 +1,1516 @@
+#!/usr/bin/env python3
+"""The findings ledger: what this fleet found, what closed it, and the evidence.
+
+The queue holds work someone can still act on. A review finding whose repair has
+been independently accepted is not work - nobody will do anything about it - and
+leaving it in `blocked` makes the fleet report blockers when the actionable number
+is zero. It is also not nothing: a second minion reading the first one's work and
+finding the defect is the most expensive thing this fleet produces, and it is read
+again every time similar work is briefed.
+
+So a resolved finding leaves the queue and lands here, and this is the only thing
+that writes it. That is stricter than it sounds. `datafile put` on an existing key
+reports `updated` and the fold returns the new content; `datafile compact` then
+deletes the old version for good. Two commands rewrite a finding into "nothing was
+wrong" and leave no trace of what it said. This command refuses the second write,
+and `siana-findings verify` is what notices if someone got past it.
+
+**Nothing here decides that a successor resolved a finding.** `resolution` and
+`resolved_by` come from the plan, written by SIANA, and no inference path reaches
+them: not ancestry, not `deps`, not `base`, not a merge. Every rejected head in this
+fleet is contained by the merge that landed its case, because each repair was cut
+from the branch it repaired, and that says nothing at all about whether anything was
+fixed - `adb47c5a` landed in `main` carrying the exact refusal the reviewer flagged.
+A rule of the form "contained by a merge, therefore resolved" would have closed that
+finding before its repair was written. What this checks is that the pointers SIANA
+supplied resolve and agree with each other. `verify` prints the judgment beside the
+mechanics with the words "not checked here", so a green run never reads as an
+endorsement of the sentence.
+
+**Evidence is copied, not referenced.** `$SIANA_HOME` is not a git repository, and
+the one document these records rest on has already been rewritten twice since the
+review that rejected it: the rejected bytes exist nowhere. So every report and brief
+a plan names is copied into a content-addressed blob store before the ledger is
+written, and every rejected head is pinned as `refs/siana/findings/<id>` - which is
+what stops `gc --prune=now` collecting a commit whose branch is gone.
+
+**Archiving is per case, all-or-nothing, and ordered.** Validate everything, copy
+every blob, pin every ref, write every ledger record, read every record back, and
+only then drop anything from the queue. Writes and removals are never interleaved,
+so the queue is always a superset of what is unarchived and a crash between the two
+halves over-reports what is left to do rather than losing it.
+
+Usage:
+    siana-findings                        every finding, newest case first
+    siana-findings show <id>              one finding whole, evidence resolved
+    siana-findings case <case>            one chain, every round in order
+    siana-findings verify [<case>]        re-run every check; exit 1 on a failure
+    siana-findings blob <sha256>          print one archived evidence file
+    siana-findings archive --plan <file>  write one case and remove its tasks
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import UTC, datetime
+
+# Where a rejected head is pinned, in every project checkout that holds one. Local
+# by construction: nothing pushes it, so it dies with the checkout, and the durable
+# half of the evidence is the blob store plus the digest. `siana-retire` scans only
+# heads, remotes and tags, so a ref here is invisible to it - which fails in the safe
+# direction, refusing a retirement it would otherwise have allowed.
+REF_NAMESPACE = "refs/siana/findings"
+
+# What the archive fills in, and a plan may therefore not carry. `source` is folded
+# from the queue, `reason` is lifted out of it, the clock is stamped here because an
+# agent must never type it, `head_pinned` is set once the ref really exists, and the
+# digests are hashed from the files. A plan carrying one of these is refused by name
+# rather than silently overridden: two writers for one field is how a record comes to
+# disagree with the world it claims to describe.
+DERIVED = ("source", "reason", "archived_at", "head_pinned")
+
+# The two shapes an `evidence` entry takes. A copied file is "<digest> <path>", so
+# the bytes are immutable by construction and the path still says where they came
+# from. A pointer is "<kind>:<id>" into another store. An unrecognised prefix is kept
+# and not checked, which is the latitude `schema-decisions.yaml` gives its own list.
+POINTER = re.compile(r"^([a-z][a-z0-9-]*):(.+)$")
+DIGEST = re.compile(r"^[0-9a-f]{64}$")
+
+# A commit named inside `landed`, which is otherwise free text: "semantic-layer#2
+# 2cd581de2b2d...". Abbreviated forms are accepted because a human writes this line.
+COMMIT_IN_LANDED = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching siana-owe."""
+
+    def __init__(self, message: str, hints=()):
+        self.message, self.hints = message, tuple(hints)
+        super().__init__(1)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def die(message: str, *hints: str):
+    raise Refusal(message, hints)
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def instant(value):
+    """A timestamp as a comparable instant, or the value itself if it is not one.
+
+    `datafile` stores a datetime normalised to `Z` where this writes `+00:00`, so a
+    read-back compared as strings disagrees with itself about a record it stored
+    perfectly. The read-back is the last gate before anything is dropped from the
+    queue, and a gate that cries wolf on every run is one somebody eventually
+    removes."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return value
+
+
+def fold(store: str, key: str):
+    """Fold an append-only datafile store into {key: record}.
+
+    The same read every other command in this distro does: the log is append-only,
+    so the last line for an id wins, and a tombstone is a last line like any other. A
+    store with no writes yet has no file at all, which is empty rather than a fault -
+    the contract is what says the store exists.
+
+    A line that is not JSON stops the read. The queue's own reader skips one; this
+    one must not, because a ledger that quietly reads short is a ledger that has
+    quietly lost a finding, and reading short is the single failure this store exists
+    to prevent."""
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for number, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                die(f"{store} line {number} is not JSON",
+                    f"run `datafile -f {store} repair` to quarantine it")
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def append_only(store: str):
+    """What in the raw log says this store is not append-only after all.
+
+    A key appearing twice is a `datafile put` run by hand over an archived finding,
+    which is how "nothing was wrong" gets written where a finding used to be. A
+    tombstone is a `datafile delete`, which is how one disappears entirely. Neither
+    can be prevented from here - no design can stop the captain running `datafile`
+    - so the answer is to make the loss visible rather than silent.
+
+    This is the same computation `datafile roll` refuses on, done in the reader
+    because the CLI only exposes it through `roll`, and rolling a ledger to ask
+    whether it is intact would be a write to answer a question."""
+    problems, seen = [], set()
+    if not os.path.isfile(store):
+        return problems
+    with open(store) as fh:
+        for number, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                problems.append(f"line {number} is not JSON")
+                continue
+            rid = rec.get("id")
+            if rid is None:
+                problems.append(f"line {number} has no id")
+                continue
+            if rec.get("_deleted"):
+                problems.append(f"line {number} is a tombstone for {rid}: a finding"
+                                " was deleted from this ledger")
+                continue
+            if rid in seen:
+                problems.append(f"line {number} writes {rid} a second time: a"
+                                " finding was rewritten after it was archived")
+            seen.add(rid)
+    return problems
+
+
+# A field of the contract, in either of the two spellings the templates use: a block
+# with its rules indented under it, or the inline mapping the queue's own contract is
+# written in. Read from the installed contract rather than repeated here, so a home
+# whose contract predates a field is checked against the contract it actually has.
+FIELD_BLOCK = re.compile(r"^  ([a-z_]+):\s*(\{.*\})?\s*$")
+FIELD_TYPE = re.compile(r"\btype:\s*([a-z]+)")
+
+
+def contract_fields(schema: str):
+    """{field: type} for the installed contract.
+
+    `unknown` names fields, so the check that it names a real one has to know what
+    the fields are. Reading the contract is the only version of that which stays
+    true after the contract grows; a list repeated here would be a second copy that
+    drifts silently in the direction of accepting a name the store rejects."""
+    fields, current, in_fields = {}, None, False
+    with open(schema) as fh:
+        for line in fh:
+            if line.startswith("fields:"):
+                in_fields = True
+                continue
+            if not in_fields:
+                continue
+            if line.strip() and not line.startswith(" "):
+                break                          # a later top-level key ends the block
+            m = FIELD_BLOCK.match(line.rstrip())
+            if m:
+                current = m.group(1)
+                inline = FIELD_TYPE.search(m.group(2) or "")
+                fields[current] = inline.group(1) if inline else None
+                continue
+            if current and fields.get(current) is None:
+                m = FIELD_TYPE.search(line)
+                if m and line.startswith("    "):
+                    fields[current] = m.group(1)
+    return fields
+
+
+def digest_of(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def blob_path(home: str, sha: str) -> str:
+    """Content-addressed, two hex characters deep, so a store holding thousands of
+    reports never puts thousands of entries in one directory."""
+    return os.path.join(home, "findings", "blobs", sha[:2], sha[2:])
+
+
+def store_blob(home: str, source: str, sha: str) -> bool:
+    """Copy one file into the blob store. True if it was written, False if the same
+    bytes were already there.
+
+    Written through a temporary in the store's own directory and renamed, with both
+    the file and its directory fsynced: a crash mid-copy must leave no blob rather
+    than a short one, because a short blob under the right digest is evidence that
+    lies. `os.replace` is atomic within a filesystem, and the temporary is kept
+    inside the store so it never crosses one."""
+    target = blob_path(home, sha)
+    if os.path.exists(target):
+        return False
+    tmpdir = os.path.join(home, "findings", "blobs", "tmp")
+    os.makedirs(tmpdir, exist_ok=True)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=tmpdir)
+    try:
+        with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+            for chunk in iter(lambda: src.read(1 << 16), b""):
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    dirfd = os.open(os.path.dirname(target), os.O_RDONLY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+    return True
+
+
+# What to say when a store tool is not installed. A home without one is a state this
+# distro models - `just doctor` prints `missing datafile` for it - and every other
+# store reader in bin/ refuses it by name rather than raising.
+NOT_ON_PATH = {
+    "datafile": ("it is what enforces this store's contract; without it nothing here"
+                 " can be written or read back",
+                 "run `just init` in the distro"),
+    "tasks": ("it is what holds the queue this archive removes from",
+              "the ledger already holds whatever was written, so re-running this"
+              " plan once it is installed is safe",
+              "run `just init` in the distro"),
+}
+
+
+def run_tool(argv):
+    """Every call out to `datafile` or `tasks`, with the one refusal they share.
+
+    Written once rather than at each call site because one of them is reached after
+    the ledger writes have already landed: without a guard there, the archive's only
+    account of the step that removes queue records would end in a stack trace."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die(f"{argv[0]} is not on PATH", *NOT_ON_PATH[argv[0]])
+
+
+def git(path: str, *args: str):
+    """git, run in `path`. Returns the completed process, decided by the caller:
+    most of these are questions whose "no" is an ordinary answer."""
+    return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                          check=False)
+
+
+def split_evidence(entry: str):
+    """One evidence entry as (digest, path) or (None, pointer).
+
+    Split on the first space, because a path may contain one and a digest may not."""
+    if " " in entry:
+        head, rest = entry.split(" ", 1)
+        if DIGEST.match(head):
+            return head, rest
+    return None, entry
+
+
+class World:
+    """Everything the checks read, folded once.
+
+    One reader for the whole run rather than one per check: a check that re-read the
+    queue could disagree with the check before it about what the queue said, and the
+    thing being decided here is whether a set of records agree with each other."""
+
+    def __init__(self, home: str, tasks_file: str):
+        self.home = home
+        self.tasks_file = tasks_file
+        self.store = os.path.join(home, "findings.jsonl")
+        self.schema = os.path.join(home, "schema-findings.yaml")
+        self.queue = fold(tasks_file, "id")
+        self.projects = fold(os.path.join(home, "projects.jsonl"), "handle")
+        self.obligations = fold(os.path.join(home, "obligations.jsonl"), "id")
+        self.ledger = fold(self.store, "id")
+        self._fields = None
+
+    def fields(self):
+        """The contract, read once. Every record's `unknown` check asks for it, and
+        a file re-read per record would be the same answer bought many times."""
+        if self._fields is None:
+            self._fields = contract_fields(self.schema)
+        return self._fields
+
+    def checkout(self, handle):
+        """Where this project's work is, or None if the registry cannot say."""
+        project = self.projects.get(handle)
+        if not project:
+            return None
+        path = project.get("path")
+        return path if path and os.path.isdir(path) else None
+
+    def task_or_archived(self, task_id: str):
+        """A task's record, from the queue if it is still there and from its own
+        ledger entry if it has been archived.
+
+        The lineage checks read `deps` and `base` off tasks that this ledger removes,
+        so a check written against the queue alone would pass before an archive and
+        become unanswerable after it. `source` is the queue record verbatim, which is
+        exactly what makes that recoverable."""
+        task = self.queue.get(task_id)
+        if task is not None:
+            return task, "queue"
+        archived = self.ledger.get(task_id)
+        if archived is not None and isinstance(archived.get("source"), dict):
+            return archived["source"], "ledger"
+        return None, None
+
+
+class Problem:
+    """One check's answer about one record.
+
+    Three outcomes and not two. `failed` is the ledger disagreeing with the world.
+    `unverifiable` is the world having lost what the check reads - a `done` task
+    removed by other means - which is neither a fault in the ledger nor something a
+    green may be claimed over. Reporting it as either would be a lie in one of the
+    two available directions."""
+
+    def __init__(self, record_id: str, check: str, detail: str, verifiable=True):
+        self.record_id = record_id
+        self.check = check
+        self.detail = detail
+        self.verifiable = verifiable
+
+    def __str__(self):
+        return f"{self.check}: {self.detail}"
+
+
+def check_record(rec, case, world, stage: str):
+    """Every mechanical check that reads one record, in the design's order.
+
+    `stage` is `archive` or `verify`, and it changes exactly two things. At archive
+    time the blobs have not been copied yet, so the evidence check asks whether the
+    files can be read rather than whether the store holds them. At verify time the
+    live file may legitimately have moved on, so a digest that no longer matches is
+    reported as drift in the world rather than as a fault in the ledger - the
+    archived bytes are still in the store and `siana-findings blob` still prints
+    them.
+
+    Everything else is the same computation in both, which is the point: `verify`
+    re-runs the archive's own reasoning on demand, so a record that passed once can
+    be asked again rather than trusted forever.
+    """
+    out = []
+    rid = rec.get("id")
+    fields = world.fields()
+
+    # 1. `unknown` names what applied here and could not be established. A bare name
+    #    must be a field of this contract and that field must be null, or the record
+    #    is claiming a hole where it holds a value. A qualified name -
+    #    `evidence:rejected-handoff` - says one member of a list is missing, so it
+    #    names a list field and says nothing about the rest of the list, which is
+    #    the only way a partly-lost evidence set can be recorded at all.
+    for name in rec.get("unknown") or []:
+        field, _, qualifier = name.partition(":")
+        if field not in fields:
+            out.append(Problem(rid, "unknown", f"{name} is not a field of this"
+                                               " contract"))
+            continue
+        if qualifier:
+            if fields[field] != "list":
+                out.append(Problem(rid, "unknown", f"{name} qualifies {field}, which"
+                                                   " is not a list"))
+        elif rec.get(field) is not None:
+            out.append(Problem(rid, "unknown", f"{field} is named as unknown but"
+                                               " holds a value"))
+
+    # 2. The archived queue record is the one this replaces, and it was blocked when
+    #    it was archived. A record whose `source` describes a different task is one
+    #    whose whole provenance is unreadable.
+    source = rec.get("source")
+    if not isinstance(source, dict):
+        out.append(Problem(rid, "source", "the queue record was not archived"))
+    else:
+        if source.get("id") != rid:
+            out.append(Problem(rid, "source", f"holds the queue record for"
+                                              f" {source.get('id')}"))
+        if source.get("status") != "blocked":
+            out.append(Problem(rid, "source", f"was {source.get('status')} and not"
+                                              " blocked when it was archived"))
+        if source.get("project") != rec.get("project"):
+            out.append(Problem(rid, "source", f"the queue said project"
+                                              f" {source.get('project')}"))
+
+    # 3. The project is the captain's, and its checkout is what the git checks read.
+    handle = rec.get("project")
+    if handle not in world.projects:
+        out.append(Problem(rid, "project", f"{handle} is not a handle in"
+                                           " projects.jsonl"))
+    elif world.checkout(handle) is None:
+        out.append(Problem(rid, "project", f"{handle}'s path is not a directory:"
+                                           f" {world.projects[handle].get('path')}"))
+
+    # 4, 5, 6. The chain, checked rather than asserted. Round N's repair was read by
+    #    round N+1's rejection, which is what makes a rejection chain one case; the
+    #    highest round's acceptance is a task that finished, which is what makes it
+    #    a closed one.
+    by_round = {r["round"]: r for r in case if isinstance(r.get("round"), int)}
+    highest = max(by_round) if by_round else None
+    resolver = rec.get("resolver")
+    if resolver:
+        task, where = world.task_or_archived(resolver)
+        if task is None:
+            out.append(Problem(rid, "resolver", f"{resolver} is no longer in the"
+                                                " queue, so its status cannot be"
+                                                " read", verifiable=False))
+        else:
+            if where == "queue" and task.get("status") != "done":
+                out.append(Problem(rid, "resolver", f"{resolver} is"
+                                                    f" {task.get('status')}, not"
+                                                    " done"))
+            branch = rec.get("branch")
+            if branch and task.get("base") != branch:
+                out.append(Problem(rid, "resolver", f"{resolver} was cut from"
+                                                    f" {task.get('base')}, not from"
+                                                    f" {branch}"))
+
+    acceptance = rec.get("acceptance")
+    if acceptance:
+        nxt = by_round.get((rec.get("round") or 0) + 1)
+        if nxt is not None:
+            # Below the highest round the acceptance is the next round itself: what
+            # read this repair is the review that then found something else.
+            if acceptance != nxt.get("id"):
+                out.append(Problem(rid, "acceptance", f"{acceptance} is not round"
+                                                      f" {nxt.get('round')}, which is"
+                                                      f" {nxt.get('id')}"))
+        task, where = world.task_or_archived(acceptance)
+        if task is None:
+            # Below the highest round the acceptance is another round of this case,
+            # so a missing one is a hole in the ledger and a real failure. At the
+            # highest round it is a `done` task in the queue, and the queue is not
+            # this store's to keep: one removed by other means is the world having
+            # lost what the check reads, which is neither a fault here nor something
+            # a green may be claimed over.
+            out.append(Problem(rid, "acceptance", f"{acceptance} is neither in the"
+                                                  " queue nor in this ledger",
+                               verifiable=nxt is not None))
+        else:
+            if nxt is None and where == "queue" and task.get("status") != "done":
+                # The highest round present names an acceptance that has not
+                # finished. Before an archive that is a live chain, which may never
+                # be filed; after a crash between two writes it is the tail of the
+                # case missing, and the same fact reads both ways. Either way this
+                # is not a finished case and the record that says so is named.
+                out.append(Problem(rid, "acceptance", f"{acceptance} is"
+                                                      f" {task.get('status')}, so"
+                                                      " this case is incomplete: the"
+                                                      " chain has no accepted end"))
+            if resolver and resolver not in (task.get("deps") or []):
+                out.append(Problem(rid, "acceptance", f"{acceptance} does not depend"
+                                                      f" on {resolver}, so it did not"
+                                                      " read that repair"))
+    elif rec.get("round") == highest:
+        out.append(Problem(rid, "acceptance", "the highest round names nothing that"
+                                              " accepted it"))
+
+    # 7. Evidence. The digest is what makes the copy trustworthy, so it is checked
+    #    against the bytes in both directions: the store must hold them, and a live
+    #    file that has moved on is said so plainly rather than passed over.
+    out.extend(check_evidence(rec, world, stage))
+
+    # 8. The rejected head and the head that repaired it exist, and the ref this
+    #    archive claims to have pinned is still pointing where it said.
+    path = world.checkout(handle)
+    if path:
+        for field in ("head", "resolver_head"):
+            sha = rec.get(field)
+            if sha and git(path, "cat-file", "-e", f"{sha}^{{commit}}").returncode:
+                out.append(Problem(rid, field, f"{sha[:12]} is not a commit in"
+                                               f" {path}"))
+        if rec.get("head_pinned"):
+            ref = f"{REF_NAMESPACE}/{rid}"
+            shown = git(path, "rev-parse", "--verify", "--quiet", ref)
+            if shown.returncode:
+                out.append(Problem(rid, "pin", f"{ref} is gone; the rejected head is"
+                                               " unanchored"))
+            elif shown.stdout.strip() != rec.get("head"):
+                out.append(Problem(rid, "pin", f"{ref} points at"
+                                               f" {shown.stdout.strip()[:12]}, not at"
+                                               f" {str(rec.get('head'))[:12]}"))
+
+        # 9. Two facts, and only the second is about the repair. That the named
+        #    commit exists is asked wherever `landed` names one at all: for a review
+        #    of a document, which rejects no branch and whose repair produced no
+        #    commit, that line is the record's only pointer to where the work went,
+        #    and it is the record whose other evidence is already known to be
+        #    unrecoverable. Containment is asked on top, where there is a repair
+        #    commit to contain - and it is containment only. That a merge holds the
+        #    repair is evidence the work was published; it is never evidence the
+        #    finding was closed, and this is written so it cannot be read as the
+        #    latter.
+        head = rec.get("resolver_head")
+        commit = last_commit(rec.get("landed"))
+        if commit:
+            named = git(path, "rev-parse", "--verify", "--quiet",
+                        f"{commit}^{{commit}}")
+            if named.returncode:
+                out.append(Problem(rid, "landed", f"{commit} is not a commit in"
+                                                  f" {path}"))
+            elif head and git(path, "merge-base", "--is-ancestor", head,
+                              commit).returncode:
+                out.append(Problem(rid, "landed", f"{commit[:12]} does not contain"
+                                                  f" {head[:12]}"))
+
+    # 12. A finding the pipeline marked for a human is one SIANA may not answer. The
+    #     flag is a fact already on disk, so this reads it rather than taking a
+    #     claim: a `decide` finding archived with no captain ruling beside it is a
+    #     decision SIANA made on the captain's behalf.
+    out.extend(check_captain_decision(rec, world))
+    return out
+
+
+def check_evidence(rec, world, stage: str):
+    """Check 7: the archived bytes are in the store, and the live file still matches.
+
+    Only the shape is checked at archive time. A plan naming a file that is not
+    there is refused earlier, by `build`, which is where a plan's paths are turned
+    into digests at all; and by then the digest of a fresh record came from the file
+    a moment ago, so asking again would only ever answer yes. What is left is the
+    re-run, where the design is explicit that a source which has moved on is not a
+    refusal: the blob for the archived digest is already in the store, so the
+    archive keeps it and continues.
+
+    At verify time both halves are asked. A blob that is not in the store is a fault
+    in the ledger. A live file that no longer hashes to what was archived is drift -
+    a fact about the world, reported so it can be seen, with the archived bytes
+    still readable through `siana-findings blob`."""
+    out, rid = [], rec.get("id")
+    for entry in rec.get("evidence") or []:
+        sha, rest = split_evidence(entry)
+        if sha is None:
+            if not POINTER.match(rest):
+                out.append(Problem(rid, "evidence", f"{entry} is neither a digest"
+                                                    " and a path nor a pointer"))
+            continue
+        if stage != "verify":
+            continue
+        if not os.path.exists(blob_path(world.home, sha)):
+            out.append(Problem(rid, "evidence", f"{sha[:12]} is not in the blob"
+                                                f" store: {rest}"))
+        if not os.path.exists(rest):
+            out.append(Problem(rid, "evidence", f"{rest} is gone from where it was"
+                                                " archived from"))
+            continue
+        try:
+            live = digest_of(rest)
+        except OSError as e:
+            out.append(Problem(rid, "evidence", f"{rest} cannot be read: {e}"))
+            continue
+        if live != sha:
+            out.append(Problem(rid, "evidence", f"drifted: {rest} now hashes to"
+                                                f" {live[:12]}, not {sha[:12]}"))
+    return out
+
+
+def check_captain_decision(rec, world):
+    """Check 12: a captain-only finding needs the captain's recorded ruling.
+
+    An `obligation:` pointer must resolve to a closed obligation about this very
+    task, and for a ship record whose pipeline findings carry `"decide": true` at
+    least one such pointer is required. Both halves matter. Without the first, the
+    pointer is a name anyone could have typed; without the second, a finding the
+    pipeline explicitly refused to let a minion settle could be archived on SIANA's
+    own say-so, which is the same refusal drawn one level up."""
+    out, rid = [], rec.get("id")
+    rulings = []
+    for entry in rec.get("evidence") or []:
+        sha, rest = split_evidence(entry)
+        if sha is not None:
+            continue
+        m = POINTER.match(rest)
+        if not m or m.group(1) != "obligation":
+            continue
+        oid = m.group(2)
+        rulings.append(oid)
+        ob = world.obligations.get(oid)
+        if ob is None:
+            out.append(Problem(rid, "ruling", f"obligation {oid} is not in"
+                                              " obligations.jsonl"))
+        elif ob.get("status") != "closed":
+            out.append(Problem(rid, "ruling", f"obligation {oid} is"
+                                              f" {ob.get('status')}: the captain has"
+                                              " not answered it"))
+        elif ob.get("task") != rid:
+            out.append(Problem(rid, "ruling", f"obligation {oid} is about"
+                                              f" {ob.get('task')}, not about {rid}"))
+    if rec.get("kind") == "ship" and needs_ruling(world.home, rid) and not rulings:
+        out.append(Problem(rid, "ruling", "the pipeline marked a finding here for the"
+                                          " captain and no closed obligation is named"
+                                          " in evidence"))
+    return out
+
+
+def needs_ruling(home: str, task_id: str) -> bool:
+    """Whether the pipeline left a finding here that only a human could settle.
+
+    Read off the findings file the run itself wrote, so this is a fact rather than a
+    claim. A file that is absent or unreadable answers no: the flag is what raises
+    the bar, and inventing one from a file nobody can read would refuse archives on
+    the strength of a missing file."""
+    path = os.path.join(home, "pipeline", f"{task_id}.findings.json")
+    try:
+        with open(path) as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+    findings = payload.get("findings") if isinstance(payload, dict) else None
+    if not isinstance(findings, list):
+        return False
+    return any(isinstance(f, dict) and f.get("decide") for f in findings)
+
+
+def last_commit(landed):
+    """The commit `landed` names, or None. Free text otherwise: a case may have
+    landed somewhere that is not a commit, and a case that has not landed at all is
+    an ordinary resolved case with nothing published yet."""
+    if not isinstance(landed, str):
+        return None
+    found = COMMIT_IN_LANDED.findall(landed)
+    return found[-1] if found else None
+
+
+def check_case(case, world, stage: str):
+    """Check 10, and every per-record check for the rounds of one case.
+
+    A case is contiguous from round 1. A gap means a record was never written or has
+    been removed, and a case with a hole in it is not a chain - the invariant that
+    ends it reads the highest round present, which after a crash between two writes
+    is a round whose acceptance is another round's id. It is reported as incomplete
+    and named, never accepted as finished."""
+    out = []
+    # Only the records whose round is a number. A hand-written line with a missing
+    # or non-numeric round fails the contract check, which says so far better than
+    # a TypeError out of the arithmetic here would.
+    rounds = [r["round"] for r in case if isinstance(r.get("round"), int)]
+    ordered = sorted(case, key=lambda r: (r.get("round") or 0, r.get("id") or ""))
+    name = case[0].get("case") if case else "?"
+    duplicates = sorted({n for n in rounds if rounds.count(n) > 1})
+    if duplicates:
+        out.append(Problem(name, "case", f"two records at round"
+                                         f" {', '.join(str(n) for n in duplicates)}"))
+    missing = sorted(set(range(1, max(rounds) + 1)) - set(rounds)) if rounds else []
+    if missing:
+        out.append(Problem(name, "case", "incomplete: round"
+                                         f" {', '.join(str(n) for n in missing)}"
+                                         f" of {max(rounds)} is not here"))
+    for rec in ordered:
+        out.extend(check_record(rec, case, world, stage))
+    return out
+
+
+def cases_of(records):
+    """Records grouped into cases, newest case first, rounds in order.
+
+    Newest by when the case was archived rather than by name: a captain reading the
+    ledger is reading history, and the case that closed most recently is the one
+    they are most likely to be asking about."""
+    groups = {}
+    for rec in records:
+        groups.setdefault(rec.get("case"), []).append(rec)
+    for rounds in groups.values():
+        rounds.sort(key=lambda r: (r.get("round") or 0, r.get("id") or ""))
+    return sorted(groups.items(),
+                  key=lambda kv: max(str(r.get("archived_at") or "") for r in kv[1]),
+                  reverse=True)
+
+
+def count(n, noun):
+    """A count and its noun, agreeing. One helper rather than the same conditional
+    spelled out at every line that prints one: it was spelled out five times and
+    left out of the sixth, where a one-round case read as `1 rounds`."""
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def cell(value):
+    """One field, as the view can print it.
+
+    A row that is valid JSON and missing a contract field reaches every reader here,
+    and the other three say so in words. This one formatted straight into a width
+    spec, where `None` raises rather than renders, so the first thing a captain types
+    was the one place a malformed row produced a traceback instead of a report."""
+    return "?" if value is None else str(value)
+
+
+def first_line(text, width=64):
+    line = (text or "").strip().splitlines()
+    line = line[0] if line else ""
+    return line if len(line) <= width else line[:width - 3] + "..."
+
+
+def view(world):
+    """Every finding, newest case first, one line each.
+
+    Grouped, because a round read out of its chain is a defect with no story: the
+    five rounds of one case are five different defects found by five different
+    readers, and the case is what says they are one argument."""
+    records = list(world.ledger.values())
+    if not records:
+        # A ledger that has archived nothing has no `.jsonl` at all, and that is a
+        # zero rather than a fault. It is said in the word the report reads, so a
+        # home with the contract and no archives never renders as an unread source.
+        print("findings empty; nothing has been archived yet")
+        return
+    groups = cases_of(records)
+    print(f"findings {len(records)} in {count(len(groups), 'case')}")
+    for name, rounds in groups:
+        project = cell(rounds[0].get("project"))
+        print(f"  {cell(name)}  ({project}, {count(len(rounds), 'round')})")
+        wid = max(len(r.get("id") or "") for r in rounds)
+        for rec in rounds:
+            print(f"    {cell(rec.get('round'))}  {cell(rec.get('id')):<{wid}}"
+                  f"  {cell(rec.get('kind')):<6}  {first_line(rec.get('summary'))}")
+    if any(rec.get(field) is None
+           for rec in records for field in ("round", "kind", "summary")):
+        print("  a row above is missing fields this view needs; `siana-findings"
+              " verify` says which")
+
+
+def show(world, rid):
+    """One finding whole, with its evidence resolved.
+
+    The judgment and the mechanics are printed apart and labelled, here as in
+    `verify`: `resolution` is a sentence an agent wrote and everything above it is
+    something a script checked, and a reader must never have to guess which half
+    they are looking at."""
+    rec = world.ledger.get(rid)
+    if rec is None:
+        die(f"no finding under that id: {rid}",
+            "`siana-findings` lists what there is")
+    rounds = [r for r in world.ledger.values() if r.get("case") == rec.get("case")]
+    print(f"finding  {rid}")
+    print(f"  case     {rec.get('case')}, round {rec.get('round')} of {len(rounds)}")
+    print(f"  project  {rec.get('project')}  ({rec.get('kind')})")
+    print(f"  archived {rec.get('archived_at')}")
+    for label, field in (("branch", "branch"), ("head", "head"),
+                         ("resolver", "resolver"), ("repaired", "resolver_head"),
+                         ("accepted", "acceptance"), ("landed", "landed")):
+        value = rec.get(field)
+        print(f"  {label:<8} {value if value is not None else absent(rec, field)}")
+    if rec.get("head_pinned"):
+        print(f"  pinned   {REF_NAMESPACE}/{rid}")
+    for task in rec.get("superseded") or []:
+        # Beside the acceptance and never apart from it: "we removed a QA" and "here
+        # is the QA that read the same work instead" are one fact, and a reader who
+        # can see the first without the second has been told half of it.
+        print(f"  removed  {task} (it could only ever have judged this, and"
+              f" {rec.get('acceptance')} judged what landed)")
+    print(f"  tags     {', '.join(rec.get('tags') or []) or '(none)'}")
+    print(f"  reason   {rec.get('reason')}")
+    print(f"  summary  {rec.get('summary')}")
+    print(f"  cost     {rec.get('consequence')}")
+    print("  evidence")
+    for entry in rec.get("evidence") or []:
+        sha, rest = split_evidence(entry)
+        if sha is None:
+            print(f"    pointer  {rest}")
+            continue
+        state = "stored" if os.path.exists(blob_path(world.home, sha)) else "MISSING"
+        if os.path.exists(rest):
+            try:
+                state += "" if digest_of(rest) == sha else ", source drifted"
+            except OSError:
+                state += ", source unreadable"
+        else:
+            state += ", source gone"
+        print(f"    {sha[:12]}  {rest}  ({state})")
+    for missing in lost(rec, "evidence"):
+        print(f"    lost          {missing}: it applied here and was never archived")
+    for name in rec.get("unknown") or []:
+        head, _, qualifier = name.partition(":")
+        if qualifier and head != "evidence":
+            print(f"  unknown  {name}")
+    print(f"  resolved {rec.get('resolution')}")
+    print(f"    by     {rec.get('resolved_by')} (judgment, not checked here)")
+
+
+def lost(rec, field):
+    """What `unknown` says is missing from one list field, as bare qualifiers.
+
+    A record can say that one member of its evidence applied and was never archived,
+    and until this was printed the fact sat in the store unreadable from the command
+    that exists to read the store: `show` listed the files that were archived, with
+    nothing to say that the artifact actually rejected is not among them. A reader
+    would have taken a knowingly partial evidence set for a complete one."""
+    out = []
+    for name in rec.get("unknown") or []:
+        head, _, qualifier = name.partition(":")
+        if head == field and qualifier:
+            out.append(qualifier)
+    return out
+
+
+def absent(rec, field):
+    """What a null field means, said in words rather than printed as a Python None.
+
+    A field that is null and named in `unknown` applied and could not be
+    established; one that is null and not named there does not apply at all - a
+    review of a document rejects no branch. Two different facts, and the difference
+    is the whole reason the contract carries `unknown` instead of a sentinel."""
+    named = [n for n in (rec.get("unknown") or []) if n.split(":")[0] == field]
+    return "(unknown; it applied and was not established)" if named else "(n/a)"
+
+
+def case_view(world, name):
+    rounds = [r for r in world.ledger.values() if r.get("case") == name]
+    if not rounds:
+        die(f"no case under that name: {name}",
+            "`siana-findings` lists the cases there are")
+    rounds.sort(key=lambda r: (r.get("round") or 0, r.get("id") or ""))
+    print(f"case     {name}  ({cell(rounds[0].get('project'))},"
+          f" {count(len(rounds), 'round')})")
+    for rec in rounds:
+        print(f"  round {rec.get('round')}  {rec.get('id')}  ({rec.get('kind')})")
+        print(f"    found    {rec.get('summary')}")
+        print(f"    cost     {rec.get('consequence')}")
+        print(f"    repaired {rec.get('resolver') or absent(rec, 'resolver')}")
+        print(f"    accepted {rec.get('acceptance') or absent(rec, 'acceptance')}")
+        for missing in lost(rec, "evidence"):
+            print(f"    lost     {missing}: it applied here and was never archived")
+        print(f"    resolved {rec.get('resolution')}")
+        # Beside the sentence it belongs to, and never once for the whole case.
+        # Nothing requires the rounds of one case to share an author - the field is
+        # free text and the design describes it per record - so one attribution line
+        # at the bottom would put the second author's sentence under the first
+        # author's name, in the one field that makes the judgment arguable later.
+        print(f"      by     {rec.get('resolved_by')}")
+    print("  every `resolved` line above is judgment and is not checked here;"
+          " `siana-findings verify` checks the mechanics")
+
+
+def contract_issues(store: str, schema: str):
+    """What the contract says is wrong with a file of records, one line each.
+
+    Asked of `datafile --strict`, which is the code that enforces this contract at
+    the write, rather than re-implemented here. A second validator would be a second
+    opinion about what this store accepts, and the one that matters is the one the
+    store uses. Its issue lines name the line and the field, which is what a reader
+    needs in order to go and look."""
+    if not os.path.isfile(store):
+        return []
+    proc = run_tool(["datafile", "-f", store, "-c", schema, "validate", "--strict"])
+    if proc.returncode == 0:
+        return []
+    out, keep = [], False
+    for line in (proc.stdout + proc.stderr).splitlines():
+        if line.startswith("issues["):
+            keep = True
+            continue
+        if line.startswith("help["):
+            break
+        if keep and line.strip():
+            out.append(line.strip())
+    return out or ["datafile refused this store and said nothing this could relay;"
+                   f" run `datafile -f {store} validate`"]
+
+
+def contract_problems(world):
+    """Check 1: every line of the ledger still passes the contract.
+
+    A record that violates the contract fails every check below it as well, because
+    the fields those read are the ones it is missing. Naming the contract violation
+    is what says why: a record with no `source` is a record nobody wrote through
+    this command, not a case somebody archived badly."""
+    return [Problem("(the log)", "contract", issue)
+            for issue in contract_issues(world.store, world.schema)]
+
+
+def contract_refusals(records, schema: str):
+    """The contract's verdict on a plan's records, before anything has been written.
+
+    The archive's first step is to validate everything, and until this existed the
+    contract was first applied by the `datafile put` at step 4 - after the blobs had
+    been copied and after `git update-ref` had created a ref in the captain's own
+    checkout. A plan abbreviating a `head` reaches that far: `git cat-file -e`
+    resolves an abbreviation, so the head check passes and only the store refuses
+    it, by which time this command has already written outside itself.
+
+    Validated by writing the candidates to a scratch store and asking `datafile`, for
+    the reason `contract_issues` gives: the contract is what the store enforces, and
+    a copy of its rules here would be a second opinion that drifts towards accepting
+    what the store rejects."""
+    fd, tmp = tempfile.mkstemp(prefix="findings-plan-", suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
+        return contract_issues(tmp, schema)
+    finally:
+        os.unlink(tmp)
+
+
+def verify(world, only=None):
+    """Re-run every mechanical check, and say plainly what was not checked.
+
+    The last line is the design's whole honesty argument made into output. Every
+    check above it is something a script established. `resolution` is a sentence an
+    agent wrote, and it sits in the same record as every pointer needed to re-derive
+    it, so a later reader who disagrees can say so - what they cannot do is find the
+    claim unsupported and untraceable. A green here must never be read as agreement
+    with that sentence, so this says it is not."""
+    records = list(world.ledger.values())
+    if only is not None:
+        records = [r for r in records if r.get("case") == only]
+        if not records:
+            die(f"no case under that name: {only}")
+    problems = list(contract_problems(world))
+    for _, rounds in cases_of(records):
+        problems.extend(check_case(rounds, world, "verify"))
+    # Store-wide even when one case was asked for. Whether this log is append-only
+    # is a property of the log, and running it per case would let a rewrite be
+    # hidden by verifying the case it is not in.
+    store_level = append_only(world.store)
+
+    failed = [p for p in problems if p.verifiable] + \
+             [Problem("(the log)", "append-only", d) for d in store_level]
+    unverifiable = [p for p in problems if not p.verifiable]
+    groups = cases_of(records)
+    print(f"verify   {count(len(records), 'record')} in"
+          f" {count(len(groups), 'case')}")
+    for problem in failed:
+        print(f"  failed        {problem.record_id}  {problem}")
+    for problem in unverifiable:
+        print(f"  unverifiable  {problem.record_id}  {problem}")
+    if not failed and not unverifiable:
+        print("  ok            every check, on every record")
+    print("  not checked   resolution and resolved_by: whether the successor"
+          " really closed the finding is judgment")
+    if failed:
+        print(f"verify   {len(failed)} failed")
+        return 1
+    if unverifiable:
+        # Not a failure: the ledger is intact and the world lost what the check
+        # reads. Not a pass either, and the summary says so rather than printing a
+        # word the reader would take for one.
+        print(f"verify   {len(unverifiable)} could not be checked")
+    return 0
+
+
+def read_plan(path: str, fields):
+    """A plan, refused rather than interpreted.
+
+    Every refusal here costs a retype and nothing else, because it happens before
+    anything is written. That is the cheapest place in this whole command to say no,
+    so it is where as much of the saying no as possible is done."""
+    try:
+        with open(path) as fh:
+            plan = json.load(fh)
+    except FileNotFoundError:
+        die(f"no plan at {path}",
+            "a plan is what carries SIANA's judgment into this store; there is no"
+            " flag that archives without one")
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"{path} will not read as JSON: {e}")
+    if not isinstance(plan, list) or not plan:
+        die(f"{path} is not a non-empty JSON array of records",
+            "one array, one case, every round of it")
+    ids, rounds = set(), set()
+    cases = set()
+    for i, rec in enumerate(plan):
+        if not isinstance(rec, dict):
+            die(f"{path} entry {i} is not an object")
+        for field in DERIVED:
+            if field in rec:
+                die(f"{path} entry {i} sets {field}, which the archive fills in",
+                    "the queue record, its reason, the clock and the digests are"
+                    " read from the world here, and a plan that carried them would"
+                    " be a second writer for a fact only one thing can know")
+        for field in ("id", "case", "round"):
+            if not rec.get(field):
+                die(f"{path} entry {i} has no {field}")
+        if not isinstance(rec["round"], int) or rec["round"] < 1:
+            die(f"{path} entry {rec['id']} has round {rec['round']!r}",
+                "rounds are counted from 1, and the whole case check is arithmetic"
+                " on them")
+        unknown_fields = [k for k in rec if k not in fields]
+        if unknown_fields:
+            die(f"{path} entry {rec['id']} sets fields this contract does not have:"
+                f" {', '.join(sorted(unknown_fields))}")
+        if rec["id"] in ids:
+            die(f"{path} names {rec['id']} twice")
+        if rec["round"] in rounds:
+            die(f"{path} has two records at round {rec['round']}")
+        ids.add(rec["id"])
+        rounds.add(rec["round"])
+        cases.add(rec["case"])
+    if len(cases) > 1:
+        die(f"{path} mixes {len(cases)} cases: {', '.join(sorted(cases))}",
+            "a case is archived whole, because the invariant that ends a chain"
+            " cannot be checked from one round of it")
+    return sorted(plan, key=lambda r: r["round"])
+
+
+def plan_fields(rec):
+    """What the plan actually decided, which is what a re-run compares.
+
+    Not the whole record. The clock, the queue snapshot and the digests are stamped
+    by the archive, so a second run would differ from the first in all three and
+    every re-run would read as a rewrite. Comparing what SIANA wrote is what makes
+    the identical plan converge and the edited one refuse."""
+    out = {}
+    for key, value in rec.items():
+        if key in DERIVED:
+            continue
+        if key == "evidence":
+            # The paths and pointers, without the digests: on a re-run the file may
+            # legitimately have changed, and the archived bytes are the ones the
+            # ledger keeps. A digest compared here would refuse a plan nobody edited.
+            out[key] = [split_evidence(e)[1] for e in value or []]
+        else:
+            out[key] = value
+    return out
+
+
+def default_for(kind):
+    """What a field the plan does not set is worth, by the contract's own defaults.
+
+    A list defaults to empty and everything else to null, which is what `datafile`
+    materialises an omitted field to. Without this a plan that never mentioned
+    `tags` would read as disagreeing with the empty list the store wrote."""
+    return [] if kind == "list" else None
+
+
+def differences(plan_rec, stored, fields):
+    """Which of this stored record's fields the plan disagrees with.
+
+    Over every field either of them has, and not only the ones the plan still
+    carries. A field deleted from a plan is a change to what SIANA decided, and
+    reading only the plan's own keys made that the one edit that converged silently:
+    a wrong pointer taken back out gave a green run against a ledger that still held
+    it, and the store is append-only by refusal, so nothing else would ever have
+    surfaced the divergence.
+
+    Named one by one rather than reported as "differs", because the whole question a
+    reader has at this point is which half is wrong: the plan they just edited, or
+    the record that was written before they edited it."""
+    left, right = plan_fields(plan_rec), plan_fields(stored)
+    out = []
+    for key in sorted(set(left) | set(right)):
+        if key in ("id", "case"):
+            # The key itself, and the field the caller has already refused on with
+            # a message that says more than a field name could.
+            continue
+        if key in left:
+            if right.get(key) != left[key]:
+                out.append(f"{key}: the plan says {left[key]!r}, the ledger holds"
+                           f" {right.get(key)!r}")
+        elif right.get(key) != default_for(fields.get(key)):
+            out.append(f"{key}: the plan no longer carries it, and the ledger holds"
+                       f" {right.get(key)!r}")
+    return out
+
+
+def build(plan_rec, task, stamp):
+    """One ledger record, from the plan and from the world.
+
+    The plan carries the judgment and the pointers. This adds the queue record
+    verbatim - a snapshot of a different contract, kept unreshaped - the reason
+    lifted to the top level so a reader need not know the queue's field layout, the
+    clock, and a digest for every file the plan named."""
+    rec = dict(plan_rec)
+    rec["source"] = dict(task)
+    reason = task.get("reason")
+    if not reason:
+        die(f"{plan_rec['id']} has no blocked reason in the queue",
+            "the reason is the finding in the minion's own words, and a record"
+            " without it keeps only SIANA's summary of what somebody else found")
+    rec["reason"] = reason
+    rec["archived_at"] = stamp
+    rec["head_pinned"] = False
+    evidence = []
+    for entry in plan_rec.get("evidence") or []:
+        if POINTER.match(entry):
+            evidence.append(entry)
+            continue
+        if not os.path.isabs(entry):
+            die(f"{plan_rec['id']} names evidence by a relative path: {entry}",
+                "a plan is read from wherever it is run, so a relative path means a"
+                " different file depending on where the archive happened")
+        try:
+            evidence.append(f"{digest_of(entry)} {entry}")
+        except OSError as e:
+            die(f"{plan_rec['id']} names evidence that cannot be read: {entry}",
+                str(e),
+                "a plan naming a file that is not there is a plan written against a"
+                " world that has moved. It is never skipped and never recorded as"
+                " absent: if it genuinely does not apply, leave it out; if it"
+                " applied and is gone, name the field in `unknown` and say so in"
+                " `resolution`")
+    rec["evidence"] = evidence
+    return rec
+
+
+def write_record(store: str, schema: str, record):
+    """Every write goes through `datafile`, so what lands has already passed the
+    contract that the queue and the registry pass through the same code. Writing the
+    JSONL line here would be a second writer, and a second writer is a second set of
+    rules."""
+    proc = run_tool(["datafile", "-f", store, "-c", schema, "put",
+                     json.dumps(record)])
+    if proc.returncode != 0:
+        die(f"the ledger refused {record.get('id')}",
+            *(proc.stdout + proc.stderr).strip().splitlines()[:6])
+
+
+def read_back(store: str, schema: str, record):
+    """Read one record out of the store and compare it field by field.
+
+    This is the last gate before anything leaves the queue, and it is the reason
+    dropping is structurally after writing rather than merely conventionally after
+    it. A record the store did not keep, or kept differently, stops the archive here
+    - with the queue still holding every task, which is the safe direction."""
+    rid = record.get("id")
+    proc = run_tool(["datafile", "-f", store, "-c", schema, "get", rid, "--json"])
+    if proc.returncode != 0:
+        die(f"the ledger will not read {rid} back",
+            *(proc.stdout + proc.stderr).strip().splitlines()[:6],
+            "nothing has been dropped from the queue")
+    try:
+        stored = json.loads(proc.stdout).get("record")
+    except json.JSONDecodeError:
+        die(f"the ledger's answer for {rid} is not JSON",
+            "nothing has been dropped from the queue")
+    if not isinstance(stored, dict):
+        die(f"the ledger has no record for {rid} after writing it",
+            "nothing has been dropped from the queue")
+    for key, value in record.items():
+        if instant(stored.get(key)) != instant(value):
+            die(f"the ledger kept {rid}.{key} as {stored.get(key)!r}, not as"
+                f" {value!r}",
+                "nothing has been dropped from the queue")
+
+
+def drop(tasks_file: str, task_id: str, record_id: str):
+    """Remove one task, naming where it went.
+
+    `tasks drop` on an absent task reports `absent` and exits 0, which is what makes
+    a re-run after a partial pass converge instead of stopping on the ones it
+    already removed."""
+    proc = run_tool(["tasks", "--file", tasks_file, "drop", task_id,
+                     "--reason", f"archived to the findings ledger as {record_id}"])
+    if proc.returncode != 0:
+        die(f"the queue refused to drop {task_id}",
+            *(proc.stdout + proc.stderr).strip().splitlines()[:6],
+            "the ledger already holds this case, so re-running this plan is safe")
+    # The line, not the word. Ids match `^[a-z][a-z0-9-]{2,47}$`, and the reason
+    # this writes is echoed back on stdout, so `qa-absent-blob` would have read as a
+    # task that was already gone: dropped in fact and reported as untouched, in the
+    # archive's only account of the step that removes queue records.
+    return any(line.strip() == "result: absent"
+               for line in proc.stdout.splitlines())
+
+
+def check_reused_id(rec, world, fresh: bool):
+    """That the task about to be dropped is the one this record archived.
+
+    Only a re-run can get this wrong, and only for a record already in the ledger.
+    Its id is a queue id, and a queue id is derived from the title against the live
+    fold, so a dropped one is free again: re-briefing work under the same title
+    reclaims it. A re-run of the same plan is advertised as safe from any state, so
+    it would then have dropped a live task nothing had archived, with a reason
+    naming a record that is not about it - and `tasks drop` only guards work that is
+    in flight, so a waiting one would have gone without a word.
+
+    Presence is not the question, because in the crash window this exists to
+    tolerate the queue still holds the very task `source` is a copy of. Equality is:
+    `source` is that record verbatim, so anything else under the id is something
+    else."""
+    if fresh:
+        return []                      # `source` was just folded from this task
+    task = world.queue.get(rec["id"])
+    if task is None or task == rec.get("source"):
+        return []
+    archived, live = rec.get("source") or {}, task
+    return [f"{rec['id']} is in the queue as a task this record did not archive:"
+            f" {live.get('title')!r} ({live.get('status')}, updated"
+            f" {live.get('updated')}), where the record archived"
+            f" {archived.get('title')!r} ({archived.get('status')}, updated"
+            f" {archived.get('updated')}). A queue id is free again once it is"
+            " dropped, so this is a new task wearing an archived name and dropping"
+            " it would remove work nothing here has a record of"]
+
+
+def check_superseded(rec, world, fresh: bool):
+    """The four conditions under which a waiting task goes with the record.
+
+    All four are mechanical, and the last is the one that matters: a QA task is
+    removed only where an independent acceptance of the same work exists somewhere
+    else. Without it this would be a command that skips QA, and with it removing the
+    orphan is recording that something better already read the work it would have
+    read.
+
+    The first condition is that the task exists, and whether an absent one is a
+    refusal depends on which run this is. On a first archive it is: a plan naming a
+    task the queue does not have removes nothing, but writes into the ledger that it
+    did, so `show` reports a removal that never happened while the real stranded task
+    sits in the queue with nothing pointing at it. Typing the orphan's title where
+    its id belongs is exactly how that is reached. On a re-run the same absence is
+    this command's own previous pass, which is what makes a repeated plan converge,
+    so it is passed over there and only there."""
+    out, rid = [], rec.get("id")
+    for task_id in rec.get("superseded") or []:
+        task = world.queue.get(task_id)
+        if task is None:
+            if fresh:
+                out.append(f"{task_id} is not in the queue, so archiving this record"
+                           " would record a removal that never happened")
+            continue                   # already dropped: a re-run converges here
+        if task.get("status") != "todo":
+            out.append(f"{task_id} is {task.get('status')}, not todo: a task that is"
+                       " not merely waiting is not one this may remove")
+        if rid not in (task.get("deps") or []):
+            out.append(f"{task_id} does not depend on {rid}, so archiving this is"
+                       " not what strands it")
+        acceptance = rec.get("acceptance")
+        accepted = world.queue.get(acceptance) if acceptance else None
+        if accepted is None or accepted.get("status") != "done":
+            out.append(f"{task_id} may only go where an independent acceptance of"
+                       f" the same work is done; {acceptance or '(nothing)'} is not")
+    return out
+
+
+def archive(world, plan_path: str):
+    plan = read_plan(plan_path, world.fields())
+    case_name = plan[0]["case"]
+    stamp = now()
+
+    # Every record first, without writing any of them: a record built from a queue
+    # task that is already archived would restamp the clock and re-fold a source
+    # that is no longer there, so an existing record is reused whole and only the
+    # plan's own fields are compared against it.
+    records, fresh = [], set()
+    for plan_rec in plan:
+        rid = plan_rec["id"]
+        stored = world.ledger.get(rid)
+        if stored is not None:
+            if stored.get("case") != case_name:
+                die(f"{rid} is already archived under case {stored.get('case')}",
+                    f"this plan files it under {case_name}; a task id is the key of"
+                    " this store and two different findings may not share one")
+            diffs = differences(plan_rec, stored, world.fields())
+            if diffs:
+                die(f"{rid} is already archived and this plan differs from it",
+                    *diffs,
+                    "nothing has been written and nothing dropped. A finding is"
+                    " written once; the plan is what changes, or the record stands")
+            records.append(stored)
+            continue
+        task = world.queue.get(rid)
+        if task is None:
+            die(f"{rid} is neither in the queue nor in this ledger",
+                "nothing to archive and nothing recorded is a fault rather than a"
+                " no-op: the task was removed by something that kept no record")
+        records.append(build(plan_rec, task, stamp))
+        fresh.add(rid)
+
+    # Any round of this case already in the ledger that the plan does not name. It
+    # belongs to the case whether or not this plan mentions it, so the contiguity
+    # check has to see it: without this a plan that left round 3 out would archive
+    # rounds 4 and 5 as a complete chain of two.
+    named = {r["id"] for r in plan}
+    records.extend(rec for rid, rec in sorted(world.ledger.items())
+                   if rec.get("case") == case_name and rid not in named)
+
+    # 1. The contract first, and on its own. Every check below reads fields the
+    #    contract has not yet approved, so a record it will refuse produces a page
+    #    of consequential complaints about the one thing that is actually wrong.
+    refused = contract_refusals(records, world.schema)
+    if refused:
+        die(f"{case_name} has a record this store would not accept",
+            *refused,
+            "nothing has been written and nothing dropped")
+
+    problems = check_case(records, world, "archive")
+    superseded = [p for rec in records
+                  for p in check_superseded(rec, world, rec["id"] in fresh)
+                  ] + [p for rec in records
+                       for p in check_reused_id(rec, world, rec["id"] in fresh)]
+    if problems or superseded:
+        die(f"{case_name} is not a case this may archive",
+            *(f"{p.record_id}  {p}" for p in problems), *superseded,
+            "nothing has been written and nothing dropped")
+
+    print(f"archive  {case_name}  {count(len(records), 'record')}")
+
+    # 2. Every blob, before any ledger write. A blob already present under the right
+    #    digest is kept: same bytes archived twice is one blob, and a re-run after a
+    #    crash copies only what is missing.
+    for rec in records:
+        for entry in rec.get("evidence") or []:
+            sha, rest = split_evidence(entry)
+            if sha is None:
+                continue
+            if os.path.exists(blob_path(world.home, sha)):
+                continue
+            if not os.path.exists(rest):
+                die(f"{rec['id']} names evidence that is neither in the blob store"
+                    f" nor on disk: {rest}",
+                    f"the archived digest is {sha}",
+                    "the bytes this record rests on exist nowhere, so there is"
+                    " nothing here to archive them from")
+            if digest_of(rest) != sha:
+                die(f"{rec['id']}'s evidence has changed and was never copied:"
+                    f" {rest}",
+                    f"the record says {sha[:12]} and the file is now"
+                    f" {digest_of(rest)[:12]}",
+                    "the archived bytes are gone; this cannot be rebuilt from what"
+                    " is on disk")
+            if store_blob(world.home, rest, sha):
+                print(f"  blob     {sha[:12]}  {rest}")
+
+    # 3. Every ref, before any ledger write. `update-ref` is idempotent with the same
+    #    value, so a re-run re-pins and exits 0.
+    for rec in records:
+        head, handle = rec.get("head"), rec.get("project")
+        if not head:
+            continue
+        path = world.checkout(handle)
+        ref = f"{REF_NAMESPACE}/{rec['id']}"
+        pinned = git(path, "update-ref", ref, head)
+        if pinned.returncode:
+            die(f"cannot pin {ref} in {path}",
+                (pinned.stderr or pinned.stdout).strip(),
+                "an unpinned rejected head does not survive `gc --prune=now` once"
+                " its branch is gone, so this is refused rather than recorded as"
+                " done")
+        # Past tense, and only for a record this run is writing. A record already
+        # in the ledger keeps whatever it recorded: the read-back compares what is
+        # about to be stored against what is stored, and a field changed here would
+        # fail that comparison over a pin that succeeded.
+        if rec["id"] in fresh:
+            rec["head_pinned"] = True
+        with open(os.path.join(world.home, "findings", "refs.log"), "a") as fh:
+            fh.write(f"{stamp} {handle} {ref} {head}\n")
+        print(f"  pinned   {ref} -> {head[:12]}")
+
+    # 4. Every ledger record, in round order. A record already present is skipped
+    #    rather than re-put: `datafile` would report it unchanged, but skipping is
+    #    what makes the intent of a re-run legible in the output.
+    for rec in records:
+        if rec["id"] not in fresh:
+            continue
+        write_record(world.store, world.schema, rec)
+        print(f"  wrote    {rec['id']}  round {rec.get('round')}")
+
+    # 5. Every record read back, before anything is dropped.
+    for rec in records:
+        read_back(world.store, world.schema, rec)
+
+    # 6. And only now the queue. Steps 4 and 6 are never interleaved: a failure
+    #    between them leaves the queue holding tasks the ledger already has, which
+    #    over-reports what is left to do, and a re-run of the same plan drops them.
+    removed = 0
+    for rec in records:
+        for task_id in [rec["id"], *(rec.get("superseded") or [])]:
+            if drop(world.tasks_file, task_id, rec["id"]):
+                continue
+            removed += 1
+            print(f"  dropped  {task_id}"
+                  + ("" if task_id == rec["id"] else f" (superseded by {rec['id']})"))
+    if not fresh and not removed:
+        print(f"archived {case_name}  already archived")
+    else:
+        print(f"archived {case_name}  {count(len(records), 'record')},"
+              f" {count(removed, 'task')} removed")
+    return 0
+
+
+def blob(world, sha):
+    if not DIGEST.match(sha or ""):
+        die(f"not a sha256: {sha}", "`siana-findings show <id>` lists the digests")
+    path = blob_path(world.home, sha)
+    if not os.path.exists(path):
+        die(f"no blob under {sha}",
+            f"looked in {os.path.dirname(path)}")
+    with open(path, "rb") as fh:
+        sys.stdout.buffer.write(fh.read())
+    return 0
+
+
+def main() -> int:
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    tasks_file = (os.environ.get("SIANA_TASKS_FILE")
+                  or os.path.join(home, "tasks.jsonl"))
+
+    ap = argparse.ArgumentParser(
+        prog="siana-findings", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    # The default view, also reachable by name. A reader who has just typed
+    # `siana-findings verify` should not have to know that the one view without a
+    # verb is spelled by leaving the verb out.
+    sub.add_parser("list")
+    s = sub.add_parser("show")
+    s.add_argument("id")
+    c = sub.add_parser("case")
+    c.add_argument("case")
+    v = sub.add_parser("verify")
+    v.add_argument("case", nargs="?")
+    b = sub.add_parser("blob")
+    b.add_argument("sha256")
+    a = sub.add_parser("archive")
+    a.add_argument("--plan", required=True,
+                   help="the case plan SIANA wrote, under findings/plans/")
+    args = ap.parse_args()
+
+    # The contract is what says the store exists, because a ledger with no archives
+    # yet has no `.jsonl` file at all. Missing it is a stop and never an empty
+    # ledger: a home that cannot read this store reporting nothing archived is
+    # indistinguishable from a fleet that has found nothing, and those are opposite
+    # facts.
+    schema = os.path.join(home, "schema-findings.yaml")
+    if not os.path.isfile(schema):
+        die(f"the findings ledger is unavailable: no contract at {schema}",
+            "it is what makes a resolved finding outlive the queue task it came"
+            " from",
+            "run `just upgrade` in the distro")
+
+    world = World(home, tasks_file)
+    if args.cmd in (None, "list"):
+        view(world)
+        return 0
+    if args.cmd == "show":
+        show(world, args.id)
+        return 0
+    if args.cmd == "case":
+        case_view(world, args.case)
+        return 0
+    if args.cmd == "verify":
+        return verify(world, args.case)
+    if args.cmd == "blob":
+        return blob(world, args.sha256)
+    os.makedirs(os.path.join(home, "findings", "plans"), exist_ok=True)
+    return archive(world, args.plan)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Refusal as r:
+        print(f"error: {r.message}", file=sys.stderr)
+        for h in r.hints:
+            print(f"  {h}", file=sys.stderr)
+        raise
+    except KeyboardInterrupt:
+        sys.exit(130)

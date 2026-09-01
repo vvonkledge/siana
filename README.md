@@ -93,9 +93,10 @@ Into the home:
   SIANA evolves its own instructions, so a home copy that differs from the template
   is your work, and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
-  `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
-  reason. A contract only ever grows, because a field dropped from a live contract
-  makes every record still carrying it unreadable.
+  `schema-attended.yaml`, `schema-findings.yaml`, `schema-tasks.yaml`: the store
+  contracts. Also never overwritten, for a harder reason. A contract only ever grows,
+  because a field dropped from a live contract makes every record still carrying it
+  unreadable.
 - `principles.md`, a template for the principles an advisory session holds SIANA to.
   Written only when absent, and never touched by `just upgrade` either: a distro that
   could rewrite it could rewrite what SIANA is held to while you are asleep. It ships
@@ -112,15 +113,16 @@ Into the home:
   [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
-`decisions.jsonl` - are not written here. `datafile` creates each on its first append,
-so a contract with no `.jsonl` beside it is an empty store and not a broken install.
+`decisions.jsonl`, `attended.jsonl`, `findings.jsonl` - are not written here.
+`datafile` creates each on its first append, so a contract with no `.jsonl` beside it
+is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
 `siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
-`siana-gate`, `siana-read`, `siana-clean`, `siana-report`, `siana-console`. They are
-links, so a `git pull` here updates the commands with no reinstall. It does not update
-the home; `just upgrade` does that.
+`siana-gate`, `siana-read`, `siana-clean`, `siana-report`, `siana-console`,
+`siana-findings`. They are links, so a `git pull` here updates the commands with no
+reinstall. It does not update the home; `just upgrade` does that.
 
 ### The distro's own pi package
 
@@ -751,6 +753,45 @@ in this distro turns a row of this store into an action.
 It is not `decisions.jsonl`. That one is the advisory ledger: what SIANA would have
 done while you were away, where nobody was asked and no answer exists.
 
+### What the fleet found, after it was fixed
+
+The queue holds work someone can still act on. A review finding whose repair has been
+independently accepted is not that: nobody will do anything about it, and leaving it
+in `blocked` makes the fleet report blockers when the actionable number is zero. It
+is also the most expensive thing this fleet produces, and it is read again every time
+similar work is briefed. So it moves to the findings ledger.
+
+    siana-findings                  every finding, newest case first
+    siana-findings show <id>        one finding whole, with its evidence resolved
+    siana-findings case <case>      one rejection chain, every round in order
+    siana-findings verify [<case>]  re-run every mechanical check
+    siana-findings blob <sha256>    print one archived evidence file
+
+A rejection chain is archived whole, as a case, and only once its last round ends in
+an acceptance that is `done`. Nothing auto-archives: every record enters through a
+plan SIANA wrote, and `siana-findings archive --plan <file>` is the only thing that
+writes this store.
+
+Two things it will not do, and they are the design. It never decides that a successor
+resolved a finding: `resolution` is a sentence SIANA writes, and no ancestry, `deps`,
+`base` or merge commit reaches it. And it never answers a finding your pipeline marked
+for you: a case carrying one is refused unless a closed obligation of yours is named
+in its evidence.
+
+What it does check, on demand and not only once, is everything mechanical: that the
+lineage resolves, that the case is a complete chain, that every archived report is
+still byte-identical to the copy in the blob store, that every rejected head is still
+pinned, and that the log has never been rewritten. `siana-findings verify` prints all
+of that beside the words `not checked here` against the judgment, so a green run
+never reads as agreement with the sentence.
+
+Evidence is copied rather than referenced, into
+`$SIANA_HOME/findings/blobs/<aa>/<rest>`, keyed by sha256. Your home is not a git
+repository and the documents in it get rewritten; a digest of a file that changed
+reads as tampering and a digest of a file that was deleted leaves nothing at all.
+Rejected heads are pinned as `refs/siana/findings/<id>` in the project checkout,
+which is what stops `git gc` collecting a commit whose branch is gone.
+
 ## Validate a change to the distro
 
     just test
@@ -790,10 +831,13 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-Those four runs are that head's, and that head had 912 tests. This tree has 1390, so
+Those four runs are that head's, and that head had 912 tests. This tree has 1495, so
 expect longer on the one you are standing on: measured here, about six minutes from the
 default pool on a quiet eleven-core box, about eight and a half with other work running
 alongside it, and about nine and a half at the three workers a four-core runner gets.
+Two single runs on this tree came in under those, 274s from the default pool and 487s
+at three workers, both at loads between five and seven; one run each is an observation
+and not a claim, and the estimates above are still the ones to plan against.
 One worker is slower again in proportion, and stays a control to reach for rather than a
 way to run the suite. All of them stretch under fleet load, and this machine's own
 variation is wider than the gap between any two pool sizes. Measured separately by the
