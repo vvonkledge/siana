@@ -538,14 +538,14 @@ test *args:
     # files that appeared. The flag covers the `bin/` loads in this process too; the
     # guard in tests/helpers.py covers those when the suite is run without `just`.
     #
-    # Not exported. PYTHONDONTWRITEBYTECODE would reach the commands the suite drives
-    # as processes, which write no bytecode into the worktree anyway: a script run
-    # directly never writes its own, and the `bin/` commands import stdlib only. What
-    # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
-    # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner. Invisible locally, where the captain's uv cache is already
-    # warm, and worse than it looks now that a warm run is minutes rather than ten of
-    # them: the pool shortens the wall clock and changes none of that cost.
+    # Still not exported, and the flag is not the whole of the guarantee either: it
+    # is not inherited, so a test that spawns its own interpreter with `tests/`
+    # importable wrote a `helpers.pyc` into the worktree whatever this line said.
+    # `tests/run.py` closes that by pointing every process a run starts at one
+    # bytecode directory outside the tree, and says there why that rather than
+    # exporting PYTHONDONTWRITEBYTECODE, which reaches `tasks` and `datafile` and
+    # costs their uv environments the cache they read on every one of the hundreds of
+    # invocations a run makes.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`

@@ -1172,6 +1172,33 @@ class Litter(Fixture):
         self.assertEqual(self.go(where, workers=2).returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(where, "__pycache__")))
 
+    def test_a_child_a_test_spawns_writes_no_bytecode_either(self):
+        # The half `-B` cannot reach, because a flag is not inherited. A test that
+        # starts its own interpreter with the suite's directory importable - and
+        # `tests/test_clean.py` does - compiled `helpers.py` into a `__pycache__`
+        # inside the worktree, whatever the runner above it was started with. That
+        # one file is enough for `siana-retire` to refuse the tree.
+        #
+        # Driven through a real run rather than by reading the setting back, because
+        # what has to hold is that a grandchild of the runner inherits it: a test
+        # that asserted the variable would still pass if nothing passed it on.
+        where = self.suite(imported="""
+            VALUE = 1
+        """, test_spawns="""
+            import os, subprocess, sys, unittest
+
+            class Spawns(unittest.TestCase):
+                def test_a_child_imports_a_sibling(self):
+                    here = os.path.dirname(os.path.abspath(__file__))
+                    out = subprocess.run(
+                        [sys.executable, "-c", "import imported"], cwd=here,
+                        env=dict(os.environ, PYTHONPATH=here),
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(out.returncode, 0, out.stderr)
+        """)
+        self.assertEqual(self.go(where, workers=2).returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(where, "__pycache__")))
+
     def test_no_run_root_is_left_under_the_temporary_directory(self):
         root = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
         where = self.suite(test_ok="""
