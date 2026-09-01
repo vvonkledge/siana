@@ -93,9 +93,10 @@ Into the home:
   SIANA evolves its own instructions, so a home copy that differs from the template
   is your work, and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
-  `schema-semantic.yaml`, `schema-tasks.yaml`: the store contracts. Also never
-  overwritten, for a harder reason. A contract only ever grows, because a field
-  dropped from a live contract makes every record still carrying it unreadable.
+  `schema-attended.yaml`, `schema-findings.yaml`, `schema-semantic.yaml`,
+  `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
+  reason. A contract only ever grows, because a field dropped from a live contract
+  makes every record still carrying it unreadable.
 - `principles.md`, a template for the principles an advisory session holds SIANA to.
   Written only when absent, and never touched by `just upgrade` either: a distro that
   could rewrite it could rewrite what SIANA is held to while you are asleep. It ships
@@ -112,16 +113,16 @@ Into the home:
   [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
-`decisions.jsonl`, `semantic.jsonl` - are not written here. `datafile` creates each
-on its first append, so a contract with no `.jsonl` beside it is an empty store and
-not a broken install.
+`decisions.jsonl`, `attended.jsonl`, `findings.jsonl`, `semantic.jsonl` - are not
+written here. `datafile` creates each on its first append, so a contract with no
+`.jsonl` beside it is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
 `siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
 `siana-gate`, `siana-read`, `siana-clean`, `siana-report`, `siana-console`,
-`siana-semantic`. They are links, so a `git pull` here updates the commands with no
-reinstall. It does not update the home; `just upgrade` does that.
+`siana-findings`, `siana-semantic`. They are links, so a `git pull` here updates the
+commands with no reinstall. It does not update the home; `just upgrade` does that.
 
 ### The distro's own pi package
 
@@ -794,6 +795,45 @@ in this distro turns a row of this store into an action.
 It is not `decisions.jsonl`. That one is the advisory ledger: what SIANA would have
 done while you were away, where nobody was asked and no answer exists.
 
+### What the fleet found, after it was fixed
+
+The queue holds work someone can still act on. A review finding whose repair has been
+independently accepted is not that: nobody will do anything about it, and leaving it
+in `blocked` makes the fleet report blockers when the actionable number is zero. It
+is also the most expensive thing this fleet produces, and it is read again every time
+similar work is briefed. So it moves to the findings ledger.
+
+    siana-findings                  every finding, newest case first
+    siana-findings show <id>        one finding whole, with its evidence resolved
+    siana-findings case <case>      one rejection chain, every round in order
+    siana-findings verify [<case>]  re-run every mechanical check
+    siana-findings blob <sha256>    print one archived evidence file
+
+A rejection chain is archived whole, as a case, and only once its last round ends in
+an acceptance that is `done`. Nothing auto-archives: every record enters through a
+plan SIANA wrote, and `siana-findings archive --plan <file>` is the only thing that
+writes this store.
+
+Two things it will not do, and they are the design. It never decides that a successor
+resolved a finding: `resolution` is a sentence SIANA writes, and no ancestry, `deps`,
+`base` or merge commit reaches it. And it never answers a finding your pipeline marked
+for you: a case carrying one is refused unless a closed obligation of yours is named
+in its evidence.
+
+What it does check, on demand and not only once, is everything mechanical: that the
+lineage resolves, that the case is a complete chain, that every archived report is
+still byte-identical to the copy in the blob store, that every rejected head is still
+pinned, and that the log has never been rewritten. `siana-findings verify` prints all
+of that beside the words `not checked here` against the judgment, so a green run
+never reads as agreement with the sentence.
+
+Evidence is copied rather than referenced, into
+`$SIANA_HOME/findings/blobs/<aa>/<rest>`, keyed by sha256. Your home is not a git
+repository and the documents in it get rewritten; a digest of a file that changed
+reads as tampering and a digest of a file that was deleted leaves nothing at all.
+Rejected heads are pinned as `refs/siana/findings/<id>` in the project checkout,
+which is what stops `git gc` collecting a commit whose branch is gone.
+
 ## Validate a change to the distro
 
     just test
@@ -833,25 +873,30 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-Those four runs are that head's, and that head had 912 tests. This tree has 1526, so
-expect longer on the one you are standing on: measured here rather than scaled, on the
-same eleven-core M3 Pro, two runs of the default five-worker pool at 302.5s and 302.4s
-and one at the three workers a four-core runner gets at 379.1s, that last taken at load
-averages between 3.0 and 5.5 with nothing else of this size on the box. Call it five
-minutes from the default pool and six and a half at three. One worker is slower again
-in proportion, and stays a control to reach for rather than a way to run the suite. All
-of them stretch under fleet load, and this machine's own variation is wider than the
-gap between any two pool sizes - wider, on this evidence, than the gap between suite
-sizes, since the same three-worker mode took 558s at `a97e447` over 1390 tests rather
-than 1526.
+Those four runs are that head's, and that head had 912 tests. This tree has 1631, so
+expect longer on the one you are standing on. Measured here rather than scaled, on
+the same eleven-core M3 Pro: 407.6s from the default five-worker pool, and 464.6s at
+the three workers a four-core runner gets. Both were taken with the box busy - load
+6.4 rising to 13.4 across the first, 12.5 falling to 3.7 across the second - so they
+are the slow end of this machine rather than the fast one. Call it seven minutes from
+the default pool and eight at three, and re-measure rather than planning against
+either: they are one run each. GitHub's own four-core runner took 497s at three
+workers over the 1526 tests this tree grew from, which is what
+`.github/workflows/ci.yml` sizes its hang guard against.
+
+Load is the variable that moves these, not the number of tests. The same three-worker
+mode on this machine took 558s over 1390 tests, 487s over 1495, 379s over 1526 and
+464.6s over 1631, which is a spread wider than the growth it is supposed to be
+tracking. One worker is slower again in proportion, and stays a control to reach for
+rather than a way to run the suite.
 
 Measured separately by the author of the pool at `6906b6a`, interleaving the two
 modes: one control of 1115s taken at load 11.8, against pool runs of 199s, 296s and
 551s taken at loads 14.3, 19.7 and 26.4. Across the whole of that work, at heads and
 loads that were not held constant, the one-worker control measured anywhere from 703s
-to 1115s. Those are observations of what load does, not a second speed claim - they are
-not comparable with the four runs above and are not combined with them. Re-measure
-rather than trusting any single number here.
+to 1115s. Those are observations of what load does, not a second speed claim - they
+are not comparable with the four runs above and are not combined with them.
+Re-measure rather than trusting any single number here.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like

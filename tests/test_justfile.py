@@ -358,6 +358,12 @@ class Init(Recipe):
                   # decision recorded without it is one nothing can learn from, and
                   # `siana-owe decision` refuses rather than writing one.
                   "schema-attended.yaml",
+                  # The findings ledger's contract. It is what says the store
+                  # exists, because a ledger that has archived nothing has no
+                  # `.jsonl` at all, and `siana-findings` refuses without it rather
+                  # than reporting a home it cannot read as a fleet that has found
+                  # nothing.
+                  "schema-findings.yaml",
                   # The captain's semantic bindings. Absent, `siana-dispatch`
                   # cannot be given one at all, and `datafile` would refuse the
                   # write with no contract to hold it to.
@@ -379,7 +385,8 @@ class Init(Recipe):
                   "siana-owe", "siana-retire", "siana-close-workspace",
                   "siana-handoff", "siana-publish", "siana-reap", "siana-pipeline",
                   "siana-afk", "siana-gate", "siana-read", "siana-clean",
-                  "siana-report", "siana-console", "siana-semantic"):
+                  "siana-report", "siana-console", "siana-findings",
+                  "siana-semantic"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this
@@ -564,6 +571,28 @@ class Init(Recipe):
         self.assertIn("attended.jsonl", doctor.stdout)
         # A home that has never run one is a zero and not a fault.
         self.assertIn("cleanup  no runs", doctor.stdout)
+
+    def test_doctor_tells_an_empty_ledger_from_an_unreadable_one(self):
+        # Opposite facts, and the whole reason this store is reported at all. A home
+        # with the contract and no archives has found nothing yet; a home without
+        # the contract cannot read the store, and reporting the second as the first
+        # would say the fleet has found nothing where the truth is that nobody can
+        # tell.
+        self.assertEqual(self.just("init").returncode, 0)
+        self.assertIn("findings.jsonl (empty; written on the first archive)",
+                      self.just("doctor").stdout)
+        os.remove(self.at("schema-findings.yaml"))
+        self.assertIn("missing findings.jsonl", self.just("doctor").stdout)
+
+    def test_upgrade_keeps_the_findings_contract(self):
+        # A contract only ever grows, and an upgrade that rewrote a live one would
+        # make every record still carrying a dropped field unreadable. That matters
+        # here more than anywhere: the records are what this fleet found.
+        self.assertEqual(self.just("init").returncode, 0)
+        out = self.just("upgrade")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("kept     ", out.stdout)
+        self.assertIn("schema-findings.yaml", out.stdout)
 
     def test_upgrade_keeps_the_runbook_and_the_attended_contract(self):
         # Both hold the fleet's own accumulated answers. An upgrade that rewrote

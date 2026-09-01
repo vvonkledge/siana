@@ -114,7 +114,7 @@ init: _contract-drift
     # itself is written by the first `datafile put`, so an empty store is a schema
     # and no log. Never overwritten, for the reason the queue's contract is not: a
     # field dropped from a live contract makes every record carrying it unreadable.
-    for c in schema-projects schema-obligations schema-decisions schema-attended schema-semantic; do
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic; do
         if [ -f "$home/$c.yaml" ]; then
             echo "current  $home/$c.yaml"
         else
@@ -327,7 +327,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-semantic; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -401,7 +401,7 @@ upgrade: _initialized init
     # line at every start, so the captain meets it where the setting they cannot make
     # would be made, and `datafile` still names the field it rejected at the write.
     echo "kept     $home/projects.jsonl (the captain's registry)"
-    for c in schema-projects schema-obligations schema-decisions schema-attended schema-semantic schema-tasks; do
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic schema-tasks; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
     done
     # The runbook is the fleet's accumulated answers to past cleanup questions, so it
@@ -574,7 +574,7 @@ doctor: _contract-drift
     # notices is what let a home with the whole package gone read as healthy.
     unhealthy=""
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-semantic.yaml schema-tasks.yaml; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-findings.yaml schema-semantic.yaml schema-tasks.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -599,6 +599,13 @@ doctor: _contract-drift
     if [ -e "$home/attended.jsonl" ]; then echo "  ok      attended.jsonl"
     elif [ -e "$home/schema-attended.yaml" ]; then echo "  ok      attended.jsonl (empty; written on the first attended decision)"
     else echo "  missing attended.jsonl"; fi
+    # The findings ledger. Empty and unavailable are opposite facts here and the
+    # line says which: a home whose contract is missing cannot read the store at
+    # all, and reporting that as an empty ledger would say this fleet has found
+    # nothing where the truth is that nothing can be read.
+    if [ -e "$home/findings.jsonl" ]; then echo "  ok      findings.jsonl"
+    elif [ -e "$home/schema-findings.yaml" ]; then echo "  ok      findings.jsonl (empty; written on the first archive)"
+    else echo "  missing findings.jsonl"; fi
     # A home that has never bound a project to the semantic layer has no store at
     # all, which is the zero and not a fault: the whole integration is opt-in and
     # the way it is opted out of is by there being nothing to read.
@@ -830,7 +837,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-semantic; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"
