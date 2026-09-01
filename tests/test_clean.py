@@ -542,6 +542,51 @@ class Run(HomeTest):
         with open(self.at("cleanup", "runs", run_id, "run.json")) as fh:
             return json.load(fh)
 
+    def live_process(self):
+        """A process that is running, that `ps` already reports as itself, and that
+        ends when this test does. Returns it with the command `ps` gives for it.
+
+        Both halves are observed here because the fixture that assumed them went
+        red on a Linux runner and nowhere else. It was `sleep 60`, snapshotted by
+        `ps` the instant `Popen` returned, and it fed both of the tests below.
+
+        The snapshot is a race: `Popen` returns as soon as the fork has happened,
+        and until the exec lands `ps` still reports this interpreter's own command
+        line, so the lock could be written naming a command the holder was never
+        running. The timer is the other half: a holder counting down 60 seconds can
+        be outlived by the run it is there to block, on a runner where the whole
+        suite takes 497 seconds. Either one leaves a lock whose recorded command no
+        longer matches its pid, which is precisely the leftover `take_lock` is
+        right to reclaim - so the test watched the lock behave correctly and called
+        it a failure.
+
+        So there is no timer at all: `cat` blocks on a pipe this test holds open and
+        is killed at cleanup. And the exec is waited for rather than assumed, by
+        polling until `ps` reports `cat` - a line this interpreter's own command can
+        never be mistaken for, which is what makes the equality proof rather than
+        coincidence. What comes back is what `siana-clean` itself will read, from
+        the same call it makes.
+        """
+        holder = subprocess.Popen(["cat"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        self.addCleanup(holder.stdin.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertTrue(until(lambda: c.process_command(holder.pid) == "cat"),
+                        "the holder never became the process ps reports for it")
+        return holder, c.process_command(holder.pid)
+
+    def assertStillItself(self, holder, command):
+        """That the fixture held for the whole of the call it was fencing.
+
+        A holder that stopped being what the lock names turns both tests below into
+        tests of the reclaim path instead, one of them silently. Asserted rather
+        than hoped for, so an escape is reported as an escape.
+        """
+        self.assertEqual(c.process_command(holder.pid), command,
+                         "the holder stopped being the process the lock names")
+
     # -- the ordinary round ------------------------------------------------
 
     def test_a_quiet_round_finishes_and_reports(self):
@@ -845,14 +890,12 @@ class Run(HomeTest):
 
     def test_a_held_lock_refuses_and_names_the_holder(self):
         os.makedirs(self.at("cleanup"), exist_ok=True)
-        holder = subprocess.Popen(["sleep", "60"])
-        self.addCleanup(holder.kill)
-        command = subprocess.run(["ps", "-p", str(holder.pid), "-o", "command="],
-                                 capture_output=True, text=True).stdout.strip()
+        holder, command = self.live_process()
         with open(self.at("cleanup", "lock"), "w") as fh:
             json.dump({"pid": holder.pid, "command": command, "what": "start",
                        "taken": "2026-01-01T00:00:00+00:00"}, fh)
         out = self.clean("start")
+        self.assertStillItself(holder, command)
         self.assertRefused(out, "already starting or resuming", str(holder.pid))
         self.assertEqual(self.calls(), [])
 
@@ -868,12 +911,15 @@ class Run(HomeTest):
         # still the one that recorded it, which is the check `siana-watch` makes of
         # its own grant, for the same reason.
         os.makedirs(self.at("cleanup"), exist_ok=True)
-        other = subprocess.Popen(["sleep", "60"])
-        self.addCleanup(other.kill)
+        other, command = self.live_process()
         with open(self.at("cleanup", "lock"), "w") as fh:
             json.dump({"pid": other.pid, "command": "some other command",
                        "what": "start", "taken": "2026-01-01T00:00:00+00:00"}, fh)
         self.assertAccepted(self.clean("start"))
+        # Without this the test passes just as well on a pid that has gone away,
+        # which is the case the test above it covers. What is named here is a pid
+        # that is live and is something else.
+        self.assertStillItself(other, command)
 
     def test_the_lock_is_released_when_a_run_finishes(self):
         self.assertAccepted(self.clean("start"))
