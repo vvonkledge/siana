@@ -180,6 +180,29 @@ test('a saved copy whose own stamp will not parse is of unknown age, never of no
     }
   });
 
+test('a session that has read live keeps one age on the bar, and it is the read',
+  async (t) => {
+    // The two clocks really do diverge on a page left open. The console answers
+    // `204` for every poll that finds the revision unmoved, so the last read keeps
+    // moving; the worker only stores a `200`, so the body it is holding stays the
+    // one from hours ago. Dating that body here would put a second, older age under
+    // a line that is right, about a fleet the console confirmed seconds ago.
+    const document = saved(3 * 3_600_000, { tasks: [task('a-task')] });
+    const page = await opened(t, { snapshot: document });
+    page.streams[0].connect();
+    await page.tick(120_000);
+    // The network drops and the worker starts answering out of its cache.
+    page.answer = async () => cached(document);
+    await page.tick(60_000);
+    const said = text(page);
+    assert.equal(bar(page).dataset.stale, 'yes');
+    assert.match(said, /Saved copy from this device\. The console could not be/);
+    assert.match(said, /last read \d+[smh]/,
+                 'the read this session did have is the age');
+    assert.doesNotMatch(said, /read 3h ago/,
+                        'the cached body was dated over a read that is newer than it');
+  });
+
 test('a live read after a saved copy is a read again, and dates itself as one',
   async (t) => {
     const document = saved(3 * DAY, { tasks: [task('a-task')] });

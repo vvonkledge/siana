@@ -83,8 +83,9 @@ const STATUS = {
  * The snapshot's own observation instant and never anything about this session: the
  * service worker hands back the same body however long it has been sitting there, so
  * the moment it was retrieved, and the moment the page was opened, are both answers
- * to a different question. Opened with the console already gone there is no last
- * successful read to date it by, and this is the only number the app holds.
+ * to a different question. This is what the bar falls back to when there is no last
+ * successful read to date the screen by, which is the whole of an app opened with
+ * the console already gone.
  *
  * An instant that will not parse says so rather than becoming a length of time.
  * `ageOf` answers a phrase and not a duration for that and for a stamp ahead of this
@@ -118,6 +119,16 @@ function Bar({ state }) {
   // ever read, only a link that has actually failed is worth saying out loud.
   const stale = state.cached || (known && age > STALE_AFTER_MS)
     || (!known && state.status === 'offline');
+  // The saved copy is dated only where nothing else can date it. With a read behind
+  // it the line above already says how old the screen is, off a clock that has gone
+  // on moving: the console answers `204` for every poll that finds the revision
+  // unmoved and the worker only ever stores a `200`, so the body in the cache can be
+  // hours older than the last time the console confirmed that same fleet. Dated
+  // there, the bar would carry two ages at once and the older of them would be wrong
+  // about what the captain is looking at.
+  const saved = 'Saved copy from this device'
+    + (known ? '' : savedAge(state.observed, now))
+    + '. The console could not be reached.';
   return (
     <div data-status={state.status} data-stale={stale ? 'yes' : 'no'}
       className="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/95
@@ -135,8 +146,7 @@ function Bar({ state }) {
         ? <p role="alert" className="bg-amber-500 px-4 py-2 text-center text-sm
           font-semibold text-amber-950">
           {state.cached
-            ? `Saved copy from this device${savedAge(state.observed, now)}. The `
-              + 'console could not be reached.'
+            ? saved
             : (known
               ? <>Not live. This is what was read <Age stamp={
                 new Date(state.readAt).toISOString()} suffix=" ago" />.</>
