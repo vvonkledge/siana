@@ -17,6 +17,7 @@ import { useEffect, useSyncExternalStore } from 'react';
 import { fleet, link, start, STALE_AFTER_MS } from './link.js';
 import { Decision, Decisions, Obligations, Project, Projects, Task } from './detail.jsx';
 import { Overview } from './overview.jsx';
+import { ageOf } from './time.js';
 import { Age, Go, useTick } from './ui.jsx';
 
 /** The current route, out of the fragment.
@@ -77,6 +78,25 @@ const STATUS = {
   offline: { say: 'offline', dot: 'bg-red-400' },
 };
 
+/** How old the saved copy on screen is, said.
+ *
+ * The snapshot's own observation instant and never anything about this session: the
+ * service worker hands back the same body however long it has been sitting there, so
+ * the moment it was retrieved, and the moment the page was opened, are both answers
+ * to a different question. Opened with the console already gone there is no last
+ * successful read to date it by, and this is the only number the app holds.
+ *
+ * An instant that will not parse says so rather than becoming a length of time.
+ * `ageOf` answers a phrase and not a duration for that and for a stamp ahead of this
+ * clock, and neither of them takes an " ago".
+ */
+function savedAge(observed, now) {
+  const age = ageOf(observed, now);
+  if (age.duration) return `, read ${age.said} ago`;
+  if (age.known) return `, read ${age.said}`;
+  return ', of unknown age';
+}
+
 /** The bar that is always there.
  *
  * It says two things and never one: how the link is, and how old what you are looking
@@ -115,7 +135,8 @@ function Bar({ state }) {
         ? <p role="alert" className="bg-amber-500 px-4 py-2 text-center text-sm
           font-semibold text-amber-950">
           {state.cached
-            ? 'Saved copy from this device. The console could not be reached.'
+            ? `Saved copy from this device${savedAge(state.observed, now)}. The `
+              + 'console could not be reached.'
             : (known
               ? <>Not live. This is what was read <Age stamp={
                 new Date(state.readAt).toISOString()} suffix=" ago" />.</>

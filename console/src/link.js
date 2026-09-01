@@ -90,11 +90,18 @@ function createStore(initial) {
 export const fleet = createStore({ snapshot: null, revision: null });
 
 /** How that answer was come by: whether the link is up, when it last worked, and
- * whether what is on screen came off this device rather than off the console. */
+ * whether what is on screen came off this device rather than off the console.
+ *
+ * `observed` is the console's own read stamp out of a cached body, and is set only
+ * while one is on screen. It is the answer to "how old is this saved copy", which
+ * `readAt` cannot give: opened with the console already gone there has been no
+ * successful read this session, and the moment the service worker handed the body
+ * back says nothing about when the fleet in it was true. */
 export const link = createStore({
   status: 'starting',
   readAt: null,
   cached: false,
+  observed: null,
   error: null,
 });
 
@@ -140,7 +147,8 @@ function publish(extra) {
   const previous = link.get();
   const next = { ...previous, ...extra, status: statusNow(), error };
   if (next.status === previous.status && next.readAt === previous.readAt
-      && next.cached === previous.cached && next.error === previous.error) {
+      && next.cached === previous.cached && next.observed === previous.observed
+      && next.error === previous.error) {
     return;
   }
   link.set(next);
@@ -198,7 +206,7 @@ async function refresh() {
       // age of the last successful read moves.
       failures = 0;
       error = null;
-      publish({ readAt: now(), cached: false });
+      publish({ readAt: now(), cached: false, observed: null });
       return;
     }
     if (!response.ok) {
@@ -219,7 +227,16 @@ async function refresh() {
     // A cached response is not a read. Leaving `readAt` where it was is what makes
     // the bar say how old this really is instead of restarting its clock every time
     // the service worker hands back the same hour-old body.
-    publish(cached ? { cached: true } : { readAt: now(), cached: false });
+    //
+    // The body's own `observed` travels with the flag, because on a cold open -
+    // installed to a home screen, nothing running to serve it - `readAt` is null for
+    // the whole session and the bar had no number at all to show. Anything but a
+    // string stays null: an instant that will not parse has to read as unknown, and
+    // a saved copy dated `0s ago` is worse than an undated one.
+    publish(cached
+      ? { cached: true,
+          observed: typeof document.observed === 'string' ? document.observed : null }
+      : { readAt: now(), cached: false, observed: null });
   } catch (e) {
     fail(e && e.message ? e.message : 'the console could not be reached');
   } finally {
