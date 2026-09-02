@@ -95,6 +95,7 @@ Into the home:
   SIANA evolves its own instructions, so a home copy that differs from the template
   is your work, and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
+  `schema-attended.yaml`, `schema-findings.yaml`, `schema-semantic.yaml`,
   `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
   reason. A contract only ever grows, because a field dropped from a live contract
   makes every record still carrying it unreadable.
@@ -114,14 +115,34 @@ Into the home:
   [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
-`decisions.jsonl` - are not written here. `datafile` creates each on its first append,
-so a contract with no `.jsonl` beside it is an empty store and not a broken install.
+`decisions.jsonl`, `attended.jsonl`, `findings.jsonl`, `semantic.jsonl` - are not
+written here. `datafile` creates each on its first append, so a contract with no
+`.jsonl` beside it is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
-`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-handoff`,
-`siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`, `siana-gate`,
-`siana-read`, `siana-console`. They are links, so a `git pull` here updates the
+`siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
+`siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
+`siana-gate`, `siana-read`, `siana-clean`, `siana-report`, `siana-console`,
+`siana-findings`, `siana-semantic`. They are links, so a `git pull` here updates the
 commands with no reinstall. It does not update the home; `just upgrade` does that.
+
+### The distro's own pi package
+
+Beside the queue integration, `init` installs `template/pi-siana` into the home as a
+project-local pi package. It carries three things:
+
+    siana_cleanup, siana_runbook   tools, so SIANA can delegate fleet cleanup
+    captain-report                 a skill, reached as `/skill:captain-report`
+    /captain-report                the same procedure, as the command you type
+
+It is installed from this checkout rather than copied, so a `git pull` updates it the
+way it updates the commands. It is also installed exactly once: pi identifies a local
+package by its resolved absolute path, so the same package reached through two
+spellings is two packages to pi and every resource in it is discovered twice. `init`
+reconciles the settings entry rather than appending one.
+
+Loading it starts nothing. No process, no watcher, no timer, no model. A cleanup run
+begins when something calls the tool, and never before.
 
 ### The queue integration
 
@@ -234,6 +255,48 @@ drives" below; `automerge` is standing permission for SIANA to arrange the merge
 work that has been through all of that, and is described under "Letting accepted work
 merge" below.
 
+### Give a project semantic context
+
+Off unless you turn it on, one project at a time. With no binding, everything below
+this heading may as well not exist: dispatch behaves exactly as it did before, and
+nothing is ever recorded anywhere.
+
+A binding says that minions on one project are briefed from a
+[semantic-layer](https://github.com/vvonkledge/semantic-layer) context pack, and that
+what came of their work is recorded back as a trace. It names every part of that
+explicitly, because none of it can be inferred: a project handle is not an IRI, and a
+directory is not a source.
+
+    datafile -f ~/.siana/semantic.jsonl put \
+        --set project=<the project whose minions get context> \
+        --set provider=<the project whose `semantic-layer` answers> \
+        --set pack=<pack directory, relative to the provider> \
+        --set source=<the source IRI the pack must be about> \
+        --set target=<the target the pack must be about> \
+        --set agent=<the agent IRI runs are attributed to> \
+        --set store=<where the trace store lives>
+
+`~/.siana/schema-semantic.yaml` describes each field. `semantic-layer` itself has to
+be installed where SIANA runs; nothing here reaches into its checkout.
+
+What then happens is two things and no more. Before a minion is claimed or started,
+`siana-dispatch` exports that pack once, checks every field of the answer, writes the
+exact bytes that verified under `~/.siana/semantic/<task-id>/`, and briefs the minion
+from that copy rather than from the live directory. When the task comes back `done`
+or `blocked`, `siana-semantic reconcile` records one span saying a fleet task ran and
+how it came out, then runs the retention pass.
+
+A run carries structure and nothing else: no title, no reason, no brief, no prompt,
+no diff, no path, no environment. There is nowhere in the document to put them.
+
+    siana-semantic status       what is bound, and what is waiting to be recorded
+    siana-semantic reconcile    record every pinned task the queue now says is done
+
+`just doctor` runs the first of those. The second is SIANA's to run when the queue
+moves, and it is exact and idempotent: running it twice records nothing twice, and
+running it after a restart catches everything that went terminal while nothing was
+watching.
+
 ### Branches the fleet leaves in your repository
 
 Every minion works in a worktree of its own, on a branch under `siana/`. That prefix
@@ -249,8 +312,9 @@ this convention keep the names they have, and every command still finds them.
 
 You never make one of these by hand, and nothing here pushes one. `siana-publish`
 pushes the branch a QA minion accepted, and only that; `siana-retire` removes the
-worktree once nothing is left in it that only it holds; `siana-reap` removes the
-branch once the work has landed.
+worktree once nothing is left in it that only it holds; `siana-close-workspace`
+closes the Herdr workspace that retirement left open, and only after it; `siana-reap`
+removes the branch once the work has landed.
 
 ### What the merge request says
 
@@ -655,16 +719,30 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-So expect about four minutes from the pool and about ten and a half from one
-worker. Both stretch under fleet load, and this machine's own variation is wider
-than the gap between any two pool sizes. Measured separately by the author of the
-pool at `6906b6a`, interleaving the two modes: one control of 1115s taken at load
-11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and 26.4.
-Across the whole of that work, at heads and loads that were not held constant, the
-one-worker control measured anywhere from 703s to 1115s. Those are observations of
-what load does, not a second speed claim - they are not comparable with the four
-runs above and are not combined with them. Re-measure rather than trusting any
-single number here.
+Those four runs are that head's, and that head had 912 tests. This tree has 1631, so
+expect longer on the one you are standing on. Measured here rather than scaled, on
+the same eleven-core M3 Pro: 407.6s from the default five-worker pool, and 464.6s at
+the three workers a four-core runner gets. Both were taken with the box busy - load
+6.4 rising to 13.4 across the first, 12.5 falling to 3.7 across the second - so they
+are the slow end of this machine rather than the fast one. Call it seven minutes from
+the default pool and eight at three, and re-measure rather than planning against
+either: they are one run each. GitHub's own four-core runner took 497s at three
+workers over the 1526 tests this tree grew from, which is what
+`.github/workflows/ci.yml` sizes its hang guard against.
+
+Load is the variable that moves these, not the number of tests. The same three-worker
+mode on this machine took 558s over 1390 tests, 487s over 1495, 379s over 1526 and
+464.6s over 1631, which is a spread wider than the growth it is supposed to be
+tracking. One worker is slower again in proportion, and stays a control to reach for
+rather than a way to run the suite.
+
+Measured separately by the author of the pool at `6906b6a`, interleaving the two
+modes: one control of 1115s taken at load 11.8, against pool runs of 199s, 296s and
+551s taken at loads 14.3, 19.7 and 26.4. Across the whole of that work, at heads and
+loads that were not held constant, the one-worker control measured anywhere from 703s
+to 1115s. Those are observations of what load does, not a second speed claim - they
+are not comparable with the four runs above and are not combined with them.
+Re-measure rather than trusting any single number here.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like
@@ -719,9 +797,21 @@ into your own when you want that.
     just doctor
 
 It changes nothing. It reports every file the home should hold, whether each required
-command is on the `PATH` and where it resolves to, whether a SIANA is running,
+command is on the `PATH` and where it resolves to, whether the distro's own pi
+package is installed in the home's harness settings, whether a SIANA is running,
 whether an advisory session is, whether every in-flight task's minion is still alive
 in the pane it was dispatched to, what SIANA owes you, and the queue itself.
+
+Almost all of that is a line for you to read and act on, and `doctor` exits zero
+having said so. Two things make it exit nonzero. The first it always had: the home's
+queue does not read at all, which includes there being no home there yet - the
+ordinary state before `just init`. The second is new: on a machine with `pi`, the
+distro's own `pi-siana` package is not installed into the home, whether because the
+settings file does not name it, names it twice, names it somewhere it is not, or is
+not there at all. That one fails rather than reports because you cannot see it from
+inside a session. A home missing that package has no `siana_cleanup` and no
+`siana_runbook` tool, no `captain-report` skill and no `/captain-report` command, and
+none of them fails: none of them is there to be called.
 
 Things it says that are not faults:
 
@@ -750,6 +840,11 @@ Things it says that are:
 - `GONE <task>: herdr has no agent in <pane>`. A minion died. `tasks reset` reclaims
   the task, and it stays manual, because that minion's worktree may hold work nobody
   has landed.
+- `missing pi-siana package: <why>`, and `missing .pi/settings.json` on a machine
+  with `pi`. The distro's own package is not installed in this home: the settings
+  file does not name it, names it twice, names it somewhere it is not, or is not
+  there at all. `just init` installs it and collapses a duplicate back to one. This
+  and an unreadable queue are what make `doctor` exit nonzero.
 
 ## Read the fleet as JSON
 
@@ -972,7 +1067,8 @@ deleted. Your home is left alone, queue and all. Delete it by hand when you mean
                 Tailwind, built by `just build` into console/dist/.
     template/   what an install copies into the home: SIANA's instructions, the
                 standing orders every minion is started with, the brief and
-                handoff templates, and the store contracts.
+                handoff templates, the store contracts, and `pi-siana/`, the
+                distro's own pi package.
     tests/      the suite.
     justfile    init, upgrade, test, doctor, uninstall.
     VISION.md   what the fleet is for.

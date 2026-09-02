@@ -188,6 +188,31 @@ class HomeTest(unittest.TestCase):
             out.append(mirror)
         return os.pathsep.join([*first, BIN, *out])
 
+    def path_without(self, *names):
+        """A PATH on which some commands cannot be found.
+
+        Every directory holding one is replaced by a mirror of itself with that entry
+        left out, rather than dropped. Dropping it would take `uv` with it on a
+        Homebrew machine, and a command under test would then fail on a tool it needs
+        instead of on the one this is hiding - a green test for the wrong reason.
+
+        The mirrors are named apart from `distro_path`'s, because a test that wants
+        both would otherwise have two fixtures writing one directory.
+        """
+        out = []
+        for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
+            if not any(os.path.lexists(os.path.join(d, n)) for n in names):
+                out.append(d)
+                continue
+            mirror = self.at(f"without-{i}")
+            os.makedirs(mirror, exist_ok=True)
+            for entry in os.listdir(d):
+                link = os.path.join(mirror, entry)
+                if entry not in names and not os.path.lexists(link):
+                    os.symlink(os.path.join(d, entry), link)
+            out.append(mirror)
+        return os.pathsep.join(out)
+
     def path_with_no_forge_client(self, *first):
         """A PATH on which neither forge client can be found, wherever this machine
         keeps one.
@@ -242,9 +267,10 @@ class HomeTest(unittest.TestCase):
         e.update(extra or {})
         return e
 
-    def run_cmd(self, argv, cwd=None, env=None, timeout=120):
+    def run_cmd(self, argv, cwd=None, env=None, timeout=120, input=None):
         return subprocess.run(argv, cwd=cwd or self.home, env=self.command_env(env),
-                              text=True, capture_output=True, timeout=timeout)
+                              text=True, capture_output=True, timeout=timeout,
+                              input=input)
 
     def run_bin(self, name, *args, **kw):
         return self.run_cmd([os.path.join(BIN, name), *args], **kw)

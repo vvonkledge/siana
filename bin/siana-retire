@@ -499,8 +499,14 @@ def main() -> None:
     print(f"retired  {path}")
     print(f"  kept   {branch} (removing a worktree never touches its branch)")
     if task.get("owner"):
+        # Never closed from here. A retirement that has just removed a tree is the
+        # worst-placed thing in the fleet to also judge whether a workspace is idle:
+        # what it knows is git, and every discriminator that decision needs - linked
+        # or source, whose pane, what is running - is herdr's. So this names the next
+        # command and stops, and that command reads the world again for itself.
         print(f"  open   the Herdr workspace behind {task['owner']} is still there")
-        print("         closing it kills that agent, which is yours to decide")
+        print("         closing it kills whatever agent is in it, so it is its own")
+        print(f"         step: siana-close-workspace {args.task_id}")
 
 
 if __name__ == "__main__":

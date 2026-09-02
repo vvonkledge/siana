@@ -62,6 +62,45 @@ import unittest
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 
+
+def pycache_prefix():
+    """One bytecode directory, outside every worktree, for every process a run
+    starts.
+
+    `just test` runs `python3 -B` and the workers below are started with it too, but
+    a flag is not inherited. A test that spawns its own interpreter with this
+    directory importable - `tests/test_clean.py` does, to park a real `siana-clean`
+    at a boundary - has that grandchild compile `helpers.py` into `tests/__pycache__`
+    inside the worktree. Verified 2026-09-01: a green run of the whole suite in a
+    fresh linked worktree at e0caa3e left exactly that one file.
+
+    One file is enough. `siana-retire` refuses to remove a tree holding any ignored
+    path, because `git worktree remove` deletes those without a word and a `.pyc` and
+    a `.env` look alike to it, so the workspace stays open and `siana-close-workspace`
+    refuses in turn. Seventeen finished task worktrees on this project were held that
+    way by 66 of these, by the suite the ship pipeline and QA are both required to
+    run.
+
+    A prefix rather than exporting `PYTHONDONTWRITEBYTECODE`, which is inherited just
+    as well and was measured and rejected. It reaches `tasks` and `datafile`, whose
+    `uv run --script` environments are then never given cached bytecode to read
+    either, so every call recompiles their dependencies: twenty calls of one went
+    from 3.5s to 12.2s on the captain's machine, 434ms apiece against the hundreds a
+    run makes, and CI has about a third of its fifteen-minute guard unspent. Written
+    somewhere and read again, the same twenty are 3.4s against 3.5s. Nothing is
+    suppressed here, only moved off the tree the captain has to retire.
+
+    Fixed rather than per-run so it stays warm, and named by uid because `/tmp` is
+    shared on Linux and a cache directory owned by somebody else is silently no cache
+    at all.
+    """
+    return os.path.join(tempfile.gettempdir(), f"siana-pycache-{os.getuid()}")
+
+
+# `setdefault`, so a worker keeps the prefix its coordinator chose rather than
+# agreeing with it by accident, and so an operator who has set their own keeps it.
+os.environ.setdefault("PYTHONPYCACHEPREFIX", pycache_prefix())
+
 # The watchdog, and it is a hang guard rather than a budget. Sized against what this
 # suite already calls acceptable rather than against what it usually takes: a test
 # here may make two `just` calls at `tests/test_justfile.py`'s 180-second timeout
