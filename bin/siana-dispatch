@@ -310,7 +310,8 @@ def resolve(projects: dict, handle: str, store: str):
             "ship": cfg.get("ship"), "qa": cfg.get("qa")}
 
 
-def assemble_orders(home: str, task_id: str, base: str, project_orders, handle: str) -> str:
+def assemble_orders(home: str, task_id: str, base: str, project_orders, handle: str,
+                    semantic: str = "") -> str:
     """One orders file, always.
 
     claude's --append-system-prompt-file does not accumulate: passing it twice keeps
@@ -320,22 +321,113 @@ def assemble_orders(home: str, task_id: str, base: str, project_orders, handle: 
 
     The combined file is durable rather than temporary, because the agent may reread
     it when its session resumes, and because what a minion was actually told should
-    outlive the dispatch that told it."""
-    if not project_orders:
+    outlive the dispatch that told it. The semantic section lands there for the same
+    reason: it names the immutable copy of a pack, and what a minion was briefed
+    from has to outlive the dispatch that briefed it."""
+    if not project_orders and not semantic:
         return base
     out_dir = os.path.join(home, "orders")
     os.makedirs(out_dir, exist_ok=True)
     combined = os.path.join(out_dir, f"{task_id}.md")
     with open(base) as fh:
         text = fh.read()
-    with open(project_orders) as fh:
-        text += (f"\n\n---\n\n# Project orders: {handle}\n\n"
-                 f"These apply to every task in this project, on top of the standing\n"
-                 f"orders above. Where they conflict, these are more specific and win.\n\n"
-                 + fh.read())
+    if project_orders:
+        with open(project_orders) as fh:
+            text += (f"\n\n---\n\n# Project orders: {handle}\n\n"
+                     f"These apply to every task in this project, on top of the standing\n"
+                     f"orders above. Where they conflict, these are more specific and win.\n\n"
+                     + fh.read())
+    text += semantic
     with open(combined, "w") as fh:
         fh.write(text)
     return combined
+
+
+# The semantic integration, reached as a process rather than imported. It is the one
+# thing here that speaks to another project's published command, and keeping it
+# behind its own boundary means a dispatch has exactly two outcomes to read: it
+# refused, or it did not.
+SEMANTIC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "siana-semantic")
+
+
+def pin_semantic(home: str, tasks_file: str, task_id: str):
+    """Verify and pin this task's context pack, before anything else exists.
+
+    Before the workspace and before the claim, because a pack that will not verify
+    has to stop the dispatch rather than arrive after a minion is already working:
+    a minion briefed from nothing looks exactly like a minion briefed from
+    something, and it is the second one the whole exchange exists to produce.
+
+    A project with no binding answers `disabled`, which is the ordinary state and
+    the reason this is invisible until the captain turns it on. A refusal is
+    relayed whole and stops the dispatch, because the alternative - dispatching
+    anyway, quietly, without the context the binding promised - is the silent
+    half-briefing this script already refuses everywhere else.
+    """
+    if not os.path.isfile(SEMANTIC):
+        die(f"there is no siana-semantic beside {os.path.realpath(__file__)}",
+            "the two ship together, and it is the only thing that knows whether",
+            "this project has semantic context at all",
+            "skipping it would brief a bound minion from nothing and look exactly",
+            "like a dispatch that had nothing to brief it with")
+    out = subprocess.run([SEMANTIC, "pin", task_id],
+                         env={**os.environ, "SIANA_HOME": home,
+                              "SIANA_TASKS_FILE": tasks_file},
+                         capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        die(f"the semantic context for {task_id} could not be pinned",
+            *[line for line in (out.stderr or out.stdout).splitlines() if line],
+            "nothing has been created for this dispatch")
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        die(f"siana-semantic did not answer about {task_id} in JSON",
+            out.stdout.strip()[:200], "nothing has been created for this dispatch")
+
+
+def mark_dispatched(home: str, tasks_file: str, task_id: str) -> None:
+    """Say that this pin's task was really claimed.
+
+    After the claim, because that is the fact it records. It is reported and never
+    fatal: the minion is running by now, and taking a live dispatch down over a
+    marker file would cost the work to save the bookkeeping. What is lost without it
+    is one run going unrecorded - the warning below is the only thing said at the
+    time, and afterwards `siana-semantic status` names the pin once its task goes
+    terminal, as one claimed by nothing."""
+    semantic_mark(home, tasks_file, task_id, "dispatched",
+                  f"the semantic pin for {task_id} is not marked as dispatched, so "
+                  f"nothing will record what this run did")
+
+
+def unmark_dispatched(home: str, tasks_file: str, task_id: str) -> None:
+    """Take the mark back, because the claim it recorded was given up again.
+
+    Everything after the claim can still refuse, and a refusal there releases the
+    claim and puts the task back in the queue. No minion ran, so the pin is
+    unclaimed again and the next dispatch reuses it, keeping one pin and one trace
+    id. Left standing, the mark would say the opposite for good: a claimed pin with
+    no recording whose task is not terminal reads as a run whose ending was lost,
+    and that is reported on every wake."""
+    semantic_mark(home, tasks_file, task_id, "released",
+                  f"the semantic pin for {task_id} is still marked as dispatched, "
+                  f"and no minion ran against it")
+
+
+def semantic_mark(home: str, tasks_file: str, task_id: str, verb: str,
+                  warning: str) -> None:
+    """One mark on a pin, reported and never fatal.
+
+    Both callers are already carrying some other outcome to the captain - a running
+    minion, or the refusal that ended the dispatch - and a failure to write a marker
+    file must not arrive in place of either."""
+    out = subprocess.run([SEMANTIC, verb, task_id],
+                         env={**os.environ, "SIANA_HOME": home,
+                              "SIANA_TASKS_FILE": tasks_file},
+                         capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        print(f"warning: {warning}", file=sys.stderr)
+        for line in (out.stderr or out.stdout).splitlines():
+            print(f"  {line}", file=sys.stderr)
 
 
 def check_registry(registry: str, schema: str) -> int:
@@ -524,7 +616,9 @@ def main() -> None:
             "there is no branch to make, so the minion would work in the project",
             "tree at whatever it is checked out to and never see that base at all")
     cwd = project["path"]
-    orders = assemble_orders(home, args.task_id, base_orders, project["orders"], handle)
+    semantic = pin_semantic(home, tasks_file, args.task_id)
+    orders = assemble_orders(home, args.task_id, base_orders, project["orders"],
+                             handle, semantic.get("orders") or "")
 
     env = {"SIANA_HOME": home, "SIANA_TASKS_FILE": tasks_file, "SIANA_TASK_ID": args.task_id}
     for pair in args.env:
@@ -646,6 +740,11 @@ def main() -> None:
             # The one action on this path the captain performs by hand, so it is
             # given whole: `--reason` is required, and a hint without it exits
             # USAGE_ERROR when it is typed back.
+            if released.returncode == 0 and semantic.get("state") == "pinned":
+                # The claim is gone, so the pin is unclaimed again and the next
+                # dispatch reuses it. Only on a release that landed: a task still
+                # held is one a minion may yet be working in.
+                unmark_dispatched(home, tasks_file, args.task_id)
             hints.append(
                 f"{args.task_id} is back in the queue; nothing holds it"
                 if released.returncode == 0 else
@@ -668,6 +767,8 @@ def main() -> None:
     if claim.returncode != 0:
         abandon(f"tasks refused to dispatch {args.task_id}", claim.stdout.strip())
     claimed = True
+    if semantic.get("state") == "pinned":
+        mark_dispatched(home, tasks_file, args.task_id)
 
     spec = AGENTS[args.kind]
     # herdr refuses any agent argument containing a newline ("agent arguments cannot
@@ -782,7 +883,8 @@ def main() -> None:
     print(json.dumps({"task_id": args.task_id, "owner": owner, "project": handle,
                       "workspace_id": workspace_id, "pane_id": pane_id,
                       "kind": args.kind, "project_path": cwd, "cwd": work_cwd,
-                      "branch": branch, "base": base, "orders": orders}, indent=2))
+                      "branch": branch, "base": base, "orders": orders,
+                      "semantic": semantic.get("directory")}, indent=2))
 
 
 if __name__ == "__main__":

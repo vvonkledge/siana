@@ -1,0 +1,71 @@
+# Contract for semantic.jsonl: which projects get semantic context, and from where.
+#
+# The captain owns this store, exactly as they own the project registry. A record
+# here is the whole of what turns semantic context on for one project: absent, and
+# `siana-dispatch` behaves as it always has and nothing is ever recorded about a run.
+#
+#   datafile -f semantic.jsonl put \
+#       --set project=siana --set provider=semantic-layer \
+#       --set pack=packs/github/vvonkledge-siana \
+#       --set source=https://semantic-layer.19h09.co/l2/github/api-github-com \
+#       --set target=vvonkledge/siana \
+#       --set agent=https://semantic-layer.19h09.co/biz/agent/siana \
+#       --set store="$HOME/.siana/semantic/trace.sqlite3"
+#
+# `put` writes a whole record, so changing one field means restating the others.
+# Read the record first (`datafile -f semantic.jsonl get <project>`), then put it
+# back with the change.
+#
+# Every field is required and none carries a default, and that is the point rather
+# than an oversight. A default here would be this distro choosing which pack a
+# minion is briefed from, which target a run is about, or which agent it is
+# attributed to - all of them claims about the captain's own graph, made by
+# something that has never read it. There is nothing to infer them from either: a
+# handle is not an IRI, and a directory is not a source.
+#
+# `extra: forbid` is the point of keeping this in a store: a mistyped key is refused
+# at write, rather than becoming a binding the captain believes they made.
+
+name: SemanticBinding
+key: project
+extra: forbid
+
+fields:
+  project:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{1,31}$'
+    description: the consuming project, by its handle in projects.jsonl. Its minions
+      are the ones dispatched with pinned context
+  provider:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{1,31}$'
+    description: the project whose installed `semantic-layer` command answers, by its
+      handle in projects.jsonl. Its `path` is what a relative `pack` resolves against
+  pack:
+    type: str
+    min_length: 1
+    description: the context pack directory, relative to the provider's path unless
+      it is written absolute or under `~`
+  source:
+    type: str
+    min_length: 1
+    max_length: 300
+    description: the source IRI this pack must be about. Passed as `--expect-source`
+      and held against the answer, because a caller that only asks is trusting
+  target:
+    type: str
+    min_length: 1
+    max_length: 300
+    description: the target this pack must be about, passed as `--expect-target` and
+      held against the answer for the same reason
+  agent:
+    type: str
+    min_length: 1
+    max_length: 300
+    description: the agent a recorded run is attributed to. semantic-layer mints
+      these identifiers, so it is copied from there and never built from a handle
+  store:
+    type: str
+    min_length: 1
+    description: the trace store runs are recorded into. `trace record` creates the
+      file and never the directories above it, so those have to exist

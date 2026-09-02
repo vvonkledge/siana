@@ -93,10 +93,10 @@ Into the home:
   SIANA evolves its own instructions, so a home copy that differs from the template
   is your work, and `init` says `kept` and leaves it alone.
 - `schema-projects.yaml`, `schema-obligations.yaml`, `schema-decisions.yaml`,
-  `schema-attended.yaml`, `schema-findings.yaml`, `schema-tasks.yaml`: the store
-  contracts. Also never overwritten, for a harder reason. A contract only ever grows,
-  because a field dropped from a live contract makes every record still carrying it
-  unreadable.
+  `schema-attended.yaml`, `schema-findings.yaml`, `schema-semantic.yaml`,
+  `schema-tasks.yaml`: the store contracts. Also never overwritten, for a harder
+  reason. A contract only ever grows, because a field dropped from a live contract
+  makes every record still carrying it unreadable.
 - `principles.md`, a template for the principles an advisory session holds SIANA to.
   Written only when absent, and never touched by `just upgrade` either: a distro that
   could rewrite it could rewrite what SIANA is held to while you are asleep. It ships
@@ -113,16 +113,16 @@ Into the home:
   [Leave it running](#leave-it-running).
 
 The stores themselves - `tasks.jsonl`, `projects.jsonl`, `obligations.jsonl`,
-`decisions.jsonl`, `attended.jsonl`, `findings.jsonl` - are not written here.
-`datafile` creates each on its first append, so a contract with no `.jsonl` beside it
-is an empty store and not a broken install.
+`decisions.jsonl`, `attended.jsonl`, `findings.jsonl`, `semantic.jsonl` - are not
+written here. `datafile` creates each on its first append, so a contract with no
+`.jsonl` beside it is an empty store and not a broken install.
 
 Into the bindir, as symlinks back into this checkout: `siana`, `siana-dispatch`,
 `siana-brief`, `siana-watch`, `siana-owe`, `siana-retire`, `siana-close-workspace`,
 `siana-handoff`, `siana-publish`, `siana-reap`, `siana-pipeline`, `siana-afk`,
 `siana-gate`, `siana-read`, `siana-clean`, `siana-report`, `siana-console`,
-`siana-findings`. They are links, so a `git pull` here updates the commands with no
-reinstall. It does not update the home; `just upgrade` does that.
+`siana-findings`, `siana-semantic`. They are links, so a `git pull` here updates the
+commands with no reinstall. It does not update the home; `just upgrade` does that.
 
 ### The distro's own pi package
 
@@ -252,6 +252,48 @@ instead of by a command that runs once, and is described under "A rigor the mini
 drives" below; `automerge` is standing permission for SIANA to arrange the merge of
 work that has been through all of that, and is described under "Letting accepted work
 merge" below.
+
+### Give a project semantic context
+
+Off unless you turn it on, one project at a time. With no binding, everything below
+this heading may as well not exist: dispatch behaves exactly as it did before, and
+nothing is ever recorded anywhere.
+
+A binding says that minions on one project are briefed from a
+[semantic-layer](https://github.com/vvonkledge/semantic-layer) context pack, and that
+what came of their work is recorded back as a trace. It names every part of that
+explicitly, because none of it can be inferred: a project handle is not an IRI, and a
+directory is not a source.
+
+    datafile -f ~/.siana/semantic.jsonl put \
+        --set project=<the project whose minions get context> \
+        --set provider=<the project whose `semantic-layer` answers> \
+        --set pack=<pack directory, relative to the provider> \
+        --set source=<the source IRI the pack must be about> \
+        --set target=<the target the pack must be about> \
+        --set agent=<the agent IRI runs are attributed to> \
+        --set store=<where the trace store lives>
+
+`~/.siana/schema-semantic.yaml` describes each field. `semantic-layer` itself has to
+be installed where SIANA runs; nothing here reaches into its checkout.
+
+What then happens is two things and no more. Before a minion is claimed or started,
+`siana-dispatch` exports that pack once, checks every field of the answer, writes the
+exact bytes that verified under `~/.siana/semantic/<task-id>/`, and briefs the minion
+from that copy rather than from the live directory. When the task comes back `done`
+or `blocked`, `siana-semantic reconcile` records one span saying a fleet task ran and
+how it came out, then runs the retention pass.
+
+A run carries structure and nothing else: no title, no reason, no brief, no prompt,
+no diff, no path, no environment. There is nowhere in the document to put them.
+
+    siana-semantic status       what is bound, and what is waiting to be recorded
+    siana-semantic reconcile    record every pinned task the queue now says is done
+
+`just doctor` runs the first of those. The second is SIANA's to run when the queue
+moves, and it is exact and idempotent: running it twice records nothing twice, and
+running it after a restart catches everything that went terminal while nothing was
+watching.
 
 ### Branches the fleet leaves in your repository
 
@@ -831,22 +873,30 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-Those four runs are that head's, and that head had 912 tests. This tree has 1495, so
-expect longer on the one you are standing on: measured here, about six minutes from the
-default pool on a quiet eleven-core box, about eight and a half with other work running
-alongside it, and about nine and a half at the three workers a four-core runner gets.
-Two single runs on this tree came in under those, 274s from the default pool and 487s
-at three workers, both at loads between five and seven; one run each is an observation
-and not a claim, and the estimates above are still the ones to plan against.
-One worker is slower again in proportion, and stays a control to reach for rather than a
-way to run the suite. All of them stretch under fleet load, and this machine's own
-variation is wider than the gap between any two pool sizes. Measured separately by the
-author of the pool at `6906b6a`, interleaving the two modes: one control of 1115s taken
-at load 11.8, against pool runs of 199s, 296s and 551s taken at loads 14.3, 19.7 and
-26.4. Across the whole of that work, at heads and loads that were not held constant, the
-one-worker control measured anywhere from 703s to 1115s. Those are observations of what
-load does, not a second speed claim - they are not comparable with the four runs above
-and are not combined with them. Re-measure rather than trusting any single number here.
+Those four runs are that head's, and that head had 912 tests. This tree has 1631, so
+expect longer on the one you are standing on. Measured here rather than scaled, on
+the same eleven-core M3 Pro: 407.6s from the default five-worker pool, and 464.6s at
+the three workers a four-core runner gets. Both were taken with the box busy - load
+6.4 rising to 13.4 across the first, 12.5 falling to 3.7 across the second - so they
+are the slow end of this machine rather than the fast one. Call it seven minutes from
+the default pool and eight at three, and re-measure rather than planning against
+either: they are one run each. GitHub's own four-core runner took 497s at three
+workers over the 1526 tests this tree grew from, which is what
+`.github/workflows/ci.yml` sizes its hang guard against.
+
+Load is the variable that moves these, not the number of tests. The same three-worker
+mode on this machine took 558s over 1390 tests, 487s over 1495, 379s over 1526 and
+464.6s over 1631, which is a spread wider than the growth it is supposed to be
+tracking. One worker is slower again in proportion, and stays a control to reach for
+rather than a way to run the suite.
+
+Measured separately by the author of the pool at `6906b6a`, interleaving the two
+modes: one control of 1115s taken at load 11.8, against pool runs of 199s, 296s and
+551s taken at loads 14.3, 19.7 and 26.4. Across the whole of that work, at heads and
+loads that were not held constant, the one-worker control measured anywhere from 703s
+to 1115s. Those are observations of what load does, not a second speed claim - they
+are not comparable with the four runs above and are not combined with them.
+Re-measure rather than trusting any single number here.
 
     SIANA_TEST_WORKERS=1 just test      one worker: unittest, in this process
     SIANA_TEST_WORKERS=8 just test      or any number you like

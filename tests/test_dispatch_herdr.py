@@ -18,6 +18,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -25,6 +27,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import fake_semantic
 from fake_herdr import CLOSE, FakeHerdr, HerdrError
 from helpers import HomeTest, script
 
@@ -150,7 +153,7 @@ class DispatchTest(HerdrTest):
     def record(self, task_id):
         return d.fold(self.at("tasks.jsonl"), "id")[task_id]
 
-    def dispatch(self, task_id, *argv, ready=None, landed=None):
+    def dispatch(self, task_id, *argv, ready=None, landed=None, env=None):
         """One `siana-dispatch`, run in-process so the timeouts can be shortened.
 
         They are the point of several of these tests and they are minutes long, so
@@ -158,7 +161,7 @@ class DispatchTest(HerdrTest):
         nobody runs."""
         out, err = io.StringIO(), io.StringIO()
         env = {"SIANA_HOME": self.home, "SIANA_TASKS_FILE": self.at("tasks.jsonl"),
-               **self.socket_env()}
+               **self.socket_env(), **(env or {})}
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, env))
             stack.enter_context(mock.patch.object(
@@ -862,6 +865,208 @@ class Transport(HerdrTest):
         with self.assertRaises(d.Unreachable) as cm:
             self.herdr_client().call("workspace.list")
         self.assertIn("cannot reach herdr", cm.exception.message)
+
+
+class SemanticContext(DispatchTest):
+    """Dispatch's half of the semantic exchange.
+
+    The pack is exported and pinned before the workspace, the claim and the agent,
+    because a pack that will not verify has to stop the dispatch rather than arrive
+    after a minion is already working. `test_semantic.py` covers what is pinned and
+    what is refused; this covers where in a dispatch it happens.
+    """
+
+    CONTENT = "<https://semantic-layer.19h09.co/l2/x> <https://y> <https://z> .\n"
+    MANIFEST = '{\n  "api_root": "https://api.github.com"\n}\n'
+    SOURCE = "https://semantic-layer.19h09.co/l2/github/api-github-com"
+    TARGET = "vvonkledge/siana"
+
+    def setUp(self):
+        super().setUp()
+        self.contract("semantic")
+        self.provider = self.at("provider")
+        self.pack_dir = os.path.join(self.provider, "packs", "p")
+        os.makedirs(self.pack_dir)
+        self.project("prov", path=self.provider)
+        bindir = self.at("fakebin")
+        os.makedirs(bindir)
+        target = os.path.join(bindir, "semantic-layer")
+        shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "fake_semantic.py"), target)
+        os.chmod(target, os.stat(target).st_mode | stat.S_IXUSR)
+        self.layer = bindir
+        self.plan_path = self.at("plan.json")
+        self.calls_path = self.at("calls.jsonl")
+
+    def bind(self):
+        args = ["project=proj", "provider=prov", "pack=packs/p",
+                f"source={self.SOURCE}", f"target={self.TARGET}",
+                "agent=https://semantic-layer.19h09.co/biz/agent/siana",
+                f"store={self.at('trace.sqlite3')}"]
+        out = self.run_cmd(["datafile", "-f", self.at("semantic.jsonl"),
+                            "-c", self.at("schema-semantic.yaml"), "put",
+                            *sum((["--set", a] for a in args), [])])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def export(self, **over):
+        """An answer about whatever instant the dispatch actually asked about.
+
+        A real dispatch reads the clock, so nothing here can know the instant in
+        advance: `fake_semantic` substitutes it, and the freshness window is wide
+        enough to hold any clock this suite runs under."""
+        return fake_semantic.export(
+            fake_semantic.AS_OF, self.CONTENT, self.MANIFEST, source=self.SOURCE,
+            target=self.TARGET, observed_at="2020-01-01T00:00:00Z",
+            fresh_until="2099-01-01T00:00:00Z", **over)
+
+    def scripted(self, entry):
+        with open(self.plan_path, "w") as fh:
+            json.dump({"pack export": entry}, fh)
+
+    def env(self):
+        return {"PATH": self.layer + os.pathsep + os.environ["PATH"],
+                "FAKE_SEMANTIC_PLAN": self.plan_path,
+                "FAKE_SEMANTIC_CALLS": self.calls_path}
+
+    def calls(self):
+        try:
+            with open(self.calls_path) as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def test_an_unbound_project_dispatches_exactly_as_it_did_before(self):
+        # The state every project is in until the captain binds one. Nothing is run,
+        # nothing is written, and the orders are the file the distro shipped.
+        self.shared_project()
+        self.herdr.reply("agent.get", seen(), seen(status="working"))
+        self.scripted({"doc": fake_semantic.response("pack export", self.export())})
+        task_id = self.task()
+
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNone(result.refusal, result.err)
+        self.assertEqual(result.binding["orders"], self.at("orders.md"))
+        self.assertIsNone(result.binding["semantic"])
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(os.path.exists(self.at("semantic")))
+
+    def test_a_bound_project_briefs_its_minion_from_the_pinned_copy(self):
+        self.shared_project()
+        self.bind()
+        self.herdr.reply("agent.get", seen(), seen(status="working"))
+        self.scripted({"doc": fake_semantic.response("pack export", self.export())})
+        task_id = self.task()
+
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNone(result.refusal, result.err)
+        self.assertEqual(result.binding["semantic"], self.at("semantic", task_id))
+        with open(result.binding["orders"]) as fh:
+            orders = fh.read()
+        self.assertIn("# Semantic context", orders)
+        self.assertIn(self.at("semantic", task_id, "pack", "content.nt"), orders)
+        # The claim landed, so the pin is marked as one a minion really worked
+        # against. Without that mark nothing would ever record what this run did.
+        self.assertTrue(os.path.exists(
+            self.at("semantic", task_id, "dispatched")))
+
+    def test_a_pack_that_will_not_verify_stops_it_before_anything_exists(self):
+        # Before the workspace, before the claim, before the agent. A minion briefed
+        # from nothing looks exactly like a minion briefed from something, and it is
+        # the second one this whole exchange exists to produce.
+        self.shared_project()
+        self.bind()
+        self.scripted({"doc": fake_semantic.response(
+            "pack export", error={"kind": "pack", "message": "the pack is stale"}),
+            "exit": 1})
+        task_id = self.task()
+
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNotNone(result.refusal)
+        self.assertIn("the pack is stale", result.said)
+        self.assertEqual(self.herdr.calls, [])
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        self.assertFalse(os.path.exists(self.at("semantic", task_id)))
+
+    def test_a_distro_missing_the_command_refuses_rather_than_going_quiet(self):
+        # The two ship together, so this is a broken checkout. It is a refusal and
+        # never a silent disable: only that command knows whether this project has
+        # a binding, so skipping it would look exactly like a project that has none.
+        self.shared_project()
+        self.bind()
+        task_id = self.task()
+
+        with mock.patch.object(d, "SEMANTIC", self.at("gone")):
+            result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNotNone(result.refusal)
+        self.assertIn("no siana-semantic beside", result.said)
+        self.assertEqual(self.herdr.calls, [])
+        self.assertEqual(self.record(task_id)["status"], "todo")
+
+    def test_a_claim_given_up_again_leaves_the_pin_unclaimed(self):
+        # `agent.start` is the first thing that can refuse holding a claim, and the
+        # dispatch gives the claim back. No minion ran, so the mark has to go with
+        # it: left standing it says a run began here, and reconcile would report
+        # that run's ending as lost on every wake, forever, about an execution that
+        # never happened.
+        self.shared_project()
+        self.bind()
+        self.herdr.reply("agent.start", TAKEN)
+        self.scripted({"doc": fake_semantic.response("pack export", self.export())})
+        task_id = self.task()
+
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNotNone(result.refusal)
+        self.assertEqual(self.record(task_id)["status"], "todo")
+        self.assertTrue(os.path.exists(self.at("semantic", task_id, "pin.json")))
+        self.assertFalse(os.path.exists(self.at("semantic", task_id, "dispatched")))
+
+    def test_the_pin_a_released_claim_left_is_the_one_the_retry_uses(self):
+        # And the whole point of taking the mark back: the pin is unclaimed again,
+        # so the retry reuses it rather than minting a second pin and a second
+        # trace id for an interruption that never produced a run.
+        self.shared_project()
+        self.bind()
+        self.herdr.reply("agent.start", TAKEN)
+        self.scripted({"doc": fake_semantic.response("pack export", self.export())})
+        task_id = self.task()
+        self.dispatch(task_id, env=self.env())
+        with open(self.at("semantic", task_id, "pin.json")) as fh:
+            first = json.load(fh)["trace_id"]
+
+        self.herdr.reply("workspace.create", {"workspace": {"workspace_id": "ws2"},
+                                              "root_pane": {"pane_id": "w2:p1"}})
+        self.herdr.reply("agent.start", {})
+        self.herdr.reply("agent.get", seen(), seen(status="working"))
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNone(result.refusal, result.said + result.err)
+        with open(self.at("semantic", task_id, "pin.json")) as fh:
+            self.assertEqual(json.load(fh)["trace_id"], first)
+        self.assertFalse(os.path.exists(self.at("semantic", f"{task_id}.1")))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_pin_whose_claim_never_landed_is_not_marked_as_dispatched(self):
+        # The queue refuses a task another minion already holds, and the pin was
+        # written before the claim was tried. It is kept, because a re-dispatch has
+        # to land on the same bytes and the same trace id - but it is not marked,
+        # because no minion ever worked against it.
+        self.shared_project()
+        self.bind()
+        self.scripted({"doc": fake_semantic.response("pack export", self.export())})
+        task_id = self.task()
+        self.run_cmd(["tasks", "--file", self.at("tasks.jsonl"), "start", task_id,
+                      "--owner", "claude@w9:p9"])
+
+        result = self.dispatch(task_id, env=self.env())
+
+        self.assertIsNotNone(result.refusal)
+        self.assertTrue(os.path.exists(self.at("semantic", task_id, "pin.json")))
+        self.assertFalse(os.path.exists(self.at("semantic", task_id, "dispatched")))
 
 
 if __name__ == "__main__":
