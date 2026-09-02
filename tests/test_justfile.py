@@ -172,6 +172,14 @@ class Doctor(Recipe):
         self.assertIn("facts.jsonl (empty; written on the first fact)", out)
         self.assertIn("grants.jsonl (empty; written on the first grant)", out)
 
+    def test_a_home_that_bound_nothing_reports_semantic_as_disabled(self):
+        # Off until the captain turns it on, and doctor has to say that plainly:
+        # a home with no bindings is the ordinary state and never a fault.
+        self.contract("semantic")
+        out = self.just("doctor").stdout
+        self.assertIn("semantic.jsonl (empty; written on the first binding)", out)
+        self.assertIn("disabled (no bindings)", out)
+
     def test_no_siana_running_is_the_ordinary_state(self):
         self.assertIn("no SIANA running", self.just("doctor").stdout)
 
@@ -375,6 +383,10 @@ class Init(Recipe):
                   # than reporting a home it cannot read as a fleet that has found
                   # nothing.
                   "schema-findings.yaml",
+                  # The captain's semantic bindings. Absent, `siana-dispatch`
+                  # cannot be given one at all, and `datafile` would refuse the
+                  # write with no contract to hold it to.
+                  "schema-semantic.yaml",
                   # What a cleanup run reads before it starts. Written here so that
                   # `doctor` can say whether it is there, rather than a cleaner
                   # having to create the file it reads.
@@ -395,7 +407,8 @@ class Init(Recipe):
                   "siana-owe", "siana-retire", "siana-close-workspace",
                   "siana-handoff", "siana-publish", "siana-reap", "siana-pipeline",
                   "siana-afk", "siana-gate", "siana-read", "siana-clean",
-                  "siana-report", "siana-console", "siana-findings", "siana-fact"):
+                  "siana-report", "siana-console", "siana-findings",
+                  "siana-semantic", "siana-fact"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this

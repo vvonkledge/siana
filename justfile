@@ -114,7 +114,7 @@ init: _contract-drift
     # itself is written by the first `datafile put`, so an empty store is a schema
     # and no log. Never overwritten, for the reason the queue's contract is not: a
     # field dropped from a live contract makes every record carrying it unreadable.
-    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-facts schema-grants; do
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic schema-facts schema-grants; do
         if [ -f "$home/$c.yaml" ]; then
             echo "current  $home/$c.yaml"
         else
@@ -327,7 +327,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-fact; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic siana-fact; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -391,22 +391,22 @@ upgrade: _initialized init
     done
 
     # The registry's records are the captain's data and never the distro's, so an
-    # upgrade has nothing to say about them. Neither contract is rewritten either: a
-    # field dropped from a live contract makes every record still carrying it
-    # unreadable, so a contract only ever grows, by hand, once the captain has seen
-    # what it would cost. `_contract-drift` reports both, above, because this recipe
-    # reaches it through `init` - and it is what announces project-contract drift
-    # now that `siana` starts on a home whose contract predates `automerge` instead
-    # of refusing. `siana` says it again in a `stale` line at every start, so the
-    # captain meets it where the setting they cannot make would be made, and
-    # `datafile` still names the field it rejected at the write.
+    # upgrade has nothing to say about them. No contract is rewritten either: a field
+    # dropped from a live contract makes every record still carrying it unreadable,
+    # so a contract only ever grows, by hand, once the captain has seen what it would
+    # cost. `_contract-drift` reports every contract that has drifted, above, because
+    # this recipe reaches it through `init` - and it is what announces
+    # project-contract drift now that `siana` starts on a home whose contract
+    # predates `automerge` instead of refusing. `siana` says it again in a `stale`
+    # line at every start, so the captain meets it where the setting they cannot make
+    # would be made, and `datafile` still names the field it rejected at the write.
     echo "kept     $home/projects.jsonl (the captain's registry)"
     # The facts store is the captain's the same way, and its credential records are
     # the only pointer to the keychain items behind them: an upgrade that replaced
     # one would leave a value nothing can find again.
     echo "kept     $home/facts.jsonl (the captain's project facts)"
     echo "kept     $home/grants.jsonl (who may use which credential)"
-    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-tasks schema-facts schema-grants; do
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic schema-tasks schema-facts schema-grants; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
     done
     # The runbook is the fleet's accumulated answers to past cleanup questions, so it
@@ -484,22 +484,23 @@ _contract-drift:
     set -uo pipefail
     home='{{home}}'
 
-    # A field the distro's project contract has and the home copy does not is a
-    # setting the captain cannot make: `extra: forbid` refuses the write and names
-    # the key, without saying that the contract is simply older than the field. An
-    # upgrade never rewrites a live contract, because a dropped field makes every
-    # record still carrying it unreadable, so growing one stays the captain's call
-    # and this only makes sure they know there is one to make.
-    for c in schema-projects schema-facts schema-grants; do
+    # A field the distro has in one of the captain's contracts and the home copy
+    # does not is a setting the captain cannot make: `extra: forbid` refuses the
+    # write and names the key, without saying that the contract is simply older
+    # than the field. An upgrade never rewrites a live contract, because a dropped
+    # field makes every record still carrying it unreadable, so growing one stays
+    # the captain's call and this only makes sure they know there is one to make.
+    for c in schema-projects schema-semantic schema-facts schema-grants; do
         [ -f "$home/$c.yaml" ] || continue
         absent="$(comm -13 \
             <(grep -oE '^  [a-z_]+:' "$home/$c.yaml" | tr -d ' :' | sort) \
             <(grep -oE '^  [a-z_]+:' "$PWD/template/$c.yaml" | tr -d ' :' | sort))"
-        [ -n "$absent" ] || continue
-        echo "  stale   $c.yaml is missing: $(echo $absent | tr '\n' ' ')" >&2
-        echo "          copy those fields into $home/$c.yaml from" >&2
-        echo "          $PWD/template/$c.yaml; until then the store" >&2
-        echo "          refuses to record them" >&2
+        if [ -n "$absent" ]; then
+            echo "  stale   $c.yaml is missing: $(echo $absent | tr '\n' ' ')" >&2
+            echo "          copy those fields into $home/$c.yaml from" >&2
+            echo "          $PWD/template/$c.yaml; until then the store" >&2
+            echo "          refuses to record them" >&2
+        fi
     done
 
     [ -f "$home/schema-tasks.yaml" ] || exit 0
@@ -543,14 +544,14 @@ test *args:
     # files that appeared. The flag covers the `bin/` loads in this process too; the
     # guard in tests/helpers.py covers those when the suite is run without `just`.
     #
-    # Not exported. PYTHONDONTWRITEBYTECODE would reach the commands the suite drives
-    # as processes, which write no bytecode into the worktree anyway: a script run
-    # directly never writes its own, and the `bin/` commands import stdlib only. What
-    # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
-    # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner. Invisible locally, where the captain's uv cache is already
-    # warm, and worse than it looks now that a warm run is minutes rather than ten of
-    # them: the pool shortens the wall clock and changes none of that cost.
+    # Still not exported, and the flag is not the whole of the guarantee either: it
+    # is not inherited, so a test that spawns its own interpreter with `tests/`
+    # importable wrote a `helpers.pyc` into the worktree whatever this line said.
+    # `tests/run.py` closes that by pointing every process a run starts at one
+    # bytecode directory outside the tree, and says there why that rather than
+    # exporting PYTHONDONTWRITEBYTECODE, which reaches `tasks` and `datafile` and
+    # costs their uv environments the cache they read on every one of the hundreds of
+    # invocations a run makes.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`
@@ -578,7 +579,7 @@ doctor: _contract-drift
     # notices is what let a home with the whole package gone read as healthy.
     unhealthy=""
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-findings.yaml schema-tasks.yaml schema-facts.yaml schema-grants.yaml; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-findings.yaml schema-semantic.yaml schema-tasks.yaml schema-facts.yaml schema-grants.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -610,6 +611,12 @@ doctor: _contract-drift
     if [ -e "$home/findings.jsonl" ]; then echo "  ok      findings.jsonl"
     elif [ -e "$home/schema-findings.yaml" ]; then echo "  ok      findings.jsonl (empty; written on the first archive)"
     else echo "  missing findings.jsonl"; fi
+    # A home that has never bound a project to the semantic layer has no store at
+    # all, which is the zero and not a fault: the whole integration is opt-in and
+    # the way it is opted out of is by there being nothing to read.
+    if [ -e "$home/semantic.jsonl" ]; then echo "  ok      semantic.jsonl"
+    elif [ -e "$home/schema-semantic.yaml" ]; then echo "  ok      semantic.jsonl (empty; written on the first binding)"
+    else echo "  missing semantic.jsonl"; fi
     # A home that has recorded no project facts has neither store, which is the same
     # zero again. What is wrong inside one is `siana-fact status`'s to say, because
     # answering that means asking the keychain about every credential reference.
@@ -824,6 +831,11 @@ doctor: _contract-drift
     # stays manual because a dead minion's worktree may hold unlanded work.
     echo
     SIANA_HOME="$home" "$PWD/bin/siana-dispatch" --check || true
+    # What is bound to the semantic layer and what is waiting to be recorded. Asked
+    # of the command that owns it, for the reason the watcher and the advisory
+    # session are: it is the only thing that knows how to read its own pins. It
+    # reports and never records, so a doctor run cannot write a trace.
+    SIANA_HOME="$home" "$PWD/bin/siana-semantic" status || true
     echo
     SIANA_HOME="$home" "$PWD/bin/siana-owe" || true
     echo
@@ -839,7 +851,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-fact; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic siana-fact; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

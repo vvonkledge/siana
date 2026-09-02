@@ -87,7 +87,7 @@ class NoFacts(Section):
         # means the standing orders file is passed through untouched.
         self.assertEqual(
             d.assemble_orders(self.home, "ship-it", self.base, None, "demo",
-                              self.section()),
+                              facts=self.section()),
             self.base)
         self.assertFalse(os.path.exists(self.at("orders", "ship-it.md")))
 
@@ -132,15 +132,26 @@ class Nonsecret(Section):
         with open(self.at("project.md"), "w") as fh:
             fh.write("PROJECT ORDERS\n")
         combined = d.assemble_orders(self.home, "ship-it", self.base,
-                                     self.at("project.md"), "demo", self.section())
+                                     self.at("project.md"), "demo",
+                                     facts=self.section())
         with open(combined) as fh:
             text = fh.read()
         self.assertLess(text.index("FLEET ORDERS"), text.index("PROJECT ORDERS"))
         self.assertLess(text.index("PROJECT ORDERS"), text.index("# Project facts"))
 
+    def test_they_come_after_the_semantic_section_too(self):
+        # Both land at the end of the same file and only one of them is data. A
+        # fact printed above the context pack would read as part of the briefing
+        # the pack is, which is the boundary the section's own heading states.
+        combined = d.assemble_orders(self.home, "ship-it", self.base, None, "demo",
+                                     "\n\n# Semantic context\n", self.section())
+        with open(combined) as fh:
+            text = fh.read()
+        self.assertLess(text.index("# Semantic context"), text.index("# Project facts"))
+
     def test_facts_alone_still_produce_a_combined_file(self):
         combined = d.assemble_orders(self.home, "ship-it", self.base, None, "demo",
-                                     self.section())
+                                     facts=self.section())
         self.assertEqual(combined, self.at("orders", "ship-it.md"))
         with open(combined) as fh:
             text = fh.read()

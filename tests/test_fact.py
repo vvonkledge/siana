@@ -780,7 +780,7 @@ class NoLeak(Facts):
         with open(self.at("orders.md"), "w") as fh:
             fh.write("FLEET ORDERS\n")
         d.assemble_orders(self.home, "ship-it", self.at("orders.md"), None, "demo",
-                          d.facts_section(self.home, "demo", "ship-it"))
+                          facts=d.facts_section(self.home, "demo", "ship-it"))
         out = self.fact("exec", "test-user", "--", self.child.command,
                         SIANA_TASK_ID="ship-it")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)

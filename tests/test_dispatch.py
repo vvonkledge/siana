@@ -154,6 +154,30 @@ class AssembleOrders(HomeTest):
         self.assertIn("# Project orders: p", text)
         self.assertLess(text.index("FLEET ORDERS"), text.index("PROJECT ORDERS"))
 
+    def test_a_semantic_section_alone_still_makes_the_combined_file(self):
+        # A bound project with no orders of its own. Without this the section would
+        # be built, handed back, and dropped on the floor: the base file is the
+        # distro's and is never written to.
+        combined = d.assemble_orders(self.home, "t1", self.base, None, "p",
+                                     "\n\n# Semantic context\n")
+        self.assertEqual(combined, self.at("orders", "t1.md"))
+        with open(combined) as fh:
+            text = fh.read()
+        self.assertIn("FLEET ORDERS", text)
+        self.assertIn("# Semantic context", text)
+        with open(self.base) as fh:
+            self.assertEqual(fh.read(), "FLEET ORDERS\n")
+
+    def test_the_semantic_section_comes_after_the_project_orders(self):
+        with open(self.at("project.md"), "w") as fh:
+            fh.write("PROJECT ORDERS\n")
+        combined = d.assemble_orders(self.home, "t1", self.base,
+                                     self.at("project.md"), "p",
+                                     "\n\n# Semantic context\n")
+        with open(combined) as fh:
+            text = fh.read()
+        self.assertLess(text.index("PROJECT ORDERS"), text.index("# Semantic context"))
+
 
 class CheckRegistry(HomeTest):
     """`--check` resolves the way a dispatch resolves, so a moved path surfaces

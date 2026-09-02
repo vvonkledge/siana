@@ -267,9 +267,10 @@ class HomeTest(unittest.TestCase):
         e.update(extra or {})
         return e
 
-    def run_cmd(self, argv, cwd=None, env=None, timeout=120):
+    def run_cmd(self, argv, cwd=None, env=None, timeout=120, input=None):
         return subprocess.run(argv, cwd=cwd or self.home, env=self.command_env(env),
-                              text=True, capture_output=True, timeout=timeout)
+                              text=True, capture_output=True, timeout=timeout,
+                              input=input)
 
     def run_bin(self, name, *args, **kw):
         return self.run_cmd([os.path.join(BIN, name), *args], **kw)
