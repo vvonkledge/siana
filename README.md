@@ -947,22 +947,22 @@ the control on the quieter side of the pool runs, 3.2 to 4.3 around it against 6
 rising to 15.7 during a pool run, with another agent running this same suite on the
 box for part of the window.
 
-Those four runs are that head's, and that head had 912 tests. This tree has 1631, so
+Those four runs are that head's, and that head had 912 tests. This tree has 1761, so
 expect longer on the one you are standing on. Measured here rather than scaled, on
-the same eleven-core M3 Pro: 407.6s from the default five-worker pool, and 464.6s at
-the three workers a four-core runner gets. Both were taken with the box busy - load
-6.4 rising to 13.4 across the first, 12.5 falling to 3.7 across the second - so they
-are the slow end of this machine rather than the fast one. Call it seven minutes from
-the default pool and eight at three, and re-measure rather than planning against
-either: they are one run each. GitHub's own four-core runner took 497s at three
-workers over the 1526 tests this tree grew from, which is what
-`.github/workflows/ci.yml` sizes its hang guard against.
+the same eleven-core M3 Pro: 478.5s from the default five-worker pool, and 563.8s at
+the three workers a four-core runner gets. Load was sampled across the second only,
+3.4 rising to 7.1, so that one is the middle of this machine rather than either end
+and the first is unattributed. Call it eight minutes from the default pool and nine
+and a half at three, and re-measure rather than planning against either: they are one
+run each. GitHub's own four-core runner took 497s at three workers over the 1526
+tests this tree grew from, which is what `.github/workflows/ci.yml` sizes its hang
+guard against.
 
 Load is the variable that moves these, not the number of tests. The same three-worker
-mode on this machine took 558s over 1390 tests, 487s over 1495, 379s over 1526 and
-464.6s over 1631, which is a spread wider than the growth it is supposed to be
-tracking. One worker is slower again in proportion, and stays a control to reach for
-rather than a way to run the suite.
+mode on this machine took 558s over 1390 tests, 487s over 1495, 379s over 1526,
+464.6s over 1631 and 563.8s over 1761, which is a spread wider than the growth it is
+supposed to be tracking. One worker is slower again in proportion, and stays a
+control to reach for rather than a way to run the suite.
 
 Measured separately by the author of the pool at `6906b6a`, interleaving the two
 modes: one control of 1115s taken at load 11.8, against pool runs of 199s, 296s and
