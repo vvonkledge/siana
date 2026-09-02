@@ -114,8 +114,7 @@ init: _contract-drift
     # itself is written by the first `datafile put`, so an empty store is a schema
     # and no log. Never overwritten, for the reason the queue's contract is not: a
     # field dropped from a live contract makes every record carrying it unreadable.
-    for c in schema-projects schema-obligations schema-decisions schema-facts \
-             schema-grants; do
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-facts schema-grants; do
         if [ -f "$home/$c.yaml" ]; then
             echo "current  $home/$c.yaml"
         else
@@ -123,6 +122,19 @@ init: _contract-drift
             echo "wrote    $home/$c.yaml"
         fi
     done
+
+    # The cleanup runbook. Written empty here so that a cleanup run never has to
+    # create the file it reads, and never overwritten: it accumulates the answers
+    # SIANA has given past cleaners, and those are the fleet's and not the distro's.
+    # `siana-clean` creates it too if it is somehow gone, for the same reason `tasks`
+    # creates its store on the first append - but a home that has one from init is a
+    # home where `just doctor` can say whether it is there.
+    if [ -f "$home/runbook.md" ]; then
+        echo "current  $home/runbook.md"
+    else
+        SIANA_HOME="$home" "$distro/bin/siana-clean" runbook >/dev/null
+        echo "wrote    $home/runbook.md"
+    fi
 
     # The captain's principles. Never overwritten and never upgraded, for a reason
     # neither the instructions nor the contracts have: it is the only file an
@@ -240,6 +252,55 @@ init: _contract-drift
         mkdir -p "$home/.pi/extensions"
         cp "$distro/template/wake.ts" "$home/.pi/extensions/wake.ts"
         echo "wrote    $home/.pi/extensions/wake.ts"
+
+        # The distro's own pi package: the cleanup tools, the captain-report skill,
+        # and the `/captain-report` command. Installed from the checkout rather than
+        # copied into the home, so an upgrade of the distro is an upgrade of the
+        # package with nothing to re-copy and nothing to drift.
+        #
+        # Reconciled rather than appended, and that is the whole reason this is not
+        # one `pi install` line. Pi identifies a local package by its resolved
+        # absolute path, so the same package reached through two spellings - a
+        # symlink and its target, an old checkout location and a new one - is two
+        # packages, and every resource in it is discovered twice: two
+        # `/captain-report` commands, two `siana_cleanup` tools, and a skill-name
+        # collision warning at every startup. So every entry that resolves to a
+        # pi-siana is removed first, and then exactly one is installed.
+        #
+        # Never also copied into `$home/.pi/extensions/`. That directory is pi's
+        # auto-discovery location, and an extension present there *and* in an
+        # installed package is loaded twice, which is the same collision by another
+        # route. `wake.ts` lives there because it is not in any package.
+        siana_pkg="$(cd "$distro/template/pi-siana" && pwd -P)"
+    python3 - "$home/.pi/settings.json" "$siana_pkg" <<'RECONCILE'
+    import json, os, sys
+    settings_path, pkg = sys.argv[1], sys.argv[2]
+    try:
+        with open(settings_path) as fh:
+            settings = json.load(fh)
+    except (OSError, ValueError):
+        settings = {}
+    before = settings.get("packages", [])
+    kept = []
+    for entry in before:
+        source = entry if isinstance(entry, str) else entry.get("source", "")
+        # Only a local path can collide this way. An npm or git source is identified by
+        # name or by URL, and neither is another spelling of this directory.
+        if not isinstance(source, str) or not source.startswith(("/", ".")):
+            kept.append(entry)
+            continue
+        resolved = os.path.realpath(
+            os.path.join(os.path.dirname(settings_path), source))
+        if resolved != pkg and os.path.basename(resolved) != "pi-siana":
+            kept.append(entry)
+    if kept != before:
+        settings["packages"] = kept
+        with open(settings_path, "w") as fh:
+            json.dump(settings, fh, indent=2)
+            fh.write("\n")
+    RECONCILE
+        (cd "$home" && pi install -l -a "$siana_pkg" >/dev/null)
+        echo "wrote    $home/.pi/settings.json (pi-siana)"
     fi
 
     # The same two halves the pi package carries in one, which is why both are
@@ -266,7 +327,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-fact; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-fact; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -333,19 +394,25 @@ upgrade: _initialized init
     # upgrade has nothing to say about them. Neither contract is rewritten either: a
     # field dropped from a live contract makes every record still carrying it
     # unreadable, so a contract only ever grows, by hand, once the captain has seen
-    # what it would cost. Task-contract drift is reported by `_contract-drift`;
-    # project-contract drift announces itself, because `datafile` names the field it
-    # rejected and `siana` refuses to start on a registry it cannot read.
+    # what it would cost. `_contract-drift` reports both, above, because this recipe
+    # reaches it through `init` - and it is what announces project-contract drift
+    # now that `siana` starts on a home whose contract predates `automerge` instead
+    # of refusing. `siana` says it again in a `stale` line at every start, so the
+    # captain meets it where the setting they cannot make would be made, and
+    # `datafile` still names the field it rejected at the write.
     echo "kept     $home/projects.jsonl (the captain's registry)"
     # The facts store is the captain's the same way, and its credential records are
     # the only pointer to the keychain items behind them: an upgrade that replaced
     # one would leave a value nothing can find again.
     echo "kept     $home/facts.jsonl (the captain's project facts)"
     echo "kept     $home/grants.jsonl (who may use which credential)"
-    for c in schema-projects schema-obligations schema-decisions schema-tasks \
-             schema-facts schema-grants; do
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-tasks schema-facts schema-grants; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
     done
+    # The runbook is the fleet's accumulated answers to past cleanup questions, so it
+    # is the captain's data the way the registry is, and an upgrade has nothing to
+    # say about it. `init` above wrote one if there was none.
+    echo "kept     $home/runbook.md (what past cleanup runs were told)"
     # Never upgraded either, and for a different reason: a distro that could rewrite
     # the principles could rewrite what SIANA is held to while the captain is away.
     echo "kept     $home/principles.md (your principles)"
@@ -393,9 +460,16 @@ _pi-packages settings:
         import json, os, sys
         try:
             with open(sys.argv[1]) as fh:
-                sources = json.load(fh).get("packages", [])
+                settings = json.load(fh)
         except (OSError, ValueError) as why:
             sys.exit(str(why))
+        # The shape is checked and not just the parse. `null` parses without error
+        # and is not a mapping, and `.get` on it printed an AttributeError traceback
+        # where the reason and the repair belong - the one thing every read in
+        # these recipes is written to keep off the screen the captain reads.
+        if not isinstance(settings, dict):
+            sys.exit(os.path.basename(sys.argv[1]) + " does not hold a JSON object")
+        sources = settings.get("packages", [])
         base = os.path.dirname(os.path.abspath(sys.argv[1]))
         for source in sources:
             print(os.path.abspath(os.path.join(base, source)))
@@ -444,12 +518,22 @@ _contract-drift:
 # Run the distro's tests. Pass unittest arguments through: `just test -v`, or
 # `just test -k slug` for one rule.
 #
-# Through `tests/run.py` rather than `-m unittest` directly, because unittest's own
-# progress is dots with no newline until the summary and a line-oriented reader -
-# the GitHub Actions runner is one - shows none of it. Three CI runs on this project
-# were killed by the hang guard having printed nothing at all. That file is the whole
-# of the difference: a line per test before it runs, and a watchdog that dumps every
-# thread's stack rather than letting a stall eat the job's wall clock in silence.
+# Through `tests/run.py` rather than `-m unittest` directly, for two reasons.
+#
+# unittest's own progress is dots with no newline until the summary, and a
+# line-oriented reader - the GitHub Actions runner is one - shows none of it. Three
+# CI runs on this project were killed by the hang guard having printed nothing at
+# all. So: a line per test before it runs, and a watchdog that dumps every thread's
+# stack rather than letting a stall eat the job's wall clock in silence.
+#
+# And the suite is latency-bound rather than CPU-bound - measured at 0.75 of one
+# core for its whole length - so it is run across a pool of worker processes. See
+# `tests/run.py` for how the pool is sized and why one worker is the control.
+#
+#     SIANA_TEST_WORKERS=1 just test      unittest, serially, in one process
+#
+# That is the mode to reach for when a failure looks like it might be the pool's
+# fault rather than the code's, and it is the control every timing here is against.
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -464,8 +548,9 @@ test *args:
     # directly never writes its own, and the `bin/` commands import stdlib only. What
     # it does reach is `tasks` and `datafile`, whose uv environments then recompile on
     # every one of the ~464 invocations a run makes, about +92ms each and roughly +40s
-    # on a cold runner, against a suite that already takes three or four minutes.
-    # Invisible locally, where the captain's uv cache is already warm.
+    # on a cold runner. Invisible locally, where the captain's uv cache is already
+    # warm, and worse than it looks now that a warm run is minutes rather than ten of
+    # them: the pool shortens the wall clock and changes none of that cost.
     #
     # The litter is not untidiness. `siana-retire` refuses to remove a worktree
     # holding ignored files, because git deletes those without a word and a `.pyc`
@@ -486,8 +571,14 @@ doctor: _contract-drift
     #!/usr/bin/env bash
     set -uo pipefail
     home='{{home}}'
+    # Doctor reports and never repairs, so almost everything it finds is a line the
+    # captain reads and acts on. This is the one exception, and it is set below: an
+    # absent pi-siana package cannot be seen from inside a session at all, because
+    # every tool and command it carries is simply not offered. A report nobody
+    # notices is what let a home with the whole package gone read as healthy.
+    unhealthy=""
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-tasks.yaml schema-facts.yaml schema-grants.yaml; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-findings.yaml schema-tasks.yaml schema-facts.yaml schema-grants.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -506,6 +597,19 @@ doctor: _contract-drift
     if [ -e "$home/decisions.jsonl" ]; then echo "  ok      decisions.jsonl"
     elif [ -e "$home/schema-decisions.yaml" ]; then echo "  ok      decisions.jsonl (empty; written on the first decision)"
     else echo "  missing decisions.jsonl"; fi
+    # The reasoning behind the decisions the captain was actually asked. A home that
+    # has recorded none has no file, which is the zero and not a fault, exactly as
+    # the four stores above are.
+    if [ -e "$home/attended.jsonl" ]; then echo "  ok      attended.jsonl"
+    elif [ -e "$home/schema-attended.yaml" ]; then echo "  ok      attended.jsonl (empty; written on the first attended decision)"
+    else echo "  missing attended.jsonl"; fi
+    # The findings ledger. Empty and unavailable are opposite facts here and the
+    # line says which: a home whose contract is missing cannot read the store at
+    # all, and reporting that as an empty ledger would say this fleet has found
+    # nothing where the truth is that nothing can be read.
+    if [ -e "$home/findings.jsonl" ]; then echo "  ok      findings.jsonl"
+    elif [ -e "$home/schema-findings.yaml" ]; then echo "  ok      findings.jsonl (empty; written on the first archive)"
+    else echo "  missing findings.jsonl"; fi
     # A home that has recorded no project facts has neither store, which is the same
     # zero again. What is wrong inside one is `siana-fact status`'s to say, because
     # answering that means asking the keychain about every credential reference.
@@ -519,6 +623,13 @@ doctor: _contract-drift
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
     done
+    # What `siana-console` runs on, and the only thing here that needs it. Absent is
+    # a console this captain cannot start rather than a fault, and it is said in
+    # those words: reported as `missing` beside `tasks` it would read as a broken
+    # install on every machine that has never wanted a console.
+    p="$(command -v node || true)"
+    if [ -n "$p" ]; then echo "  ok      node -> $p"
+    else echo "  none    node (only siana-console needs it)"; fi
     # What `siana` can start in. A harness needs both the command and the queue
     # integration `init` wrote into this home for it, so they are reported as the
     # one fact they make: a session started with either half missing has no fleet
@@ -541,6 +652,12 @@ doctor: _contract-drift
             starts="$starts $cmd"
         else
             echo "  missing $f (\`just init\` writes it)"
+            # For pi this is the package check below reached by another route. A
+            # home with no pi settings at all names no pi-siana package either, and
+            # everything that package carries is missing with it - but the check
+            # needs a file to read, so it is never reached to say so. Without this
+            # the one case the check exists for exits 0.
+            if [ "$cmd" = pi ]; then unhealthy=1; fi
         fi
         # The wake consumer, reported only for the harness that has one. It is what
         # delivers `siana-watch`'s wake inside the session without writing into the
@@ -555,6 +672,70 @@ doctor: _contract-drift
                 echo "  missing .pi/extensions/wake.ts (\`just init\` writes it;" \
                      "without it \`siana-watch\` refuses to start)"
             fi
+            # The distro's own package, asked of the settings file rather than
+            # assumed from it existing. `wake.ts` is checked by name because a home
+            # without it cannot advance unattended; this is the same silence one
+            # layer in. A home whose `packages` array has lost the pi-siana entry
+            # has no `siana_cleanup` and no `siana_runbook` tool, no
+            # `captain-report` skill and no `/captain-report` command - and none of
+            # them fails, because none of them is there to be called.
+            #
+            # An entry is recognised exactly as `init`'s reconciler recognises one,
+            # so what doctor calls a pi-siana entry and what init collapses to a
+            # single entry cannot drift apart.
+            siana_pkg="$(cd "$PWD/template/pi-siana" && pwd -P)"
+    python3 - "$home/.pi/settings.json" "$siana_pkg" <<'PACKAGE' || unhealthy=1
+    import json, os, sys
+    settings_path, pkg = sys.argv[1], sys.argv[2]
+    name = os.path.basename(settings_path)
+    # Both assigned before anything can fail, and the shape checked rather than the
+    # parse alone. A settings file holding `null` parses without error and is not a
+    # mapping, and an unset `why` at the bottom was a Python traceback printed where
+    # the repair line belongs - a report tracing instead of refusing.
+    why, settings = "", None
+    try:
+        with open(settings_path) as fh:
+            settings = json.load(fh)
+    except (OSError, ValueError) as exc:
+        why = f"{name} will not parse: {exc}"
+    if not why and not isinstance(settings, dict):
+        why = f"{name} does not hold a JSON object"
+    if not why:
+        packages = settings.get("packages", [])
+        if not isinstance(packages, list):
+            why = "its `packages` is not a list"
+        else:
+            found = []
+            for entry in packages:
+                source = entry if isinstance(entry, str) else \
+                    (entry.get("source", "") if isinstance(entry, dict) else "")
+                if not isinstance(source, str) or not source.startswith(("/", ".")):
+                    continue
+                resolved = os.path.realpath(
+                    os.path.join(os.path.dirname(settings_path), source))
+                if resolved == pkg or os.path.basename(resolved) == "pi-siana":
+                    found.append(resolved)
+            if not found:
+                why = "no entry names it"
+            elif len(found) > 1:
+                # Two spellings of one directory are two packages to pi, and every
+                # resource in it is then discovered twice.
+                why = f"{len(found)} entries name it: {', '.join(found)}"
+            elif not os.path.isdir(found[0]):
+                why = f"its entry resolves to {found[0]}, which is not there"
+            elif not os.path.isfile(os.path.join(found[0], "package.json")):
+                why = f"its entry resolves to {found[0]}, which holds no package.json"
+    if not why:
+        print("  ok      .pi/settings.json (pi-siana)")
+        raise SystemExit(0)
+    print(f"  missing pi-siana package: {why}", file=sys.stderr)
+    print("          without it a session has no siana_cleanup or siana_runbook",
+          file=sys.stderr)
+    print("          tool, no captain-report skill and no /captain-report command",
+          file=sys.stderr)
+    print("          `just init` installs it", file=sys.stderr)
+    raise SystemExit(1)
+    PACKAGE
             # The queue package the settings file actually configures, counted
             # rather than taken on trust from the file being there. `pi install`
             # only appends, so a home can end up carrying two; pi loads the first
@@ -631,6 +812,12 @@ doctor: _contract-drift
     # was started and never that one is running, and only the command that wrote it
     # knows how to tell those apart. It reports and never repairs.
     SIANA_HOME="$home" "$PWD/bin/siana-afk" --status || true
+    # What the delegated cleanup loop is doing, asked of the command that owns its
+    # state for the reason the two above are asked: a run record can say a cleaner
+    # was started and never that one is running, and only `siana-clean` knows how to
+    # tell those apart. It exits 3 while a question is pending, which is a state and
+    # not a fault, so its code is not this recipe's to react to.
+    SIANA_HOME="$home" "$PWD/bin/siana-clean" status || true
     # Dispatch does the resolving and holds the pane bindings, so asking it means
     # this cannot drift from what a real dispatch would accept or from where a real
     # minion was put. It reports a dead owner and never reclaims one: `tasks reset`
@@ -641,12 +828,18 @@ doctor: _contract-drift
     SIANA_HOME="$home" "$PWD/bin/siana-owe" || true
     echo
     [ -d "$home" ] && (cd "$home" && tasks)
+    # The queue's own exit code, unless the package check above already failed.
+    # Kept rather than replaced with a plain `exit 0`, because a home whose queue
+    # will not read is a home doctor was already right to fail on.
+    status=$?
+    [ -z "$unhealthy" ] || status=1
+    exit "$status"
 
 # Remove the installed commands. SIANA's home and its queue are left alone.
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-fact; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-fact; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Gather everything a captain's report is made of, from the live world.
+
+The captain asks SIANA how the fleet is, and the wrong way to answer is from the
+session's own memory. A session remembers what it did, not what happened: a minion
+that finished while SIANA was mid-turn, a watcher that died an hour ago and a
+publication that was never opened are all invisible to recollection and all obvious
+to a read. So this reads, and the report is written from what it returns.
+
+This gathers and never judges. Every fact here is something a store, a command or a
+repository said, quoted rather than interpreted, and nothing in this file decides
+whether the fleet is healthy, what should happen next, or which of two things matters
+more. Those are the report, and the report is an agent's work: the `captain-report`
+skill is where the judgment lives, and it is written against this output.
+
+**An unavailable source is a source that is unavailable, and never an empty one.**
+That distinction is the whole reason this exists as a script. A herdr that is not
+running, a forge with no credentials and a project directory that has been moved all
+produce nothing, and rendering nothing as "no open workspaces" or "nothing to
+publish" is how a report becomes a lie. Every source below reports one of three
+states, and `unavailable` carries the reason in the failing command's own words:
+
+    read          the source answered, and `data` is what it said
+    empty         the source answered, and it holds nothing. This is a real zero
+    unavailable   the source could not be read at all, and `why` says so
+
+Usage:
+    siana-report [--json] [--project <handle>]
+
+The default output is for a human reading over SIANA's shoulder. `--json` is what the
+skill consumes; it is the same facts and it is the one an agent should use, because
+the text form is aligned for reading and its alignment is not a contract.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+# Every subprocess this makes is a read, and a read that hangs is worse than one that
+# fails: the captain is waiting on this. A forge call over a slow link is the
+# realistic worst case, so the budget is generous for one call and fatal for a wedge.
+CALL_S = 30
+
+
+def run(argv, cwd=None):
+    """One read of the world, as (ok, text). Never raises: a source that cannot be
+    read is a fact this report carries rather than a failure that stops it."""
+    try:
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
+                              timeout=CALL_S)
+    except FileNotFoundError:
+        return False, f"{argv[0]} is not on PATH"
+    except subprocess.TimeoutExpired:
+        return False, f"{' '.join(argv[:3])} did not answer in {CALL_S}s"
+    except OSError as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout).strip() or \
+            f"{argv[0]} exited {proc.returncode}"
+    return True, proc.stdout
+
+
+def source(name: str, ok: bool, data, why: str = "") -> dict:
+    """One source's answer, in the three states this report knows.
+
+    `empty` is decided here rather than by each caller, so that "the store answered
+    and holds nothing" cannot be spelled two ways in one report.
+    """
+    if not ok:
+        return {"source": name, "state": "unavailable", "why": why, "data": None}
+    if data in (None, [], {}, ""):
+        return {"source": name, "state": "empty", "why": "", "data": data}
+    return {"source": name, "state": "read", "why": "", "data": data}
+
+
+def fold(path: str, key: str):
+    """An append-only datafile store, folded to {key: record}.
+
+    The same read `siana-owe` and `siana-dispatch` do: the last line for an id wins
+    and a tombstone is a last line like any other. Raises on a line that is not JSON,
+    because a corrupt store is a fault the captain has to know about rather than a
+    smaller set of records.
+    """
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    with open(path) as fh:
+        for number, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                raise ValueError(f"{os.path.basename(path)}:{number} is not JSON")
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+def store(home: str, name: str, key: str, schema: str):
+    """A store as a source.
+
+    A store with no records has no `.jsonl` at all, because `datafile` writes it on
+    the first append. That is `empty` and never `unavailable` - but only when the
+    contract is there, because the contract is what says the store exists. A missing
+    contract is a home that was never initialised for this store, and reporting that
+    as "nothing owed" would be the exact lie this file is written against.
+    """
+    if not os.path.isfile(os.path.join(home, schema)):
+        return source(name, False, None,
+                      f"no contract at {schema}; run `just upgrade` in the distro")
+    try:
+        return source(name, True, list(fold(os.path.join(home, name), key).values()))
+    except ValueError as exc:
+        return source(name, False, None, str(exc))
+
+
+def command(name: str, argv, cwd=None):
+    """A fleet command's own read-only report, quoted whole.
+
+    Asked rather than reimplemented, for the reason `just doctor` asks them: a file
+    can say a watcher was started and never that one is running, and only the command
+    that wrote the record knows how to tell those apart. Several of these exit
+    non-zero to mean "something is outstanding" rather than "I failed", so the text
+    is kept either way and the exit code is reported beside it.
+    """
+    try:
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
+                              timeout=CALL_S)
+    except FileNotFoundError:
+        return source(name, False, None, f"{argv[0]} is not on PATH")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return source(name, False, None, str(exc))
+    text = (proc.stdout + proc.stderr).strip()
+    return source(name, True, {"exit": proc.returncode, "text": text})
+
+
+def projects(home: str):
+    try:
+        return list(fold(os.path.join(home, "projects.jsonl"), "handle").values())
+    except ValueError:
+        return []
+
+
+def repository(project: dict):
+    """What one project's repository says: its branches, its worktrees, and whether
+    the forge can be reached at all.
+
+    The forge is asked once per project and only for whether it answers. What has
+    merged is `siana-reap`'s question and it asks it per branch; duplicating that
+    here would put a second, weaker copy of a rule that decides whether a branch may
+    be deleted.
+    """
+    path = project.get("path") or ""
+    out = {"handle": project.get("handle"), "path": path,
+           "target": project.get("target")}
+    if not os.path.isdir(path):
+        return source(f"repo:{project.get('handle')}", False, None,
+                      f"no directory at {path}; the registry points somewhere gone")
+    ok, text = run(["git", "for-each-ref", "--format=%(refname:short)",
+                    "refs/heads/siana"], cwd=path)
+    out["branches"] = text.split() if ok else None
+    out["branches_why"] = "" if ok else text
+    ok, text = run(["git", "worktree", "list", "--porcelain"], cwd=path)
+    out["worktrees"] = ([line.split(" ", 1)[1] for line in text.splitlines()
+                         if line.startswith("worktree ")] if ok else None)
+    out["worktrees_why"] = "" if ok else text
+    ok, remote = run(["git", "remote", "get-url", "origin"], cwd=path)
+    out["remote"] = remote.strip() if ok else None
+    out["remote_why"] = "" if ok else remote
+    if out["remote"]:
+        cli = "glab" if "gitlab" in out["remote"] else "gh"
+        ok, text = run([cli, "auth", "status"], cwd=path)
+        out["forge"] = cli if ok else None
+        out["forge_why"] = "" if ok else text.strip()
+    else:
+        out["forge"], out["forge_why"] = None, "no origin remote"
+    return source(f"repo:{project.get('handle')}", True, out)
+
+
+def gather(home: str, only):
+    """Every source, in the order a report reads them: what the fleet is doing, what
+    it owes, what it is waiting on, and what state it has left lying around."""
+    bindir = os.path.dirname(os.path.realpath(__file__))
+
+    def fleet(name):
+        return os.path.join(bindir, name)
+
+    out = [
+        store(home, "tasks.jsonl", "id", "schema-tasks.yaml"),
+        store(home, "projects.jsonl", "handle", "schema-projects.yaml"),
+        store(home, "obligations.jsonl", "id", "schema-obligations.yaml"),
+        store(home, "attended.jsonl", "id", "schema-attended.yaml"),
+        store(home, "decisions.jsonl", "id", "schema-decisions.yaml"),
+        command("watcher", [fleet("siana-watch"), "--status"], cwd=home),
+        command("advisory", [fleet("siana-afk"), "--status"], cwd=home),
+        command("dispatch", [fleet("siana-dispatch"), "--check"], cwd=home),
+        command("cleanup", [fleet("siana-clean"), "status", "--json"], cwd=home),
+        command("herdr", ["herdr", "workspace", "list"], cwd=home),
+    ]
+    for project in projects(home):
+        if only and project.get("handle") != only:
+            continue
+        out.append(repository(project))
+    if only and not any(s["source"] == f"repo:{only}" for s in out):
+        out.append(source(f"repo:{only}", False, None,
+                          f"no project in the registry under the handle {only}"))
+    return out
+
+
+def text_report(sources) -> None:
+    """The gathered facts, aligned for a human reading over SIANA's shoulder.
+
+    Deliberately not the captain's report. There is no ordering by importance here,
+    no health verdict and no recommendation, because every one of those is a judgment
+    and this file makes none. What it is for is checking, by eye, that the thing the
+    skill is about to read really did come from the world.
+    """
+    for s in sources:
+        head = f"{s['source']:<24} {s['state']}"
+        if s["state"] == "unavailable":
+            print(head)
+            for line in s["why"].splitlines()[:4]:
+                print(f"  why    {line}")
+            continue
+        if s["state"] == "empty":
+            print(head)
+            continue
+        data = s["data"]
+        if isinstance(data, list):
+            print(f"{head} ({len(data)} records)")
+        elif isinstance(data, dict) and "text" in data:
+            print(f"{head} (exit {data['exit']})")
+            for line in data["text"].splitlines():
+                # Clipped, because a `herdr workspace list` is one JSON line several
+                # thousand columns wide and this view exists to be read by eye. What
+                # is clipped is never lost: `--json` carries every source whole, and
+                # that is the form anything acting on this reads.
+                print(f"  {line if len(line) <= 100 else line[:100] + ' ...'}")
+        else:
+            print(head)
+            for key, value in sorted(data.items()):
+                if key.endswith("_why"):
+                    if value:
+                        print(f"  {key:<12} {value.splitlines()[0]}")
+                    continue
+                if isinstance(value, list):
+                    print(f"  {key:<12} {len(value)}")
+                elif value is None:
+                    print(f"  {key:<12} unavailable")
+                else:
+                    print(f"  {key:<12} {value}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="siana-report", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    ap.add_argument("--project", help="one project handle; omitted means all of them")
+    args = ap.parse_args()
+
+    home = os.environ.get("SIANA_HOME", os.path.expanduser("~/.siana"))
+    if not os.path.isdir(home):
+        print(f"error: no SIANA home at {home}", file=sys.stderr)
+        print("  run `just init` in the distro", file=sys.stderr)
+        return 1
+    sources = gather(home, args.project)
+    if args.as_json:
+        print(json.dumps(sources, indent=2))
+    else:
+        text_report(sources)
+    # Non-zero when a source could not be read, so a caller that only wants to know
+    # whether the picture is complete does not have to parse it. Never non-zero for
+    # what the sources say: a fleet with ten blockers is a fleet this read correctly.
+    return 1 if any(s["state"] == "unavailable" for s in sources) else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -7,8 +7,12 @@ minimum code, mechanics apart from judgment - is judgment, and stays in the orde
 where an agent reads it.
 
 The column limit is for prose. Command examples and code are fenced or indented, and
-wrapping one changes what it does, so those are read past rather than measured. The em
-dash has no such exception: there is nowhere in a prose file it belongs.
+wrapping one changes what it does, so those are read past rather than measured. YAML
+frontmatter is read past for the same reason and not as a favour: a skill's
+`description` is a single-line scalar that a harness parses, wrapping it changes what
+the harness reads, and one of them is 488 columns because it has to list every phrase
+that should load the skill. The em dash has no such exception: there is nowhere in a
+prose file it belongs, frontmatter included.
 """
 
 import os
@@ -48,7 +52,17 @@ def prose_lines(text):
     fenced = False
     in_code = False
     previous_blank = True
-    for number, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    # Frontmatter, when the document opens with it. Skipped whole rather than
+    # detected line by line, because `---` is also a horizontal rule and a document
+    # that used one would otherwise switch the exception on halfway down.
+    first = 0
+    if lines and lines[0].strip() == "---":
+        close = next((i for i, line in enumerate(lines[1:], 1)
+                      if line.strip() == "---"), None)
+        if close is not None:
+            first = close + 1
+    for number, line in enumerate(lines[first:], first + 1):
         blank = not line.strip()
         indented = line.startswith("    ") or line.startswith("\t")
         if line.lstrip().startswith("```"):
@@ -72,6 +86,12 @@ class Prose(unittest.TestCase):
         # A checker that silently matched nothing would pass forever, and every
         # test below it would be reporting on an empty list.
         self.assertTrue(list(prose_files()))
+
+    def test_frontmatter_is_still_measured_for_the_em_dash(self):
+        # The column exception is about what a harness parses. The em dash is about
+        # what a person reads, and a description is read by both.
+        self.assertNotIn(EM_DASH, "".join(
+            open(path, encoding="utf-8").read() for path in prose_files()))
 
     def test_no_prose_file_uses_an_em_dash(self):
         found = []
@@ -121,6 +141,23 @@ class ProseLines(unittest.TestCase):
     def test_prose_after_a_code_block_is_measured_again(self):
         text = "before\n\n    code\n\nafter\n"
         self.assertEqual([line for _, line in prose_lines(text)], ["before", "after"])
+
+    def test_frontmatter_is_not_prose(self):
+        text = "---\nname: a-skill\ndescription: a very long single line\n---\nbody\n"
+        self.assertEqual([line for _, line in prose_lines(text)], ["body"])
+
+    def test_a_horizontal_rule_further_down_does_not_open_frontmatter(self):
+        # `---` is also a rule. A document that used one would otherwise have every
+        # line after it read as frontmatter and stop being measured at all.
+        text = "words\n\n---\n\nmore words\n"
+        self.assertEqual([line for _, line in prose_lines(text)],
+                         ["words", "---", "more words"])
+
+    def test_an_unclosed_frontmatter_marker_measures_the_whole_document(self):
+        # Fail towards measuring. An opening `---` with no close is a malformed
+        # document, and reading it as one long exemption would silence the file.
+        text = "---\nnot really frontmatter\nstill prose\n"
+        self.assertEqual(len(list(prose_lines(text))), 3)
 
 
 if __name__ == "__main__":

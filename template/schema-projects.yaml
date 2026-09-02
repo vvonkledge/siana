@@ -58,3 +58,17 @@ fields:
     type: bool
     default: true
     description: false only for a project git cannot branch, which means no isolation
+  automerge:
+    type: enum
+    values: [merge, squash, rebase]
+    required: false
+    description: standing permission for SIANA to arrange the merge of a request it
+      published, and the method the history is shaped with. Absent, the captain
+      merges every request in person, which is what every project did before this
+      field existed. There is no default, because a script choosing between a merge
+      commit, a squash and a rebase would be choosing how this project's history
+      reads. Setting it delegates arranging and nothing else - the forge's own
+      required checks and required reviews still decide whether a merge happens -
+      and it composes with `pipeline`, `qa` and `target` rather than standing in
+      for any of them, so a project carrying this field without those three
+      refuses to publish at all
