@@ -109,6 +109,22 @@ class ContractDrift(Recipe):
         self.assertIn("stale   schema-projects.yaml is missing: qa", out.stderr)
         self.assertIn("refuses to record them", out.stderr)
 
+    def test_a_facts_contract_missing_a_field_is_named_the_same_way(self):
+        # The same check, over every contract the distro owns rather than over the
+        # registry alone. A home that got `schema-facts.yaml` before a field was
+        # added to it refuses that field at write and says only that the key does
+        # not exist.
+        self.contract("facts")
+        with open(self.at("schema-facts.yaml")) as fh:
+            text = fh.read()
+        cut = text.split("  note:")[0] + text.split("      fact, because a URL "
+                                                    "with no idea what it is for "
+                                                    "is a URL a minion guesses at\n")[1]
+        with open(self.at("schema-facts.yaml"), "w") as fh:
+            fh.write(cut)
+        out = self.just("doctor")
+        self.assertIn("stale   schema-facts.yaml is missing: note", out.stderr)
+
     def test_a_current_project_contract_is_not_called_stale(self):
         self.contract("projects")
         self.assertNotIn("schema-projects.yaml is missing", self.just("doctor").stderr)
@@ -145,13 +161,16 @@ class Doctor(Recipe):
     def test_an_empty_store_is_a_zero_and_never_a_fault(self):
         # datafile writes the .jsonl on the first append, so absent-with-a-contract
         # is an empty store. Doctor must not cry wolf about it.
-        self.contract("projects", "obligations", "decisions")
+        self.contract("projects", "obligations", "decisions", "facts", "grants")
         out = self.just("doctor").stdout
         self.assertIn("projects.jsonl (empty; written on the first project)", out)
         self.assertIn("obligations.jsonl (empty; written on the first promise)", out)
         # A home that has never run an advisory session has no ledger at all, which
         # is the same zero and not a home missing part of its install.
         self.assertIn("decisions.jsonl (empty; written on the first decision)", out)
+        # And a home that has recorded no project facts has neither store.
+        self.assertIn("facts.jsonl (empty; written on the first fact)", out)
+        self.assertIn("grants.jsonl (empty; written on the first grant)", out)
 
     def test_a_home_that_bound_nothing_reports_semantic_as_disabled(self):
         # Off until the captain turns it on, and doctor has to say that plainly:
@@ -372,6 +391,9 @@ class Init(Recipe):
                   # `doctor` can say whether it is there, rather than a cleaner
                   # having to create the file it reads.
                   "runbook.md",
+                  # The two contracts behind project facts. Without them
+                  # `siana-fact` records nothing and no dispatch delivers one.
+                  "schema-facts.yaml", "schema-grants.yaml",
                   # The principles an advisory session holds SIANA to. It ships
                   # unfilled and `siana-afk` refuses to start until it is written,
                   # so a home without it is one where a session cannot start at all.
@@ -386,7 +408,7 @@ class Init(Recipe):
                   "siana-handoff", "siana-publish", "siana-reap", "siana-pipeline",
                   "siana-afk", "siana-gate", "siana-read", "siana-clean",
                   "siana-report", "siana-console", "siana-findings",
-                  "siana-semantic"):
+                  "siana-semantic", "siana-fact"):
             link = os.path.join(self.bindir, c)
             self.assertTrue(os.path.islink(link), f"{c} was not linked")
             # realpath both sides: what matters is that the link lands on this
@@ -811,6 +833,27 @@ class Init(Recipe):
         for root, _, files in os.walk(self.at("upgrade")):
             backups += files
         self.assertNotIn("principles.md", backups)
+
+    def test_an_upgrade_leaves_the_fact_stores_and_their_contracts_alone(self):
+        # A credential record is the only pointer to the keychain item behind it, so
+        # an upgrade that rewrote one would leave a value nothing can find again.
+        # The contracts are kept for the reason every contract here is: a field
+        # dropped from a live one makes every record still carrying it unreadable.
+        self.assertEqual(self.just("init").returncode, 0)
+        with open(self.at("facts.jsonl"), "w") as fh:
+            fh.write('{"id": "demo/staging", "project": "demo", "slug": "staging", '
+                     '"kind": "url", "value": "https://x.example.test", '
+                     '"recorded": "2026-08-31T00:00:00Z"}\n')
+        with open(self.at("schema-facts.yaml")) as fh:
+            contract = fh.read()
+        out = self.just("upgrade")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("kept     " + self.at("facts.jsonl"), out.stdout)
+        self.assertIn("kept     " + self.at("grants.jsonl"), out.stdout)
+        with open(self.at("facts.jsonl")) as fh:
+            self.assertIn("demo/staging", fh.read())
+        with open(self.at("schema-facts.yaml")) as fh:
+            self.assertEqual(fh.read(), contract)
 
     def test_uninstall_removes_the_links_and_leaves_the_home_alone(self):
         self.assertEqual(self.just("init").returncode, 0)

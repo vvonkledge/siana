@@ -114,7 +114,7 @@ init: _contract-drift
     # itself is written by the first `datafile put`, so an empty store is a schema
     # and no log. Never overwritten, for the reason the queue's contract is not: a
     # field dropped from a live contract makes every record carrying it unreadable.
-    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic; do
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic schema-facts schema-grants; do
         if [ -f "$home/$c.yaml" ]; then
             echo "current  $home/$c.yaml"
         else
@@ -327,7 +327,7 @@ init: _contract-drift
     fi
 
     mkdir -p '{{bindir}}'
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic siana-fact; do
         ln -sfn "$distro/bin/$c" "{{bindir}}/$c"
         echo "linked   {{bindir}}/$c -> $distro/bin/$c"
     done
@@ -401,7 +401,12 @@ upgrade: _initialized init
     # line at every start, so the captain meets it where the setting they cannot make
     # would be made, and `datafile` still names the field it rejected at the write.
     echo "kept     $home/projects.jsonl (the captain's registry)"
-    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic schema-tasks; do
+    # The facts store is the captain's the same way, and its credential records are
+    # the only pointer to the keychain items behind them: an upgrade that replaced
+    # one would leave a value nothing can find again.
+    echo "kept     $home/facts.jsonl (the captain's project facts)"
+    echo "kept     $home/grants.jsonl (who may use which credential)"
+    for c in schema-projects schema-obligations schema-decisions schema-attended schema-findings schema-semantic schema-tasks schema-facts schema-grants; do
         echo "kept     $home/$c.yaml (rewriting a live contract loses records)"
     done
     # The runbook is the fleet's accumulated answers to past cleanup questions, so it
@@ -485,7 +490,7 @@ _contract-drift:
     # than the field. An upgrade never rewrites a live contract, because a dropped
     # field makes every record still carrying it unreadable, so growing one stays
     # the captain's call and this only makes sure they know there is one to make.
-    for c in schema-projects schema-semantic; do
+    for c in schema-projects schema-semantic schema-facts schema-grants; do
         [ -f "$home/$c.yaml" ] || continue
         absent="$(comm -13 \
             <(grep -oE '^  [a-z_]+:' "$home/$c.yaml" | tr -d ' :' | sort) \
@@ -574,7 +579,7 @@ doctor: _contract-drift
     # notices is what let a home with the whole package gone read as healthy.
     unhealthy=""
     echo "home     $home"
-    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-findings.yaml schema-semantic.yaml schema-tasks.yaml; do
+    for f in siana.env AGENTS.md orders.md review.md brief-ship.md brief-scout.md brief-qa.md handoff.md principles.md runbook.md schema-projects.yaml schema-obligations.yaml schema-decisions.yaml schema-attended.yaml schema-findings.yaml schema-semantic.yaml schema-tasks.yaml schema-facts.yaml schema-grants.yaml; do
         if [ -e "$home/$f" ]; then echo "  ok      $f"; else echo "  missing $f"; fi
     done
     # An empty queue has no tasks.jsonl at all: datafile creates it on the first
@@ -612,6 +617,15 @@ doctor: _contract-drift
     if [ -e "$home/semantic.jsonl" ]; then echo "  ok      semantic.jsonl"
     elif [ -e "$home/schema-semantic.yaml" ]; then echo "  ok      semantic.jsonl (empty; written on the first binding)"
     else echo "  missing semantic.jsonl"; fi
+    # A home that has recorded no project facts has neither store, which is the same
+    # zero again. What is wrong inside one is `siana-fact status`'s to say, because
+    # answering that means asking the keychain about every credential reference.
+    if [ -e "$home/facts.jsonl" ]; then echo "  ok      facts.jsonl"
+    elif [ -e "$home/schema-facts.yaml" ]; then echo "  ok      facts.jsonl (empty; written on the first fact)"
+    else echo "  missing facts.jsonl"; fi
+    if [ -e "$home/grants.jsonl" ]; then echo "  ok      grants.jsonl"
+    elif [ -e "$home/schema-grants.yaml" ]; then echo "  ok      grants.jsonl (empty; written on the first grant)"
+    else echo "  missing grants.jsonl"; fi
     for cmd in tasks datafile; do
         p="$(command -v "$cmd" || true)"
         if [ -n "$p" ]; then echo "  ok      $cmd -> $p"; else echo "  missing $cmd"; fi
@@ -837,7 +851,7 @@ doctor: _contract-drift
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
-    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic; do
+    for c in siana siana-dispatch siana-brief siana-watch siana-owe siana-retire siana-close-workspace siana-handoff siana-publish siana-reap siana-pipeline siana-afk siana-gate siana-read siana-clean siana-report siana-console siana-findings siana-semantic siana-fact; do
         link="{{bindir}}/$c"
         if [ ! -L "$link" ] && [ ! -e "$link" ]; then
             echo "not installed: $link"

@@ -1,0 +1,1134 @@
+#!/usr/bin/env python3
+"""What the captain has recorded about one project, and who may use the one kind of
+it that is a secret.
+
+A staging URL, the link to the business documentation, the account a test user signs
+in with: durable, project-scoped, and the same for every minion sent there. Told to
+each of them at dispatch, so nobody has to ask and nobody has to guess. Kept in
+`facts.jsonl`, apart from the registry, because a fact has its own lifecycle and one
+kind of fact is a credential.
+
+This is mechanics, not judgment. The captain decides what is worth recording and who
+may use it. This makes those two decisions durable, and refuses the ways they go
+wrong.
+
+**Nonsecret facts and credentials are different things and are handled differently.**
+
+  - A `url` or `text` fact is delivered to every minion dispatched for that project,
+    in a clearly marked data section of its orders. It is nonsecret by construction:
+    it is written into a file on disk in the captain's home, so anything recorded as
+    one is a thing the captain is content to have read.
+  - A `credential` records only where the value lives. The value is set through the
+    operating system keychain's own non-echoing prompt, and this command never sees
+    it, never accepts it as an argument, and never writes it anywhere. There is no
+    subcommand that prints it. The only way it is ever read is `exec`, which puts it
+    into one child process's environment and returns that child's status.
+
+**A credential is used by one task and no other.** `grant` authorises one queued
+task, while it is still `todo`, so the authorisation is a decision the captain made
+about work they had read rather than an answer to a minion that has already started
+and asked. Nothing is inherited: not from the project, not from a dependency, not
+from the QA task paired with it, not from a grant on the same fact yesterday.
+`exec` reads the task the caller is actually running as, checks it is that task, and
+checks the task is still `doing`.
+
+**What this is not.** SIANA, its minions and the captain all run as one operating
+system user, so a process that wanted the value could call the keychain itself. This
+is not a sandbox and nothing here should be described as one. What it does is
+narrower and is worth having on its own: a fact recorded for one project never
+reaches a minion working on another, a credential never lands in a file, an orders
+document, a report or a log, and every use of one is something the captain
+authorised in advance and can withdraw.
+
+Usage:
+    siana-fact                                   every fact, by project
+    siana-fact list [<project>]                  one project's facts
+    siana-fact get <project> <slug>              one nonsecret value, alone
+    siana-fact url <project> <slug> <https url>  record or replace a URL
+    siana-fact text <project> <slug> <line>      record or replace a line of text
+    siana-fact credential <project> <slug> --account <username>
+                                                 record a keychain reference, and
+                                                 set its value at the prompt
+    siana-fact rm <project> <slug>               drop a fact
+    siana-fact grant <task-id> <fact>            authorise one todo task
+    siana-fact revoke <task-id> <fact>           withdraw that authorisation
+    siana-fact status                            what is recorded, and what is wrong
+    siana-fact exec <fact> -- <command> [args]   run one command with the credential
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import UTC, datetime
+from urllib.parse import urlparse
+
+# What the authorised child is given, and the only two names it is given. Stated
+# here because this is the command that sets them, and repeated in the orders
+# section `siana-dispatch` writes because that is where a minion reads them. A
+# minion is told them rather than left to discover them: a name it has to guess is
+# one it gets wrong, and the failure looks like a credential that does not work.
+USERNAME_ENV = "SIANA_FACT_USERNAME"
+PASSWORD_ENV = "SIANA_FACT_PASSWORD"
+
+# The keychain command, and only macOS's is implemented. Resolved rather than
+# assumed, so a machine that has no keychain refuses instead of failing somewhere
+# further in with a FileNotFoundError.
+#
+# `SIANA_KEYCHAIN` names it for a machine whose keychain command is somewhere else,
+# and it is what lets this project's own suite drive every keychain refusal on a CI
+# runner that has no keychain at all - which is the only way those refusals are
+# tested anywhere other than a Mac. It authorises nothing: every check below still
+# runs, and a process that could set it could call `security` itself, because this
+# was never a boundary between processes of one user. See the docstring above.
+KEYCHAIN_ENV = "SIANA_KEYCHAIN"
+KEYCHAIN = "/usr/bin/security"
+
+# `security` answers with these, and each one has to fail closed with its own reason.
+# A single "the keychain said no" would leave the captain unable to tell an item that
+# was never created from one they have to unlock, and those are opposite actions.
+ITEM_NOT_FOUND = 44
+DUPLICATE_ITEM = 45
+INTERACTION_NOT_ALLOWED = 51
+
+# A URL fact is bounded by the contract; what it has to be is decided here, because
+# a scheme is meaning and a contract only checks shape. https only: a fact is handed
+# to a minion as somewhere to go, and http is somewhere to go that anything on the
+# path can rewrite.
+URL_SCHEME = "https"
+
+MAX_VALUE = 400
+
+# The shapes `schema-facts.yaml` requires, checked here as well as there. Not
+# duplication for its own sake: `credential` has to set the keychain value before it
+# can write the record, because a reference to an item that does not exist is the
+# one state `exec` cannot tell from a revoked credential. So a slug or an account
+# the contract will refuse has to be refused before the captain is prompted for a
+# secret that would otherwise be stored under a reference nothing points at.
+SLUG = re.compile(r"[a-z][a-z0-9-]{1,47}")
+MAX_META = 200
+
+# Every field of a fact that has to survive being read: printed to a terminal,
+# handed to the keychain, or written into a minion's orders. A control character in
+# one of them is a fact that can forge whatever it is printed into, and the contract
+# refuses one on the way in - so a record carrying one was written around this
+# command, and both readers of the store have to say the same thing about it.
+# `siana-dispatch`'s `SCREENED` is the twin of this list and has to stay the twin.
+SCREENED = ("slug", "value", "account", "service", "note")
+
+
+class Refusal(SystemExit):
+    """A refusal that still knows what it said, matching siana-dispatch."""
+
+    def __init__(self, message: str, hints=()):
+        self.message, self.hints = message, tuple(hints)
+        super().__init__(1)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def die(message: str, *hints: str):
+    raise Refusal(message, hints)
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def fold(store: str, key: str):
+    """Fold an append-only datafile store into {key: record}.
+
+    The same read `siana-dispatch` and `siana-owe` do, for the same reason: the log
+    is append-only, so the last line for an id wins and a tombstone is a last line
+    like any other. A store with no writes yet has no file at all, which is empty
+    rather than a fault, because the contract is what says the store exists.
+
+    A line that is not JSON is a stop and never a skip. This store decides which
+    minion is told what, and one it silently read past is one that answers a smaller
+    question than it was asked.
+    """
+    out = {}
+    if not os.path.isfile(store):
+        return out
+    with open(store) as fh:
+        for number, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                die(f"{store}:{number} is not JSON",
+                    "this store says which minion is told what, so a line that",
+                    "cannot be read is a stop and never something to skip past",
+                    f"run `datafile -f {store} repair` to quarantine it")
+            rid = rec.get(key)
+            if rid is None:
+                continue
+            if rec.get("_deleted"):
+                out.pop(rid, None)
+            else:
+                out[rid] = rec
+    return out
+
+
+class Home:
+    """Where everything this command reads and writes lives.
+
+    One object rather than a dozen path joins, because half the subcommands need the
+    queue, the registry and both stores, and a path spelled slightly differently in
+    one of them is a command reading a store nobody wrote to.
+    """
+
+    def __init__(self) -> None:
+        self.path = os.environ.get("SIANA_HOME") or os.path.expanduser("~/.siana")
+        self.facts = os.path.join(self.path, "facts.jsonl")
+        self.facts_schema = os.path.join(self.path, "schema-facts.yaml")
+        self.grants = os.path.join(self.path, "grants.jsonl")
+        self.grants_schema = os.path.join(self.path, "schema-grants.yaml")
+        self.registry = os.path.join(self.path, "projects.jsonl")
+        self.registry_schema = os.path.join(self.path, "schema-projects.yaml")
+        self.tasks = (os.environ.get("SIANA_TASKS_FILE")
+                      or os.path.join(self.path, "tasks.jsonl"))
+
+    def require_contracts(self) -> None:
+        """Both contracts, or neither is usable.
+
+        They are one feature: a fact store with no grants contract can record a
+        credential nothing may ever be authorised to use, and a grants store with no
+        facts contract can authorise a fact that cannot exist. A home carrying one
+        of them is a half-finished upgrade, and saying so here is better than the
+        refusal `datafile` would give three steps later about a store nobody
+        expected to be missing.
+        """
+        for name, path in (("facts", self.facts_schema), ("grants", self.grants_schema)):
+            if not os.path.isfile(path):
+                die(f"no {name} contract at {path}",
+                    "project facts are what a minion is told about where it works",
+                    "run `just init` in the distro")
+
+    def read_facts(self):
+        return fold(self.facts, "id")
+
+    def read_grants(self):
+        return fold(self.grants, "id")
+
+    def read_projects(self):
+        if not os.path.isfile(self.registry_schema):
+            die(f"no project registry at {self.registry}",
+                "a fact belongs to a project, and the registry is what says which",
+                "projects exist",
+                "run `just init` in the distro")
+        return fold(self.registry, "handle")
+
+    def read_task(self, task_id: str):
+        task = fold(self.tasks, "id").get(task_id)
+        if task is None:
+            die(f"no such task: {task_id}",
+                f"run `tasks --file {self.tasks} list` to see the queue")
+        return task
+
+
+def write(store: str, schema: str, record: dict) -> None:
+    """Every write goes through `datafile`, so the contract is enforced by the same
+    code that enforces it for the queue and the registry. Writing the JSONL line
+    here would be a second writer, and a second writer is a second set of rules."""
+    try:
+        proc = subprocess.run(
+            ["datafile", "-f", store, "-c", schema, "put", json.dumps(record)],
+            capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die("datafile is not on PATH",
+            "it is what enforces this store's contract; without it nothing is written",
+            "run `just init` in the distro")
+    if proc.returncode != 0:
+        die("the store refused this record",
+            *(proc.stdout + proc.stderr).strip().splitlines()[:6])
+
+
+def drop(store: str, schema: str, rid: str) -> None:
+    try:
+        proc = subprocess.run(
+            ["datafile", "-f", store, "-c", schema, "delete", rid],
+            capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die("datafile is not on PATH", "run `just init` in the distro")
+    if proc.returncode != 0:
+        die(f"the store would not drop {rid}",
+            *(proc.stdout + proc.stderr).strip().splitlines()[:6])
+
+
+# The rule the contract cannot state. `value`, `account` and `service` are optional
+# there because no one kind uses all three, so which of them a kind requires is
+# checked here, once, by every reader of this store.
+REQUIRED = {"url": ("value",), "text": ("value",),
+            "credential": ("account", "service")}
+
+
+def malformed(fact: dict) -> str:
+    """Why this record cannot be used, or "" when it can.
+
+    Returned rather than raised, because `status` reports every bad record and the
+    other callers refuse on the first. A reader that could only refuse would make
+    the report impossible to write, and a report is how the captain finds out a
+    record went bad without a dispatch having to fail on it.
+    """
+    kind = fact.get("kind")
+    if kind not in REQUIRED:
+        return f"kind {kind!r} is not one this knows how to deliver"
+    for field in REQUIRED[kind]:
+        if not fact.get(field):
+            return f"a {kind} fact carries {field}, and this one has none"
+    if kind == "url":
+        parsed = urlparse(str(fact["value"]))
+        if parsed.scheme != URL_SCHEME or not parsed.netloc:
+            return f"value is not an {URL_SCHEME} URL"
+    for field in SCREENED:
+        if any(ch < " " or ch == "\x7f" for ch in str(fact.get(field) or "")):
+            return f"{field} carries a control character"
+    if not fact.get("project") or not fact.get("slug"):
+        return "carries no project or no slug"
+    if fact.get("id") != f"{fact.get('project')}/{fact.get('slug')}":
+        return "id does not match its own project and slug"
+    return ""
+
+
+def usable(fact: dict, fact_id: str) -> dict:
+    problem = malformed(fact)
+    if problem:
+        die(f"{fact_id} cannot be used: {problem}",
+            "a fact nobody can read is not a fact a minion may be handed",
+            "run `siana-fact status` to see every record in this state")
+    return fact
+
+
+def keychain_command() -> str:
+    """The keychain on this machine, or "" when there is none.
+
+    Only macOS's is implemented. Anywhere else this is empty and every caller
+    refuses, rather than reaching for a command that is not there or, worse,
+    reaching one of the same name that is something else entirely.
+    """
+    named = os.environ.get(KEYCHAIN_ENV)
+    if named:
+        return named
+    return KEYCHAIN if sys.platform == "darwin" else ""
+
+
+def require_keychain() -> str:
+    command = keychain_command()
+    if not command:
+        die(f"no keychain on this platform ({sys.platform})",
+            "a credential's value lives in the operating system keychain, and only",
+            "macOS's is implemented here",
+            f"record the nonsecret half of it with `siana-fact text` instead, or set"
+            f" {KEYCHAIN_ENV} to the keychain command this machine has")
+    return command
+
+
+def keychain(command: str, argv, capture: bool):
+    """One call into the keychain, and the one place its answers are read.
+
+    Nothing about the value is in `argv`: the item is named by service and account,
+    and the value travels on a pipe or through the keychain's own prompt. So the
+    command line this builds is safe to appear in a process list, which is where a
+    `-w <secret>` would have put it.
+
+    Every non-zero answer fails closed, and none of them says anything about the
+    value. "The keychain refused" and "the keychain gave me half a password" must
+    not be distinguishable from out here, because a caller that could tell them
+    apart is one that could be asked to.
+    """
+    try:
+        return subprocess.run([command, *argv], capture_output=capture, text=True,
+                              check=False)
+    except OSError as e:
+        die(f"cannot run the keychain command {command}: {e}",
+            f"set {KEYCHAIN_ENV} to the one this machine has, or unset it to use"
+            f" {KEYCHAIN}")
+
+
+def keychain_refusal(proc, service: str, account: str, doing: str):
+    """What to say about a keychain answer that was not success.
+
+    `security`'s own text goes on the last line and never on the first, so the
+    captain reads what happened before they read the tool that said it. Its stdout
+    is never repeated: on the read path that is where the value would be.
+    """
+    ref = f"{service} / {account}"
+    if proc.returncode == ITEM_NOT_FOUND:
+        die(f"the keychain has no item for {ref}",
+            f"nothing was {doing}, and no value was read",
+            "the reference is recorded but its value was never set, or it was",
+            "removed from the keychain afterwards",
+            "set it again with `siana-fact credential <project> <slug> --account"
+            " <username>`")
+    if proc.returncode == DUPLICATE_ITEM:
+        die(f"the keychain already holds an item for {ref}",
+            "it was not overwritten, because a credential replaced by accident is",
+            "one nothing can get back",
+            "pass --replace to set a new value for the item that is already there")
+    if proc.returncode == INTERACTION_NOT_ALLOWED:
+        die(f"the keychain would not release {ref}",
+            f"nothing was {doing}, and no value was read",
+            "the keychain is locked, or this process was denied access to the item",
+            "unlock it and allow the access, then run this again")
+    die(f"the keychain refused {ref} (exit {proc.returncode})",
+        f"nothing was {doing}, and no value was read",
+        *(proc.stderr or "").strip().splitlines()[:3])
+
+
+def check_shape(slug: str, account=None, note=None) -> None:
+    """The contract's own grammar, before anything irreversible happens.
+
+    `datafile` would refuse any of these at write with a message about a pattern,
+    which is a fine answer when the write is the first thing that happens and a
+    useless one when a secret has already been put in the keychain under a reference
+    the refused record was going to name.
+
+    Every field the refused record would have carried is checked, and not only the
+    ones that name the keychain item. A note the contract rejects fails the write
+    just as completely as a bad slug does, and leaves the same orphan behind.
+    """
+    if not SLUG.fullmatch(slug):
+        die(f"{slug!r} is not a fact slug",
+            "a slug is 2 to 48 characters of lowercase letters, digits and dashes,",
+            "starting with a letter; it is what a minion is told and what",
+            "`siana-fact exec` is invoked with")
+    for name, text in (("account", account), ("note", note)):
+        if text is None:
+            continue
+        if not text or len(text) > MAX_META:
+            die(f"a{'n' if name == 'account' else ''} {name} is 1 to {MAX_META}"
+                f" characters, and this is {len(text)}")
+        if any(ch < " " or ch == "\x7f" for ch in text):
+            die(f"a{'n' if name == 'account' else ''} {name} is one line",
+                "it is written into a minion's orders, where a newline is a fact",
+                "that can forge the section around it")
+
+
+def say_orphan(service, account, under: str) -> None:
+    """A keychain item with nothing pointing at it, and the command that removes it.
+
+    Never removed here: the value may be the only copy, and the record naming it is
+    the cheap half to recreate. Shared by `rm` and by a credential re-recorded under
+    a new account, because both leave exactly this behind and only the first of them
+    used to say so.
+    """
+    if not service or not account:
+        print(f"    the record named no {'service' if not service else 'account'},")
+        print("    so nothing here can say which item it was; look for one under")
+        print(f"    {under}")
+    elif safe(service) != service or safe(account) != account:
+        # `shlex.quote` makes these shell-safe and not terminal-safe: quoting a
+        # control character prints it. Escaping one instead would print a command
+        # that no longer names the item, so there is no command here.
+        print(f"    it names {safe(service)} / {safe(account)}, and a control")
+        print("    character in either means there is no command to print that")
+        print("    would still name the item; find it in your keychain by hand")
+    else:
+        print(f"    security delete-generic-password"
+              f" -s {shlex.quote(service)} -a {shlex.quote(account)}")
+
+
+def service_name(project: str, slug: str) -> str:
+    """The keychain item's service. Derived, never typed: it is how a captain looking
+    at their keychain sees which fact an item belongs to, and how this command finds
+    the item again after the record it came from has been rewritten."""
+    return f"siana/{project}/{slug}"
+
+
+def fact_id(project: str, slug: str) -> str:
+    return f"{project}/{slug}"
+
+
+def grant_id(task_id: str, fact: str) -> str:
+    return f"{task_id}/{fact}"
+
+
+def resolve_project(home: Home, handle: str) -> None:
+    """A fact belongs to a project the registry has. Checked before every write,
+    because a fact recorded against a handle nobody registered is one no dispatch
+    will ever deliver and nothing will ever say why."""
+    projects = home.read_projects()
+    if handle not in projects:
+        known = ", ".join(sorted(projects)) or "(the registry is empty)"
+        die(f"unknown project: {handle}",
+            f"known handles: {known}",
+            f"the captain adds projects to {home.registry}; a fact is never"
+            f" recorded against a handle nobody registered")
+
+
+def fact_reference(project: str, reference: str) -> str:
+    """A fact reference as typed, resolved to an id, without asking whether the fact
+    is still there.
+
+    A bare slug is read against `project`, which is where every caller's project
+    comes from: the task, or the argument. A `<project>/<slug>` is accepted too and
+    refused when the project it names is not that one, so a cross-project reference
+    is a refusal that says so rather than a lookup that quietly finds nothing.
+
+    Separate from the lookup below because `revoke` needs this half and not that
+    one. A grant outlives the fact it names on purpose - `rm` says so and lists the
+    tasks still holding one - so a revoke that first demanded the fact exist made
+    exactly those grants impossible to withdraw, and `status` reported them as
+    broken for as long as they stood.
+    """
+    if "/" in reference:
+        named, _, slug = reference.partition("/")
+        if named != project:
+            die(f"{reference} belongs to {named}, not to {project}",
+                "a fact is only ever used inside its own project, and this is the",
+                "only place the two could have been made to disagree")
+    else:
+        slug = reference
+    return fact_id(project, slug)
+
+
+def resolve_fact(facts: dict, project: str, reference: str) -> str:
+    """The same reference, and the fact it names has to be there."""
+    rid = fact_reference(project, reference)
+    if rid not in facts:
+        here = sorted(safe(f.get("slug")) for f in facts.values()
+                      if f.get("project") == project)
+        die(f"no fact called {safe(rid.partition('/')[2])} in {project}",
+            f"{project} has: {', '.join(here) or '(nothing recorded)'}")
+    return rid
+
+
+def safe(text) -> str:
+    """A value out of a store, rendered so a terminal reads it as text.
+
+    Every report here is written to a terminal, and the records it reports on are
+    exactly the ones that may have been hand-edited: this is where a dispatch sends
+    the captain when it refuses one. So the command whose job is to display a
+    corrupt record was the one place a corrupt record could still forge output - a
+    newline in a slug printing a second line that reads as another record's `ok`,
+    or an escape sequence erasing the BROKEN lines above it.
+
+    Only control characters are escaped. Anything else is what the captain wrote and
+    is theirs to read back unchanged.
+    """
+    return "".join(ch if ch >= " " and ch != "\x7f" else f"\\x{ord(ch):02x}"
+                   for ch in str(text))
+
+
+def show(fact: dict) -> str:
+    """One fact on one line, and never its value when there is a secret one.
+
+    A credential shows where the value lives and nothing about the value, because
+    this line is printed to a terminal, into a scrollback, and sometimes into a
+    transcript."""
+    problem = malformed(fact)
+    if problem:
+        return f"BROKEN      {problem}"
+    if fact["kind"] == "credential":
+        body = f"account {fact['account']}"
+    else:
+        body = str(fact["value"])
+    note = f"   ({fact['note']})" if fact.get("note") else ""
+    return f"{fact['kind']:<10}  {body}{note}"
+
+
+def project_facts(facts: dict, project: str):
+    """One project's facts, slug order. Sorted rather than log order everywhere,
+    because this is what a minion's orders are built from and two dispatches of one
+    task have to produce the same bytes.
+
+    The comparison is on `str(...)` because the caller groups by `str(...)` too, and
+    a record whose `project` is not a string - null, a number, missing - otherwise
+    falls into a bucket that matches nothing: it vanishes from the listing instead
+    of being shown as broken, and leaves an empty group behind it. `malformed` has
+    a branch for exactly that record and `show` is what displays it, so the one
+    thing this must not do is hide it."""
+    return sorted((f for f in facts.values() if str(f.get("project")) == project),
+                  key=lambda f: str(f.get("slug")))
+
+
+def cmd_list(args, home: Home) -> None:
+    home.require_contracts()
+    facts = home.read_facts()
+    if args.project:
+        resolve_project(home, args.project)
+        projects = [args.project]
+    else:
+        projects = sorted({str(f.get("project")) for f in facts.values()})
+    # Counted over what is about to be listed and never over the store, so a
+    # listing scoped to one project cannot report another project's facts in its
+    # header and then not show them.
+    listed = {handle: project_facts(facts, handle) for handle in projects}
+    total = sum(len(here) for here in listed.values())
+    if not total:
+        where = f" in {safe(args.project)}" if args.project else ""
+        print(f"facts    nothing recorded{where}")
+        return
+    print(f"facts    {total} in {len(listed)} project(s)")
+    for handle in projects:
+        here = listed[handle]
+        wid = max(len(safe(f.get("slug"))) for f in here)
+        for fact in here:
+            print(f"  {safe(handle)}/{safe(fact.get('slug')):<{wid}}  {show(fact)}")
+
+
+def cmd_get(args, home: Home) -> None:
+    """One nonsecret value, alone on stdout, so it can be read by a person or piped.
+
+    A credential is refused here and is the reason this subcommand does not simply
+    print whatever the record has. There is no command that prints a credential, and
+    `get` is where somebody looking for one would try first, so this is where it has
+    to be said."""
+    home.require_contracts()
+    facts = home.read_facts()
+    rid = resolve_fact(facts, args.project, args.slug)
+    fact = usable(facts[rid], rid)
+    if fact["kind"] == "credential":
+        die(f"{rid} is a credential, and nothing prints one",
+            "its value is in the keychain and is read only by the child process",
+            "one authorised task runs:",
+            f"  siana-fact exec {args.slug} -- <command>",
+            f"what is nonsecret about it: account {fact['account']},"
+            f" service {fact['service']}")
+    print(fact["value"])
+
+
+def record_value(args, home: Home, kind: str) -> None:
+    home.require_contracts()
+    resolve_project(home, args.project)
+    check_shape(args.slug, note=args.note or None)
+    value = args.value
+    if len(value) > MAX_VALUE:
+        die(f"a {kind} fact is at most {MAX_VALUE} characters, and this is {len(value)}",
+            "a fact is a pointer to where something is, never the thing itself")
+    if any(ch < " " or ch == "\x7f" for ch in value):
+        die(f"a {kind} fact is one line",
+            "it is appended to a minion's orders as data, and a newline in one is a",
+            "fact that can forge the section around it")
+    if kind == "url":
+        parsed = urlparse(value)
+        if parsed.scheme != URL_SCHEME or not parsed.netloc:
+            die(f"{value!r} is not an {URL_SCHEME} URL",
+                "a minion is handed this as somewhere to go, and anything on the",
+                f"path can rewrite somewhere that is not {URL_SCHEME}")
+    rid = fact_id(args.project, args.slug)
+    existing = home.read_facts().get(rid)
+    if existing and existing.get("kind") == "credential":
+        die(f"{rid} is already a credential",
+            "replacing it with a nonsecret fact would leave its keychain item with",
+            "nothing pointing at it, and every grant on it naming a fact that is no",
+            f"longer one: `siana-fact rm {args.project} {args.slug}` first if that"
+            " is what you mean")
+    record = {"id": rid, "project": args.project, "slug": args.slug, "kind": kind,
+              "value": value, "recorded": now()}
+    if args.note:
+        record["note"] = args.note
+    write(home.facts, home.facts_schema, record)
+    print(f"recorded {rid} ({kind})")
+    print(f"  told to every minion dispatched for {args.project}")
+
+
+def cmd_url(args, home: Home) -> None:
+    record_value(args, home, "url")
+
+
+def cmd_text(args, home: Home) -> None:
+    record_value(args, home, "text")
+
+
+def cmd_credential(args, home: Home) -> None:
+    """Record where a credential lives, and set its value at the keychain's prompt.
+
+    The value is never an argument and never passes through this process. `security`
+    is run with no password on its command line, which is what makes it prompt, and
+    it prompts twice without echoing. So the secret goes from the captain's keyboard
+    into the keychain, and the only thing this command learns is whether that worked.
+
+    The record is written after the keychain accepts the value, never before. A
+    reference to an item that does not exist is the one state `exec` cannot tell
+    from a revoked credential, and it is the state a failed setup would leave.
+    """
+    home.require_contracts()
+    resolve_project(home, args.project)
+    # Before the keychain, never after: see `check_shape`.
+    check_shape(args.slug, args.account, args.note or None)
+    command = require_keychain()
+    rid = fact_id(args.project, args.slug)
+    existing = home.read_facts().get(rid)
+    if existing and existing.get("kind") != "credential":
+        die(f"{rid} is already a {existing.get('kind')} fact",
+            "a fact does not change kind under a slug minions have already been",
+            f"told: `siana-fact rm {args.project} {args.slug}` first if that is"
+            " what you mean")
+    service = service_name(args.project, args.slug)
+
+    # `-w` with nothing after it is what makes `security` prompt for the value, and
+    # prompt twice, reading from the terminal without echoing. A value passed here
+    # instead would be in this process's command line, which is world-readable on
+    # both platforms this fleet runs on.
+    argv = ["add-generic-password", "-s", service, "-a", args.account]
+    if args.replace:
+        argv.append("-U")
+    argv.append("-w")
+    proc = keychain(command, argv, capture=False)
+    if proc.returncode != 0:
+        keychain_refusal(proc, service, args.account, "recorded")
+
+    record = {"id": rid, "project": args.project, "slug": args.slug,
+              "kind": "credential", "account": args.account, "service": service,
+              "recorded": now()}
+    if args.note:
+        record["note"] = args.note
+    write(home.facts, home.facts_schema, record)
+    print(f"recorded {rid} (credential)")
+    print(f"  keychain {service} / {args.account}")
+    # A keychain item is keyed by service and account together, so recording the
+    # same slug under a different account does not collide with the old item, needs
+    # no --replace, and leaves a secret on the machine that nothing now points at.
+    # `status` walks records rather than keychain items, so it would never mention
+    # it. `rm` goes to some length over exactly this state; so does this.
+    was = (existing or {}).get("account")
+    if was and was != args.account:
+        print(f"  the account changed from {safe(was)}, and the item it named is")
+        print("  still in the keychain with nothing pointing at it:")
+        say_orphan(existing.get("service"), was, service)
+    print(f"  no minion has it: `siana-fact grant <task-id> {args.slug}` while that"
+          f" task is still todo")
+
+
+def cmd_rm(args, home: Home) -> None:
+    """Drop the record. The keychain item is left where it is, and said so.
+
+    Destroying a credential is not something a command that was asked to tidy a
+    registry should do on the way past: the value may be the only copy, and the
+    record naming it is the cheap half to recreate. So the exact command is printed
+    and the captain runs it if they mean it.
+    """
+    home.require_contracts()
+    facts = home.read_facts()
+    rid = resolve_fact(facts, args.project, args.slug)
+    fact = facts[rid]
+    drop(home.facts, home.facts_schema, rid)
+    print(f"dropped  {safe(rid)}")
+    standing = [g for g in home.read_grants().values()
+                if g.get("fact") == rid and g.get("status") == "granted"]
+    if standing:
+        # Not revoked here. A grant on a fact that no longer exists authorises
+        # nothing, because every read of one reads the fact too, and rewriting the
+        # captain's grants as a side effect of a delete is how a record they meant
+        # to keep disappears.
+        print(f"  {len(standing)} grant(s) still name it, and now authorise nothing:")
+        for g in sorted(standing, key=lambda g: str(g.get("id"))):
+            print(f"    siana-fact revoke {safe(g.get('task'))} {safe(rid)}")
+    if fact.get("kind") == "credential":
+        print("  its keychain item is untouched, because the value may be the only")
+        print("  copy. Remove it yourself if you mean to:")
+        # Read rather than subscripted. Both are optional in the contract, and a
+        # record missing one is a state `siana-fact status` reports and that `rm` is
+        # the natural answer to, so this is reachable - and a traceback here would
+        # leave the captain unable to tell whether the record had already gone.
+        say_orphan(fact.get("service"), fact.get("account"),
+                   service_name(args.project, args.slug))
+
+
+def cmd_grant(args, home: Home) -> None:
+    home.require_contracts()
+    task = home.read_task(args.task)
+    handle = task.get("project")
+    if not handle:
+        die(f"{args.task} carries no project",
+            "a grant is for one task working in one project, and a task that cannot",
+            "say which project it belongs to is not yet a task")
+    if task.get("status") != "todo":
+        die(f"{args.task} is {task.get('status')}, and a grant is written before"
+            f" dispatch",
+            "a credential is authorised for work the captain has read, not handed",
+            "to a minion that has already started and asked for it",
+            "if this task really needs it, reset it to todo, grant, and dispatch it",
+            "again")
+    facts = home.read_facts()
+    rid = resolve_fact(facts, handle, args.fact)
+    fact = usable(facts[rid], rid)
+    if fact["kind"] != "credential":
+        die(f"{rid} is a {fact['kind']} fact, and needs no grant",
+            f"every minion dispatched for {handle} is told it already",
+            "only a credential is granted, because only a credential is withheld")
+    record = {"id": grant_id(args.task, rid), "task": args.task, "fact": rid,
+              "project": handle, "status": "granted", "granted": now()}
+    write(home.grants, home.grants_schema, record)
+    print(f"granted  {rid} to {args.task}")
+    print(f"  it runs   siana-fact exec {fact['slug']} -- <command>")
+    print(f"  revoke    siana-fact revoke {args.task} {fact['slug']}")
+
+
+def cmd_revoke(args, home: Home) -> None:
+    """Withdraw one grant. Idempotent on a grant that is already revoked, and a
+    refusal on a pair that was never granted: the second is a typo, and a revocation
+    that silently succeeded against one would read as the credential being safe."""
+    home.require_contracts()
+    grants = home.read_grants()
+    mine = {gid: g for gid, g in grants.items() if g.get("task") == args.task}
+    if not mine:
+        # Said before anything asks which of them was meant, because "which fact?"
+        # is a strange question to be asked about a task that holds none.
+        die(f"nothing grants anything to {args.task}",
+            "no grant names that task; check the id, because a revocation that",
+            "matched nothing would read as one that worked")
+    # Matched against the grants this task actually holds, and never against what
+    # the queue says the task is today. Every record that authorises nothing is one
+    # somebody has to be able to withdraw, and each of the three ways a grant
+    # outlives its surroundings used to be a record `status` called broken with no
+    # command that would clear it: the fact dropped, the task dropped, and the task
+    # re-added under another project. The last is why a fully qualified reference is
+    # taken as written - it is what `siana-dispatch` prints when it refuses one.
+    if "/" in args.fact:
+        rid = args.fact
+    else:
+        handle = (fold(home.tasks, "id").get(args.task) or {}).get("project")
+        if not handle:
+            held = {str(g.get("project")) for g in mine.values()}
+            if len(held) != 1:
+                die(f"which fact of {args.task}'s?",
+                    f"{args.task} is not in the queue to say which project it"
+                    f" worked in, and it holds: "
+                    f"{', '.join(sorted(safe(g.get('fact')) for g in mine.values()))}",
+                    "name the fact in full: siana-fact revoke <task> <project>/<slug>")
+            handle = held.pop()
+        rid = fact_id(handle, args.fact)
+    gid = grant_id(args.task, rid)
+    grant = grants.get(gid)
+    if grant is None:
+        die(f"nothing grants {safe(rid)} to {args.task}",
+            f"{args.task} holds: "
+            f"{', '.join(sorted(safe(g.get('fact')) for g in mine.values()))}",
+            "there is no authorisation here to withdraw, and a revocation that",
+            "matched nothing would read as one that worked")
+    if grant.get("status") == "revoked":
+        print(f"revoked  {safe(rid)} from {args.task}"
+              f" (already, at {grant.get('revoked')})")
+        return
+    record = dict(grant)
+    record.update(status="revoked", revoked=now())
+    write(home.grants, home.grants_schema, record)
+    print(f"revoked  {safe(rid)} from {args.task}")
+
+
+def grant_state(grant: dict, facts: dict, tasks: dict) -> str:
+    """What this grant authorises right now, as one word for the report.
+
+    Every reason a standing record authorises nothing is a separate word, because
+    they are separate things to do about it: a task that has finished wants the
+    grant revoked, and a fact that is gone wants the grant deleted."""
+    if grant.get("status") == "revoked":
+        return "revoked"
+    fact = facts.get(str(grant.get("fact")))
+    if fact is None:
+        return "orphan"
+    if fact.get("project") != grant.get("project"):
+        return "mismatch"
+    task = tasks.get(str(grant.get("task")))
+    if task is None:
+        return "orphan"
+    if task.get("project") != grant.get("project"):
+        return "mismatch"
+    if task.get("status") not in ("todo", "doing"):
+        return "stale"
+    return "granted"
+
+
+def cmd_status(args, home: Home) -> None:
+    """What is recorded and what is wrong with it, reading nothing secret.
+
+    A credential's item is asked about and never read: `security find-generic-
+    password` without `-w` answers whether the item is there and returns its
+    attributes, so a reference nobody ever set is reported without the value ever
+    being fetched. Nothing here writes, and nothing here repairs.
+    """
+    missing = [p for p in (home.facts_schema, home.grants_schema)
+               if not os.path.isfile(p)]
+    if len(missing) == 2:
+        print(f"facts    disabled  no contract at {home.facts_schema}")
+        print("           `just init` in the distro writes one; until then nothing")
+        print("           records a fact and no dispatch delivers one")
+        return
+    if missing:
+        # One of the pair. A home that got half the upgrade, which is worse than
+        # neither: the half that is there accepts writes the other half cannot serve.
+        print(f"facts    stale     {missing[0]} is missing and its pair is not")
+        print("           this home has half the contract; run `just init` in the")
+        print("           distro before recording anything")
+        return
+
+    # What makes this report exit nonzero, and it is narrower than what it prints.
+    # A record nothing can deliver and a reference whose keychain item is gone are
+    # faults: something the captain believes is set up is not. A stale grant is
+    # not one, because it already authorises nothing and is only housekeeping.
+    bad = []
+    try:
+        facts = home.read_facts()
+    except Refusal as r:
+        # Printed rather than raised, because this is the report and a report that
+        # exits through the refusal path says nothing about the grants beside it.
+        # Nonzero all the same: a store nothing can read is not a healthy home.
+        print(f"facts    BROKEN    {r.message}")
+        for hint in r.hints:
+            print(f"           {hint}")
+        raise SystemExit(1) from None
+    projects = home.read_projects()
+    command = keychain_command()
+
+    print(f"facts    {len(facts)} recorded")
+    wid = max((len(safe(r)) for r in facts), default=0)
+    for rid in sorted(facts):
+        fact, shown = facts[rid], safe(rid)
+        problem = malformed(fact)
+        if problem:
+            bad.append(rid)
+            print(f"  BROKEN  {shown}: {problem}")
+            continue
+        if fact["project"] not in projects:
+            bad.append(rid)
+            print(f"  BROKEN  {shown}: {safe(fact['project'])} is not in the registry")
+            continue
+        if fact["kind"] != "credential":
+            print(f"  ok      {shown:<{wid}}  {fact['kind']}")
+            continue
+        if not command:
+            print(f"  unknown {shown:<{wid}}  credential, and this platform has no"
+                  f" keychain to ask")
+            continue
+        proc = keychain(command, ["find-generic-password", "-s", fact["service"],
+                                  "-a", fact["account"]], capture=True)
+        if proc.returncode == 0:
+            print(f"  ok      {shown:<{wid}}  credential, item present")
+        elif proc.returncode == ITEM_NOT_FOUND:
+            bad.append(rid)
+            print(f"  MISSING {shown:<{wid}}  credential, the keychain has no item"
+                  f" for {safe(fact['service'])}")
+        else:
+            bad.append(rid)
+            print(f"  unknown {shown:<{wid}}  credential, the keychain answered"
+                  f" {proc.returncode} rather than yes or no")
+
+    try:
+        grants = home.read_grants()
+    except Refusal as r:
+        print(f"grants   BROKEN    {r.message}")
+        raise SystemExit(1) from None
+    tasks = fold(home.tasks, "id")
+    standing = {gid: grant_state(grants[gid], facts, tasks)
+                for gid in sorted(grants)}
+    live = [gid for gid, state in standing.items() if state == "granted"]
+    print(f"grants   {len(live)} standing of {len(grants)}")
+    for gid, state in standing.items():
+        grant = grants[gid]
+        where = f"{safe(grant.get('task'))} -> {safe(grant.get('fact'))}"
+        if state == "granted":
+            print(f"  ok      {where}")
+        elif state == "revoked":
+            print(f"  ok      {where}  revoked at {safe(grant.get('revoked'))}")
+        elif state == "stale":
+            task = tasks.get(str(grant.get("task"))) or {}
+            print(f"  stale   {where}  the task is {safe(task.get('status'))}, so"
+                  f" this authorises nothing")
+            print(f"          withdraw it: siana-fact revoke"
+                  f" {safe(grant.get('task'))} {safe(grant.get('fact'))}")
+        elif state == "orphan":
+            bad.append(gid)
+            print(f"  BROKEN  {where}  names a task or a fact that is not there")
+        else:
+            bad.append(gid)
+            print(f"  BROKEN  {where}  the task, the grant and the fact do not agree"
+                  f" on the project")
+    raise SystemExit(1 if bad else 0)
+
+
+def cmd_exec(args, home: Home) -> None:
+    """Run one command with one credential, for the one task that was authorised.
+
+    Everything is checked before the keychain is touched, and the keychain is
+    touched before the child exists, so a refusal on any of it has run nothing and
+    read nothing.
+
+    The task is the one this process is actually running as, read from the
+    environment `siana-dispatch` set at the minion's birth. It is never an argument:
+    a task id that could be typed is an authorisation that could be borrowed.
+    """
+    home.require_contracts()
+    task_id = os.environ.get("SIANA_TASK_ID")
+    if not task_id:
+        die("SIANA_TASK_ID is not set, so there is no task to authorise this",
+            "a credential is granted to one task, and this is run by that task's",
+            "minion, which is given its id at birth",
+            "nothing outside a dispatched minion can use one")
+    task = home.read_task(task_id)
+    if task.get("status") != "doing":
+        die(f"{task_id} is {task.get('status')}, not doing",
+            "a grant is spent while the task is being worked, and a task that has",
+            "finished or been blocked has no further use for one",
+            "the grant record is still there; what has changed is the task")
+    handle = task.get("project")
+    if not handle:
+        die(f"{task_id} carries no project", "there is nothing to scope a fact to")
+
+    facts = home.read_facts()
+    rid = resolve_fact(facts, handle, args.fact)
+    fact = usable(facts[rid], rid)
+    if fact["kind"] != "credential":
+        die(f"{rid} is a {fact['kind']} fact, and carries no secret to run with",
+            f"read it with `siana-fact get {handle} {fact['slug']}`")
+
+    grant = home.read_grants().get(grant_id(task_id, rid))
+    if grant is None:
+        die(f"{task_id} was not granted {rid}",
+            "a grant is written before dispatch, for one task, and is never",
+            "inherited from the project, a dependency, the QA task beside this one,",
+            "or a grant on the same fact yesterday",
+            "the captain grants one; a minion never grants itself one")
+    if grant.get("status") != "granted":
+        die(f"{task_id} had {rid} and it was revoked at {grant.get('revoked')}",
+            "a revocation takes effect before the keychain is read, so nothing was",
+            "read here")
+    if grant.get("project") != handle or fact["project"] != handle:
+        die(f"the grant for {rid} does not agree with {task_id} about the project",
+            f"the task is in {handle}, the grant records"
+            f" {grant.get('project')}, and the fact is in {fact['project']}",
+            "nothing is guessed between them; repair the record")
+
+    command = require_keychain()
+    proc = keychain(command, ["find-generic-password", "-s", fact["service"],
+                              "-a", fact["account"], "-w"], capture=True)
+    if proc.returncode != 0:
+        keychain_refusal(proc, fact["service"], fact["account"], "run")
+    # `-w` writes the value and a newline. One trailing newline comes off and no
+    # other whitespace does: a password may legitimately end in a space, and
+    # `.strip()` here would hand the child a different secret than the one stored
+    # and leave nothing to say why it failed to authenticate.
+    secret = proc.stdout[:-1] if proc.stdout.endswith("\n") else proc.stdout
+    if not secret:
+        die(f"the keychain returned nothing for {fact['service']} / {fact['account']}",
+            "an empty value is not a credential, and the child was not run",
+            "set it again with `siana-fact credential"
+            f" {handle} {fact['slug']} --account {fact['account']} --replace`")
+
+    # A copy, never `os.environ`. The two names exist in the child and in nothing
+    # else: not in this process, not in anything else this process goes on to run,
+    # and not in the next invocation.
+    env = dict(os.environ)
+    env[USERNAME_ENV] = fact["account"]
+    env[PASSWORD_ENV] = secret
+    try:
+        child = subprocess.run(args.argv, env=env, check=False)
+    except FileNotFoundError:
+        die(f"{args.argv[0]}: no such command",
+            "the credential was read and nothing ran with it")
+    except PermissionError:
+        die(f"{args.argv[0]}: not executable",
+            "the credential was read and nothing ran with it")
+    finally:
+        # Dropped on every path out, including the two refusals above. The strings
+        # themselves are immutable and Python decides when they are collected, so
+        # this is housekeeping and not an erasure, and describing it as more than
+        # that would be the overclaim this whole feature is written not to make.
+        env.pop(PASSWORD_ENV, None)
+        del secret
+    # A child killed by a signal is reported the way a shell reports one, so a
+    # caller reading this exit code learns the same thing it would have learned
+    # running the command itself.
+    raise SystemExit(128 - child.returncode if child.returncode < 0
+                     else child.returncode)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="siana-fact", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("list", help="every fact, or one project's")
+    p.add_argument("project", nargs="?")
+    p.set_defaults(run=cmd_list)
+
+    p = sub.add_parser("get", help="one nonsecret value, alone on stdout")
+    p.add_argument("project")
+    p.add_argument("slug")
+    p.set_defaults(run=cmd_get)
+
+    for kind, helptext in (("url", "record or replace an https URL"),
+                           ("text", "record or replace one line of text")):
+        p = sub.add_parser(kind, help=helptext)
+        p.add_argument("project")
+        p.add_argument("slug")
+        p.add_argument("value")
+        p.add_argument("--note", help="what this is for, in your words")
+        p.set_defaults(run=cmd_url if kind == "url" else cmd_text)
+
+    p = sub.add_parser("credential",
+                       help="record a keychain reference and set its value")
+    p.add_argument("project")
+    p.add_argument("slug")
+    p.add_argument("--account", required=True,
+                   help="the username; nonsecret, and given to the child process")
+    p.add_argument("--replace", action="store_true",
+                   help="set a new value for a keychain item that already exists")
+    p.add_argument("--note", help="what this is for, in your words")
+    p.set_defaults(run=cmd_credential)
+
+    p = sub.add_parser("rm", help="drop a fact")
+    p.add_argument("project")
+    p.add_argument("slug")
+    p.set_defaults(run=cmd_rm)
+
+    p = sub.add_parser("grant", help="authorise one todo task to use one credential")
+    p.add_argument("task")
+    p.add_argument("fact", help="the fact's slug, in that task's own project")
+    p.set_defaults(run=cmd_grant)
+
+    p = sub.add_parser("revoke", help="withdraw one grant")
+    p.add_argument("task")
+    p.add_argument("fact")
+    p.set_defaults(run=cmd_revoke)
+
+    p = sub.add_parser("status", help="what is recorded, and what is wrong with it")
+    p.set_defaults(run=cmd_status)
+
+    p = sub.add_parser("exec", help="run one command with an authorised credential")
+    p.add_argument("fact", help="the credential's slug, in this task's own project")
+    # REMAINDER, so the child's own flags are the child's. Without it, a `-v` meant
+    # for the command being run is parsed here and the invocation fails with an
+    # error about a flag this command does not have.
+    p.add_argument("argv", nargs=argparse.REMAINDER,
+                   help="-- followed by the command to run")
+    p.set_defaults(run=cmd_exec)
+    return ap
+
+
+def main() -> None:
+    ap = build_parser()
+    args = ap.parse_args()
+    home = Home()
+    if args.cmd is None:
+        args = ap.parse_args(["list"])
+    if args.cmd == "exec":
+        argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        if not argv:
+            die("what should this run?",
+                "usage: siana-fact exec <fact> -- <command> [args...]",
+                "the credential goes into that command's environment and nowhere"
+                " else")
+        args.argv = argv
+    args.run(args, home)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Refusal as r:
+        print(f"error: {r.message}", file=sys.stderr)
+        for h in r.hints:
+            print(f"  {h}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        sys.exit(130)
