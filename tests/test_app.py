@@ -118,15 +118,32 @@ class Toolchain(unittest.TestCase):
         self.assertIn("console/dist/", ignored)
 
     def test_the_application_is_the_only_place_npm_reaches(self):
-        # One package.json in the repository, and it is the frontend's. A second one
-        # anywhere else would be a second dependency tree nothing here checks.
-        found = []
+        # Two package.json in the repository, and they are not the same kind of
+        # thing. The frontend's is an installed dependency tree, and the rest of this
+        # class is what checks it. The pi package's is a manifest of resources a
+        # harness discovers. It declares peers on packages pi already bundles and
+        # nothing else - no `dependencies` and no `bundledDependencies`, which
+        # `test_package.py` is what holds it to - and the justfile installs it with
+        # `pi install -l -a` off a local path, which never runs npm. So not even
+        # those peers are resolved here, and there is no lockfile to check.
+        #
+        # This asserted `["console"]` alone until that package landed, and the count
+        # is not what it was guarding. A third manifest anywhere is a second
+        # dependency tree nothing here checks, so the list stays exact rather than
+        # becoming a rule about where manifests may live. The lockfile line is what
+        # keeps "npm reaches" meaning an installed tree: without it a new root could
+        # bring one and pass by being named.
+        roots, locked = [], []
         for dirpath, dirnames, filenames in os.walk(DISTRO):
             dirnames[:] = [d for d in dirnames
                            if not d.startswith(".") and d != "node_modules"]
+            here = os.path.relpath(dirpath, DISTRO)
             if "package.json" in filenames:
-                found.append(os.path.relpath(dirpath, DISTRO))
-        self.assertEqual(found, ["console"])
+                roots.append(here)
+            if "package-lock.json" in filenames:
+                locked.append(here)
+        self.assertEqual(sorted(roots), ["console", "template/pi-siana"])
+        self.assertEqual(sorted(locked), ["console"])
 
 
 @unittest.skipUnless(NPM and NODE, "the frontend toolchain runs on node and npm")
