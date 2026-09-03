@@ -27,6 +27,12 @@ EM_DASH = "—"
 # thing any agent could fix. ORDERS.md says never to edit them at all.
 GENERATED = {"CHANGELOG.md"}
 
+# Directories holding nothing anybody here wrote. `node_modules/` is the frontend's
+# installed packages and `dist/` is its build output, and both are full of other
+# people's prose: without this the em dash check reports on a few thousand files that
+# no agent in this fleet can fix.
+SKIPPED = {"__pycache__", "node_modules", "dist"}
+
 
 def prose_files():
     """Every markdown file in the distro. Discovered rather than listed, because a
@@ -34,7 +40,7 @@ def prose_files():
     drifts."""
     for dirpath, dirnames, filenames in os.walk(DISTRO):
         dirnames[:] = [d for d in dirnames
-                       if not d.startswith(".") and d != "__pycache__"]
+                       if not d.startswith(".") and d not in SKIPPED]
         for name in sorted(filenames):
             if name.endswith(".md") and name not in GENERATED:
                 yield os.path.join(dirpath, name)

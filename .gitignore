@@ -8,3 +8,10 @@ __pycache__/
 # CI checks `tasks` and `datafile` out here to install the stores the suite drives.
 # Ignored so reproducing the workflow by hand does not offer them up as new files.
 .ci-deps/
+
+# The frontend toolchain's installed packages and its build output. `just build`
+# writes both; `just test` builds before it runs, and `bin/siana-console` serves
+# `console/dist/`. Neither is committed: the lockfile is what makes the build
+# reproducible, and a committed bundle is a second answer to what the source says.
+console/node_modules/
+console/dist/

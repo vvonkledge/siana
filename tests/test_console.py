@@ -36,6 +36,7 @@ import signal
 import socket
 import stat
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -98,9 +99,12 @@ class Stream:
     is the half of server-sent events a client actually depends on.
     """
 
-    def __init__(self, port, target="/api/stream"):
+    def __init__(self, port, target="/api/stream", host=None):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=0.5)
-        self.sock.sendall(f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        # The port is part of the `Host` a browser sends, and the console refuses one
+        # that does not name its own listener, so this has to send the real thing.
+        self.sock.sendall(f"GET {target} HTTP/1.1\r\n"
+                          f"Host: {host or f'127.0.0.1:{port}'}\r\n"
                           f"Accept: text/event-stream\r\n\r\n".encode())
         self.text = ""
         self.ended = False
@@ -380,22 +384,29 @@ class Routes(Console):
         super().setUp()
         self.start()
 
-    def test_only_the_two_documented_paths_are_served(self):
-        for target in ("/", "/index.html", "/api", "/api/", "/api/state/",
+    def test_only_the_documented_paths_are_served(self):
+        # `/` is the application and is served; `/index.html` is not, because the
+        # route table is a set of names and never a directory that happens to hold
+        # one.
+        for target in ("/index.html", "/api", "/api/", "/api/state/",
                        "/api/statex", "/api/messages", "/favicon.ico",
-                       "/.git/config"):
+                       "/.git/config", "/assets", "/assets/", "/icons/",
+                       "/console/dist/index.html", "/sw.js.map",
+                       "/package.json", "/src/main.jsx"):
             with self.subTest(target):
                 status, _, body = self.request(target)
                 self.assertEqual(status, 404, body)
                 self.assertEqual(json.loads(body)["code"], "NO_ROUTE")
 
     def test_a_traversal_reaches_no_file(self):
-        # Nothing here opens a file for a request path at all, so this is belt and
-        # braces. It is here because slice 3 serves a bundle, and a route table that
-        # quietly normalised its way into serving one would pass every other test.
+        # The console now serves a bundle, and this is what says no request path is
+        # ever turned into one. It cannot be: the files are read once at startup into
+        # a map keyed on the route, and a request is a lookup in that map.
         for target in ("/api/state/../../../etc/passwd", "/api/../../etc/passwd",
                        "/api/state/..%2f..%2fetc%2fpasswd", "/%61pi/state",
-                       "/api/state%00", "/api/state/.."):
+                       "/api/state%00", "/api/state/..",
+                       "/assets/../../../etc/passwd", "/icons/../../package.json",
+                       "/..%2f..%2fetc%2fpasswd", "/assets/..%00.js"):
             with self.subTest(target):
                 status, _, body = self.request(target)
                 self.assertEqual(status, 404, body)
@@ -989,6 +1000,379 @@ class Configuration(Console):
                 self.assertFalse(os.path.exists(self.at("inbox", "console")))
 
 
+class TheApplication(Console):
+    """The browser application, served from the distro this command came out of.
+
+    Two things here are worth more than the rest. The bundle is found beside this
+    file rather than beside the caller, so the console works from wherever a captain
+    starts it. And the route table is a set of names: nothing turns a request into a
+    filesystem path, so there is no traversal to defend against and no directory to
+    fall back into.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.start()
+
+    def app(self, target):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        try:
+            conn.request("GET", target)
+            res = conn.getresponse()
+            return res.status, dict(res.getheaders()), res.read()
+        finally:
+            conn.close()
+
+    def shell(self):
+        status, headers, body = self.app("/")
+        self.assertEqual(status, 200, body[:400])
+        return headers, body.decode()
+
+    def test_the_application_shell_is_served_at_one_path_and_says_it_is_html(self):
+        headers, body = self.shell()
+        self.assertIn("text/html", headers["Content-Type"])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIn("<div id=\"app\">", body)
+        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+
+    def test_the_document_carries_a_policy_the_browser_can_hold_it_to(self):
+        # The build refuses to emit a byte naming another origin. This is the same
+        # rule said to the browser, so that it holds against a page this console
+        # never built.
+        headers, body = self.shell()
+        policy = headers["Content-Security-Policy"]
+        for rule in ("default-src 'self'", "form-action 'none'",
+                     "frame-ancestors 'none'", "object-src 'none'",
+                     "base-uri 'none'"):
+            self.assertIn(rule, policy)
+        # `default-src 'self'` forbids an inline script and an inline handler, so a
+        # shell carrying one would be a page the policy stops from working at all.
+        self.assertNotIn("<script>", body)
+        self.assertNotRegex(body, r"<[^>]+\son[a-z]+=")
+        self.assertNotIn("unsafe-inline", policy)
+
+    def test_the_policy_is_on_the_document_and_not_on_every_byte(self):
+        # A policy on an image or a script says nothing about anything.
+        _, headers, _ = self.app("/manifest.webmanifest")
+        self.assertNotIn("Content-Security-Policy", headers)
+
+    def test_the_shell_names_only_assets_this_console_serves(self):
+        _, body = self.shell()
+        referenced = set(re.findall(r'(?:src|href)="([^"]+)"', body))
+        self.assertTrue(referenced, "the shell references nothing at all")
+        for target in sorted(referenced):
+            with self.subTest(target):
+                self.assertTrue(target.startswith("/"),
+                                f"the shell reaches off this console for {target}")
+                status, _, _ = self.app(target)
+                self.assertEqual(status, 200, f"the shell names {target}, a 404")
+
+    def test_the_generated_assets_are_typed_and_cached_by_their_hash(self):
+        _, body = self.shell()
+        for target, expected in ((re.search(r'src="(/assets/[^"]+\.js)"', body)[1],
+                                  "text/javascript"),
+                                 (re.search(r'href="(/assets/[^"]+\.css)"', body)[1],
+                                  "text/css")):
+            with self.subTest(target):
+                status, headers, payload = self.app(target)
+                self.assertEqual(status, 200)
+                self.assertIn(expected, headers["Content-Type"])
+                # The name carries a hash of the contents, so the file behind it
+                # never changes and a browser never has to ask again.
+                self.assertIn("immutable", headers["Cache-Control"])
+                self.assertEqual(int(headers["Content-Length"]), len(payload))
+
+    def test_the_manifest_and_the_worker_are_served_and_never_cached(self):
+        for target, expected in (("/manifest.webmanifest", "application/manifest"),
+                                 ("/sw.js", "text/javascript")):
+            with self.subTest(target):
+                status, headers, body = self.app(target)
+                self.assertEqual(status, 200, body[:200])
+                self.assertIn(expected, headers["Content-Type"])
+                # A worker the browser will not re-fetch is a worker an upgrade
+                # cannot replace, and a cached shell names assets that have gone.
+                self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_every_icon_the_manifest_names_is_served_as_an_image(self):
+        _, _, body = self.app("/manifest.webmanifest")
+        icons = json.loads(body)["icons"]
+        self.assertTrue(icons)
+        for icon in icons:
+            with self.subTest(icon["src"]):
+                status, headers, payload = self.app(icon["src"])
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Content-Type"], "image/png")
+                self.assertEqual(payload[:8], b"\x89PNG\r\n\x1a\n")
+                # Never cached. The script and the stylesheet carry a hash of their
+                # own contents in their names and can be kept for a year; an icon is
+                # emitted at a fixed name, so a browser told the same thing would go
+                # on showing last month's artwork.
+                self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_an_asset_that_was_not_built_is_a_refusal_and_never_a_guess(self):
+        for target in ("/assets/index-deadbeef.js", "/assets/nothing.css",
+                       "/icons/icon-64.png", "/assets/index.js"):
+            with self.subTest(target):
+                status, _, body = self.app(target)
+                self.assertEqual(status, 404, body[:200])
+                self.assertEqual(json.loads(body)["code"], "NO_ROUTE")
+
+    def test_a_screen_of_the_application_is_a_fragment_and_not_a_path(self):
+        # Every route in the application is a fragment of `/`, which is why there is
+        # no catch-all here. A console that answered the shell for any unknown path
+        # would be inventing routes and would make the table above meaningless.
+        for target in ("/task/a-task", "/decisions", "/projects", "/obligations"):
+            with self.subTest(target):
+                status, _, body = self.app(target)
+                self.assertEqual(status, 404, body[:200])
+
+    def test_the_api_is_unchanged_by_the_application_being_there(self):
+        doc = self.state()
+        self.assertEqual(sorted(doc["sources"]), sorted(SOURCES))
+        # Read raw, because a stream has no end and `http.client` would sit on
+        # `read()` until its own timeout rather than failing.
+        said = self.stream().until("text/event-stream", timeout=15)
+        self.assertIn("HTTP/1.1 200", said)
+        self.assertIn(": connected", said)
+
+    def test_it_serves_the_application_from_any_working_directory(self):
+        # The link `just init` leaves in a bindir is resolved before node sets
+        # `__dirname`, so the distro this command came out of is the one whose
+        # application is served - whatever directory the captain started it in.
+        before = self.shell()[1]
+        elsewhere = tempfile.mkdtemp(prefix="siana-elsewhere-")
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        link = os.path.join(elsewhere, "bin")
+        os.makedirs(link)
+        os.symlink(CONSOLE, os.path.join(link, "siana-console"))
+        # Its own home, because the console started in `setUp` holds this one's
+        # singleton claim and a second console in one home is a refusal by design.
+        home = os.path.join(elsewhere, "home")
+        os.makedirs(home)
+        second = free_port()
+        out, err = self.at("elsewhere.out"), self.at("elsewhere.err")
+        environment = self.command_env({
+            "SIANA_CONSOLE_PORT": str(second),
+            "HERDR_SOCKET_PATH": self.herdr.path,
+            "PATH": self.distro_path(),
+            "SIANA_HOME": home,
+        })
+        with open(out, "w") as o, open(err, "w") as e:
+            started = subprocess.Popen([os.path.join(link, "siana-console")],
+                                       cwd=elsewhere, env=environment,
+                                       stdout=o, stderr=e, text=True)
+        started.out, started.err = out, err
+        self.addCleanup(self.stop, started)
+        self.assertTrue(until(lambda: self.listening(second)),
+                        f"the console never bound a port:\n{self.said(started)}")
+        status, _, body = self.app_at(second, "/")
+        self.assertEqual(status, 200, body[:200])
+        self.assertEqual(body.decode(), before)
+
+    def app_at(self, port, target):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        try:
+            conn.request("GET", target)
+            res = conn.getresponse()
+            return res.status, dict(res.getheaders()), res.read()
+        finally:
+            conn.close()
+
+
+class NoApplication(Console):
+    """A console whose bundle is not there, or is not the shape it knows.
+
+    The API is what every acceptance of this console rests on, so it keeps serving
+    it. The application routes say what is wrong with the install instead, because
+    the captain asked for something this command is supposed to have and "no such
+    page" would send them looking in the wrong place.
+    """
+
+    def distro(self, files=None):
+        """A copy of this command, with a bundle of the test's choosing beside it.
+
+        The command is one self-contained file that requires nothing but node's own
+        modules, so a copy of it in a directory of this shape is the real thing
+        looking at a different `console/dist`.
+        """
+        root = self.at("distro")
+        os.makedirs(os.path.join(root, "bin"), exist_ok=True)
+        shutil.copy(CONSOLE, os.path.join(root, "bin", "siana-console"))
+        for name, body in (files or {}).items():
+            where = os.path.join(root, "console", "dist", name)
+            os.makedirs(os.path.dirname(where), exist_ok=True)
+            with open(where, "wb") as fh:
+                fh.write(body)
+        return os.path.join(root, "bin", "siana-console")
+
+    def serving(self, command, port):
+        out = self.at(f"copy.{port}.out")
+        err = self.at(f"copy.{port}.err")
+        environment = self.command_env({
+            "SIANA_CONSOLE_PORT": str(port),
+            "HERDR_SOCKET_PATH": self.herdr.path,
+            "PATH": self.distro_path(),
+        })
+        with open(out, "w") as o, open(err, "w") as e:
+            proc = subprocess.Popen([command], cwd=self.home, env=environment,
+                                    stdout=o, stderr=e, text=True)
+        proc.out, proc.err = out, err
+        self.addCleanup(self.stop, proc)
+        self.assertTrue(until(lambda: proc.poll() is not None
+                              or self.listening(port)),
+                        f"the console never bound a port:\n{self.said(proc)}")
+        self.assertIsNone(proc.poll(), f"the console stopped:\n{self.said(proc)}")
+        return proc
+
+    def ask(self, port, target):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        try:
+            conn.request("GET", target)
+            res = conn.getresponse()
+            return res.status, res.read().decode()
+        finally:
+            conn.close()
+
+    def test_a_missing_bundle_still_serves_the_api_and_says_what_is_wrong(self):
+        port = free_port()
+        proc = self.serving(self.distro(), port)
+        status, body = self.ask(port, "/api/state")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn("sources", json.loads(body))
+        for target in ("/", "/manifest.webmanifest", "/sw.js"):
+            with self.subTest(target):
+                status, body = self.ask(port, target)
+                self.assertEqual(status, 503, body[:200])
+                doc = json.loads(body)
+                self.assertEqual(doc["code"], "NO_APP")
+                self.assertIn("just build", doc["error"])
+        self.assertIn("no application is being served", self.said(proc))
+
+    def test_a_bundle_missing_a_file_is_refused_whole(self):
+        # Half an application is worse than none: the shell would load, the script it
+        # names would 404, and the captain would be looking at a blank page with
+        # nothing anywhere saying why.
+        port = free_port()
+        self.serving(self.distro({
+            "index.html": b"<!doctype html><div id=app></div>",
+            "assets/index-abc.js": b"console.log(1)",
+            "assets/style-abc.css": b"body{}",
+        }), port)
+        status, body = self.ask(port, "/")
+        self.assertEqual(status, 503, body[:200])
+        self.assertIn("manifest.webmanifest", json.loads(body)["error"])
+
+    def test_a_bundle_holding_a_file_this_does_not_serve_is_refused_whole(self):
+        port = free_port()
+        self.serving(self.distro({
+            "index.html": b"<!doctype html>",
+            "manifest.webmanifest": b"{}",
+            "sw.js": b"",
+            "assets/index-abc.js": b"",
+            "assets/style-abc.css": b"",
+            "assets/secrets.env": b"TOKEN=1",
+        }), port)
+        status, body = self.ask(port, "/")
+        self.assertEqual(status, 503, body[:200])
+        self.assertIn("secrets.env", json.loads(body)["error"])
+        status, body = self.ask(port, "/assets/secrets.env")
+        self.assertEqual(status, 404, body[:200])
+
+    def test_a_bundle_with_no_script_is_refused_rather_than_served_blank(self):
+        port = free_port()
+        self.serving(self.distro({
+            "index.html": b"<!doctype html>",
+            "manifest.webmanifest": b"{}",
+            "sw.js": b"",
+            "assets/style-abc.css": b"",
+        }), port)
+        status, body = self.ask(port, "/")
+        self.assertEqual(status, 503, body[:200])
+        self.assertIn("script", json.loads(body)["error"])
+
+
+class TheHost(Console):
+    """The console answers to its own name and to nothing else.
+
+    Binding loopback stops another machine connecting. It does not stop a web page:
+    any origin can point its own hostname at `127.0.0.1`, and the captain's browser
+    will then treat what this returns as same-origin and let that page read it. The
+    `Host` header is the one thing the page cannot forge, so it is what is checked.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.start()
+
+    def sent(self, host, target="/api/state", version="HTTP/1.1"):
+        """One request, framed by hand, because `http.client` writes its own `Host`
+        and this is a test about that header.
+
+        Read until the response head has arrived and no further: one of the targets
+        here is a stream, which has no end, and waiting for one would stall the suite
+        rather than fail it.
+        """
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=1)
+        try:
+            head = f"GET {target} {version}\r\n"
+            if host is not None:
+                head += f"Host: {host}\r\n"
+            sock.sendall((head + "Connection: close\r\n\r\n").encode())
+            said = b""
+            deadline = time.time() + 30
+            while b"\r\n\r\n" not in said and time.time() < deadline:
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                said += chunk
+            return said.decode(errors="replace")
+        finally:
+            sock.close()
+
+    def test_the_exact_loopback_listener_is_served(self):
+        for target in ("/", "/api/state", "/api/stream"):
+            with self.subTest(target):
+                said = self.sent(f"127.0.0.1:{self.port}", target)
+                self.assertTrue(said.startswith("HTTP/1.1 200"), said[:200])
+
+    def test_a_host_that_is_not_this_listener_reads_neither_app_nor_api(self):
+        for host in ("evil.example.com", f"evil.example.com:{self.port}",
+                     "localhost", f"localhost:{self.port}", "127.0.0.1",
+                     f"127.0.0.1:{self.port + 1}", "[::1]", "0.0.0.0",
+                     f"attacker.test:{self.port}", " ", "127.0.0.1:"):
+            for target in ("/", "/api/state", "/api/stream",
+                           "/manifest.webmanifest"):
+                with self.subTest(f"{host} {target}"):
+                    said = self.sent(host, target)
+                    self.assertTrue(said.startswith("HTTP/1.1 403"), said[:200])
+                    self.assertIn("BAD_HOST", said)
+                    # The refusal is a refusal and never a smaller answer: no source,
+                    # no revision, nothing off a store.
+                    self.assertNotIn("sources", said)
+                    self.assertNotIn("revision", said)
+
+    def test_a_request_with_no_host_at_all_is_refused(self):
+        # HTTP/1.1 requires one and every browser sends one, so something that omits
+        # it is not the captain's browser.
+        said = self.sent(None, "/api/state", version="HTTP/1.0")
+        self.assertTrue(said.startswith("HTTP/1.1 403"), said[:200])
+        self.assertIn("BAD_HOST", said)
+
+    def test_the_refusal_says_where_to_go_instead(self):
+        said = self.sent("evil.example.com")
+        self.assertIn(f"http://127.0.0.1:{self.port}/", said)
+
+    def test_a_stream_is_refused_on_a_bad_host_before_it_opens(self):
+        stream = Stream(self.port, host="evil.example.com")
+        self.addCleanup(stream.close)
+        said = stream.read(2.0)
+        self.assertIn("403", said)
+        self.assertNotIn("event: state", said)
+
+
 class TheSlice(unittest.TestCase):
     """What this command is not, read off its source.
 
@@ -1035,9 +1419,33 @@ class TheSlice(unittest.TestCase):
             self.assertNotIn(forbidden, self.source,
                              f"siana-console must not reach for {forbidden!r}")
 
+    def test_no_request_ever_reaches_the_filesystem(self):
+        # The bundle is read once, at startup, into a map keyed on the route. Nothing
+        # in the request path opens anything, which is what makes traversal have
+        # nowhere to go rather than somewhere that is checked.
+        handler = self.source[self.source.index("async function handle("):]
+        for forbidden in ("readFileSync", "readdirSync", "createReadStream",
+                          "path.join", "path.resolve", "existsSync"):
+            self.assertNotIn(forbidden, handler,
+                             f"the request path reaches for {forbidden!r}")
+
+    def test_the_bundle_is_found_beside_this_file_and_not_beside_the_caller(self):
+        # `process.cwd()` here would serve whatever happened to be under the
+        # directory the captain started the console in.
+        self.assertIn("path.join(__dirname, '..', 'console', 'dist')", self.source)
+        self.assertNotIn("process.cwd()", self.source)
+
+    def test_the_host_is_checked_before_anything_is_read(self):
+        # Loopback stops another machine. It does not stop a page that resolves its
+        # own hostname to 127.0.0.1 and reads this through the captain's browser.
+        handler = self.source[self.source.index("async function handle("):]
+        self.assertLess(handler.index("addressedHere"), handler.index("ROUTES"),
+                        "the host is checked after the request has been routed")
+        self.assertIn("BAD_HOST", self.source)
+
     def test_it_carries_nothing_from_a_later_slice(self):
-        # Slice 2 is loopback, read-only and unauthenticated on purpose. Half of an
-        # authentication check is worse than none, because it looks like one.
+        # This console is loopback, read-only and unauthenticated on purpose. Half of
+        # an authentication check is worse than none, because it looks like one.
         for forbidden in ("jwt", "jwks", "cloudflared", "access-control",
                           "websocket", "sendusermessage"):
             self.assertNotIn(forbidden, self.source.lower(),

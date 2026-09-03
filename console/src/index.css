@@ -1,0 +1,22 @@
+/* Scanned sources, named rather than discovered.
+ *
+ * Tailwind's automatic detection walks the whole project, so a class name written in
+ * a test file - or in a comment - would put a rule into the stylesheet the captain is
+ * served, and the built CSS would change every time a test was added. The application
+ * is `src/`, and `src/` is what this compiles from. */
+@import "tailwindcss" source(none);
+@source "./**/*.{js,jsx}";
+
+/* A phone in a dark room is where this is read, so the page is dark before a single
+   class applies: a white flash between the shell painting and the app mounting is a
+   real thing at 3am. */
+html {
+  background-color: #020617;
+  color-scheme: dark;
+}
+
+body {
+  /* The bar is sticky and the nav sits on the home indicator, so both need the safe
+     area rather than the viewport edge. */
+  padding-bottom: env(safe-area-inset-bottom);
+}

@@ -28,7 +28,8 @@ has been run on an operating system other than macOS.
 | ---------- | ---------- | ----------------------------------------------------- |
 | `python3`  | 3.13.13    | every `siana-*` command that is not bash or node      |
 | `bash`     | 5.3.9      | `siana`, `siana-brief`, and the recipes in `justfile` |
-| `node`     | 26.7.0     | `siana-console`; no other command here needs it       |
+| `node`     | 26.7.0     | `siana-console` and its browser app; nothing else     |
+| `npm`      | 11.19.0    | `just build`, which builds that app; nothing else     |
 | `just`     | 1.58.0     | the recipes below                                     |
 | `git`      | 2.50.1     | a minion works in a worktree of its project           |
 | `datafile` | 0.1.1      | every record store: queue, registry, obligations      |
@@ -37,7 +38,8 @@ has been run on an operating system other than macOS.
 | `herdr`    | 0.8.0      | the session manager minions are started in            |
 | `claude`   | 2.1.231    | the harness minions run in, and the other of the two  |
 
-Verified on macOS 26.6.2 (Darwin 25.6) on 2026-08-28.
+Verified on macOS 26.6.2 (Darwin 25.6) on 2026-08-28, except `npm`, which was
+verified on 2026-08-31.
 
 `datafile` and `tasks` are checkouts you install yourself:
 
@@ -732,187 +734,31 @@ what you wanted.
 `~/.siana/review.md` is what that reviewer is told. It is yours to edit, like every
 other instruction file in the home.
 
-### Delegate the cleanup
+## Build the browser console
 
-Retiring worktrees and reaping branches is long, repetitive and almost entirely
-mechanical. Done inside SIANA's session it is thirty rounds of tool output crowding
-out the fleet. So it happens somewhere else, and SIANA sees only what it has to
-answer:
+    just build
 
-    siana-clean start --grant retire       one run, in its own context
-    siana-clean status                     what it is doing, or stopped on
-    siana-clean answer <run> --text ...    your answer to its question
-    siana-clean resume <run>               carry it on from there
+`npm ci` and then a production build, into `console/dist/`, which is what
+`siana-console` serves and what the suite tests. Run it after a fresh clone, and after
+a `git pull` that changed anything under `console/`. `just test` runs it first, so an
+ordinary check builds what it is about to test.
 
-At the helm you never type these: SIANA calls the `siana_cleanup` tool the pi package
-registers, and it is the same command underneath.
+Neither the installed packages nor the build output is committed.
+`console/package-lock.json` is what makes the install reproducible, and the same
+source builds to the same bytes twice, which is what makes "the suite tested what is
+served" mean anything. Without a build, the console still serves its API and says on
+startup that it has no application to serve; `just doctor` reports the same thing.
 
-A run carries a grant, and the grants are named after the commands they unlock.
-`inventory` reads and is always in force. `retire` adds `siana-retire`. `reap-report`
-adds `siana-reap` in its report-only form. `close-workspace` adds
-`siana-close-workspace`. There is no grant that reaches `siana-reap --yes`, because a
-wrong reap is the one mistake in this fleet that loses work.
-
-`close-workspace` is the narrow authority you granted to close the Herdr workspace a
-finished minion leaves behind, and it is a grant of its own rather than part of
-`retire` because closing a workspace kills the agent in it. Start a run with both and
-it retires each tree and then closes the workspace that retirement left open, which
-is where the idle agent and the open workspace per retirement used to accumulate.
-
-The narrowness is in the command rather than in what the cleaner was told.
-`siana-close-workspace` takes a task id, and resolves the workspace from that task's
-own recorded owner pane - never from a label, a workspace number, an agent name or
-what is focused, each of which finds *a* workspace rather than *that task's*. It
-closes only a `done` task's workspace, only when Herdr says the workspace is a
-linked-worktree one open on exactly the tree the queue recorded, in exactly the
-repository the registry gives that project, unfocused, named by no other task in the
-queue, and with its agent in one of the states a finished minion actually leaves -
-idle, done or unknown. That last one is an allowlist, so an agent mid-turn, an agent
-stopped at a dialog waiting for you, and a state a later Herdr grows all refuse. And
-it closes only after the retirement has actually happened: the tree gone from disk and
-gone from git's own list of worktrees, read from the world rather than taken from an
-exit code.
-
-That ordering is load-bearing twice over. A workspace closed before its worktree is
-removed strands the worktree, and a project's *source* workspace closes every
-linked-worktree workspace under it, so a workspace Herdr does not mark
-`is_linked_worktree` is refused outright. Raw `herdr` closing stays refused to a
-cleanup run whatever grants it holds.
-
-The cleaner does no safety thinking of its own. It enumerates and delegates, and
-every refusal it meets is one of your existing commands refusing on its own terms.
-
-What keeps it to that is a directory of refusing shims put on the front of its `PATH`
-for the run. A command outside the grant fails with a message naming what to do
-instead, so the ordinary way an agent goes wrong - reaching for the next obvious
-command - is stopped by a mechanism rather than by a sentence in a prompt. It is not
-a sandbox, and it is worth knowing which: it intercepts command names, so a binary
-invoked by absolute path is outside it. What actually holds is that the destructive
-work lives in commands that fail closed on their own inputs.
-
-What the cleaner does instead of guessing is stop:
-
-    $ siana-clean start --grant retire
-    run      clean-20260830-0730
-      round  1
-      asks   design-three-part's tree holds 44 untracked files; are they yours?
-      kind   siana
-      answer siana-clean answer clean-20260830-0730 --text <your answer>
-
-The question is on disk before anybody reads it, and nothing after that point runs
-until an answer is recorded. Answering and resuming are two operations with a process
-boundary between them, so nothing is ever waiting on anything else and a restart
-loses at most a round.
-
-A question the cleaner marks `captain` is one SIANA cannot answer for you. It becomes
-an ordinary recorded decision, you answer it, and only then can the run be unblocked.
-
-Every answer lands in `$SIANA_HOME/runbook.md`, which the next cleaner reads first.
-Entries are built out of the question a cleaner wrote down and the answer SIANA
-recorded, and nothing else can be *recorded* there, so a guess, a secret or a stray
-piece of transcript cannot get in that way.
-
-That is a property of the command and not a wall around the file. A cleaner runs with
-a shell, and a shell can write any file its user can, so the rule against editing the
-runbook by hand is carried in the cleaner's instructions the way the rest of its
-scope is. The child is started without the harness's file-writing tools, which
-narrows it. Read it the way you read the shim guard above: a real boundary against
-the ordinary mistake, and not a wall.
-
-If anything goes wrong, nothing was half-done. The mutations belong to commands that
-fail closed on their own inputs, so a killed cleaner, an unavailable model or a
-corrupt run record all leave the fleet exactly as it was. `siana-clean status` says
-which, and the package's README lists the recoveries.
-
-### Ask for the report
-
-    /captain-report
-
-SIANA reads the live queue, registry, repositories, forge, watcher, herdr,
-obligations, cleanup runs and decision history, and writes you an overview: what
-happened, whether the fleet is moving, what is about to go wrong, what is waiting to
-be published or cleaned up, what is still owed, and every decision you have to take.
-
-A source it could not read is named as unreadable. It is never rendered as healthy
-and never as empty, because "no open workspaces" when herdr is down is a lie you
-would act on.
-
-Each pending decision arrives with its options, what each one costs, what SIANA
-recommends, and why. A recommendation is not authority and nothing in this distro
-turns one into an action.
-
-### What the fleet learns from what you decide
-
-Every decision SIANA puts in front of you is recorded twice, and the split is the
-point. The obligation holds the question, whether it is still open, and - once you
-answer - your answer, in your words. Beside it, keyed by the same id,
-`attended.jsonl` holds what the obligation has no room for: the situation, the
-options, what each one cost, which SIANA would have chosen, and why.
-
-    siana-owe history            every decision, joined
-    siana-owe history --json     the same, for a program
-
-Your answer lives in exactly one place and is read out of it every time, so there is
-nothing here to go stale. Later, once an answer has been carried out:
-
-    siana-owe outcome <id> --outcome "what actually happened"
-
-It refuses while the obligation is still open, because an outcome recorded before an
-answer is a guess.
-
-This is a learning corpus and a reporting foundation, and that is all it is. It
-exists so that "how often did SIANA and I agree, and about what" is a question with
-an answer, which is the only ground an argument for giving the fleet more autonomy
-could ever stand on. Nothing reads a recommendation as permission today, and nothing
-in this distro turns a row of this store into an action.
-
-It is not `decisions.jsonl`. That one is the advisory ledger: what SIANA would have
-done while you were away, where nobody was asked and no answer exists.
-
-### What the fleet found, after it was fixed
-
-The queue holds work someone can still act on. A review finding whose repair has been
-independently accepted is not that: nobody will do anything about it, and leaving it
-in `blocked` makes the fleet report blockers when the actionable number is zero. It
-is also the most expensive thing this fleet produces, and it is read again every time
-similar work is briefed. So it moves to the findings ledger.
-
-    siana-findings                  every finding, newest case first
-    siana-findings show <id>        one finding whole, with its evidence resolved
-    siana-findings case <case>      one rejection chain, every round in order
-    siana-findings verify [<case>]  re-run every mechanical check
-    siana-findings blob <sha256>    print one archived evidence file
-
-A rejection chain is archived whole, as a case, and only once its last round ends in
-an acceptance that is `done`. Nothing auto-archives: every record enters through a
-plan SIANA wrote, and `siana-findings archive --plan <file>` is the only thing that
-writes this store.
-
-Two things it will not do, and they are the design. It never decides that a successor
-resolved a finding: `resolution` is a sentence SIANA writes, and no ancestry, `deps`,
-`base` or merge commit reaches it. And it never answers a finding your pipeline marked
-for you: a case carrying one is refused unless a closed obligation of yours is named
-in its evidence.
-
-What it does check, on demand and not only once, is everything mechanical: that the
-lineage resolves, that the case is a complete chain, that every archived report is
-still byte-identical to the copy in the blob store, that every rejected head is still
-pinned, and that the log has never been rewritten. `siana-findings verify` prints all
-of that beside the words `not checked here` against the judgment, so a green run
-never reads as agreement with the sentence.
-
-Evidence is copied rather than referenced, into
-`$SIANA_HOME/findings/blobs/<aa>/<rest>`, keyed by sha256. Your home is not a git
-repository and the documents in it get rewritten; a digest of a file that changed
-reads as tampering and a digest of a file that was deleted leaves nothing at all.
-Rejected heads are pinned as `refs/siana/findings/<id>` in the project checkout,
-which is what stops `git gc` collecting a commit whose branch is gone.
+Without `npm`, `just build` says so and does nothing, and the frontend half of the
+suite skips itself. Nothing else here needs one.
 
 ## Validate a change to the distro
 
     just test
 
-Standard-library `unittest`, no dependencies to install. It drives the pure
+Standard-library `unittest` for the distro itself, no dependencies to install. It
+builds the browser console first and then drives that application's own tests, which
+run on node against the built bundle. It drives the pure
 mechanics in-process and drives the commands as real processes against a real
 `tasks` and `datafile`, into throwaway homes, because a stubbed store would only
 ever agree with the suite. Unittest arguments pass through, so `just test -v` is
@@ -1157,18 +1003,33 @@ anything is built on top of it: a `datafile` read may rewrite the `.idx` cache
 beside a store. That write is atomic and it is a cache. No authoritative record is
 ever changed.
 
-## Read the fleet over loopback HTTP
+## Read the fleet from a browser
 
     SIANA_CONSOLE_PORT=8787 siana-console
 
-`siana-read` answers one question and exits, which a phone cannot run. This is the
-smallest process that puts those same documents on a socket, and it is the whole of
-what it does. You start it yourself, and you stop it with Ctrl-C or `kill`. Nothing
-in the fleet starts it, nothing in the fleet depends on it, and stopping it leaves
-SIANA, the watcher, every minion and every store exactly as they were.
+Then open `http://127.0.0.1:8787/` in a browser **on this machine**. That exact
+address and not `localhost`: the console answers to the name it binds and refuses
+every other one, for the reason below.
+
+Nothing else can reach it yet, a phone included. The listener is loopback-only, there
+is no tunnel here and no way to ask for one, so `127.0.0.1` on another device is that
+device's own loopback and reaches nothing. What the application is today is a console
+shaped for a phone - one thumb-reachable column, installable to a home screen, and
+readable with its shell cached offline - waiting on the exposure that is not in this
+distro. Install it from a browser on this machine if you want the standalone window;
+it is the same application either way.
+
+`siana-read` answers one question and exits, which no browser can run. This is the
+smallest process that puts those same documents on a socket, and serves the
+application that reads them. You start it yourself, and you stop it with Ctrl-C or
+`kill`. Nothing in the fleet starts it, nothing in the fleet depends on it, and
+stopping it leaves SIANA, the watcher, every minion and every store exactly as they
+were.
 
 It is the one command here that runs on `node`, so `just doctor` reports whether
-there is one to run it on.
+there is one to run it on. The application it serves is built rather than committed,
+so `just doctor` reports that too, and the console says on startup when there is
+nothing to serve.
 
 Read what it is before you run it:
 
@@ -1176,8 +1037,17 @@ Read what it is before you run it:
   that moves it. Nothing else on your network can reach it.
 - **Unauthenticated.** Anything already running on this machine as you can read it.
   That is the same reach that anything running as you already has over the home
-  itself, so it adds nothing locally and would add everything remotely, which is why
-  the address is not configurable.
+  itself, and it is the whole of what it adds - which is why the address is not
+  configurable and why the name below is checked.
+- **Addressed by name.** Binding loopback stops another machine reaching it. It does
+  not stop a web page: any site you visit can point its own hostname at `127.0.0.1`,
+  have your browser connect here, and then read every task, obligation and decision
+  in your home, because the browser believes the answer came from that site. So the
+  console refuses any request whose `Host` is not the listener it bound, which is the
+  one header such a page cannot choose. `localhost` is deliberately not a second
+  accepted name: whether it even reaches this listener depends on how your machine
+  resolves it, and a second accepted name is a second thing to get wrong for no reach
+  the first does not already give.
 - **Read-only where it matters.** It has no write endpoint. Every request it serves
   reaches the fleet through `siana-read` and through nothing else, so no request can
   change an authoritative record. It writes one file of its own: the claim below.
@@ -1186,10 +1056,30 @@ Read what it is before you run it:
 `SIANA_CONSOLE_PORT` has no default, and the console refuses to start without it. A
 port every machine used would be a port something else is one day holding.
 
-It serves two routes and refuses everything else, every other method included:
+Every request is answered only if it was addressed to `127.0.0.1` at that port.
+Anything else - `localhost`, this machine's hostname, or a name a page on the
+internet resolved here - is refused with `403` and `BAD_HOST`, and the refusal says
+which address to open instead. Nothing is read before that check, so it covers the
+application and the API alike.
 
-    GET /api/state?rev=<opaque>    every source, in one document
+Requests that pass it reach these and nothing else, every other method included:
+
+    GET /                         the application
+    GET /manifest.webmanifest     what makes it installable
+    GET /sw.js                    the offline shell
+    GET /assets/<built>           the one script and the one stylesheet
+    GET /icons/<built>            the app icons
+    GET /api/state?rev=<opaque>   every source, in one document
     GET /api/stream               server-sent events announcing a new revision
+
+That list is the whole route table. Nothing turns a request into a filesystem path:
+the bundle is read once at startup into memory, every file in it has to be one this
+command knows, and a request is a lookup in that table or a refusal. A build that
+emitted something else is refused whole rather than half served, and the console says
+which file it did not recognise.
+
+Every screen of the application is a fragment of `/`, so there is no fallback route
+under it. `/task/<id>` is a 404; `/#/task/<id>` is a screen.
 
 `/api/state` runs all six `siana-read` commands and returns what each of them said:
 the whole document, its exit code, and when it was asked. Nothing is folded, and no
@@ -1206,6 +1096,34 @@ untouched stores hands back the revision you already have.
 It carries no state and no event id: there is nothing to replay, a reconnecting
 client is told the current revision, and `/api/state` is complete on its own when
 the stream is disconnected.
+
+### What the application shows, and what it will not do
+
+Four panels, in the order a captain needs them. **Needs you** is open decisions and
+blocked tasks, and it says out loud when it is empty. **In flight** is what is being
+worked on, with what herdr says each minion is doing beside it. **Ready** is unstarted
+work whose dependencies are met. **Coverage** is whether anyone is at the helm, as
+evidence with an age on it rather than as a green tick. Under those are the registry,
+one project, one task, what is owed, and the decision log.
+
+A source that could not be read is shown as one. `siana-read` refuses an unreadable
+store rather than answering an empty one, and the application keeps that distinction:
+a red panel says what went wrong and shows nothing, instead of an empty list that
+reads as a fleet with nothing in it. A corrupt store shows its bad lines beside the
+records that were readable. An unreachable herdr is "minion unknown" and never "no
+minions".
+
+A bar across the top says `connected`, `polling`, `reconnecting` or `offline`, with
+the age of the last successful read, and turns loud when what is on screen stops
+being current. Installed, it opens offline: a service worker holds the application
+shell and the last `/api/state` it saw, and a snapshot served from there is banded as
+a saved copy rather than shown as live.
+
+**It only reads.** There is no button anywhere in it, online or offline, because
+there is nothing behind one: this console cannot answer a decision, unblock a task or
+send SIANA a message. Answering any of that is done at the helm. Every asset it
+serves is local - no CDN, no remote font, no remote script, no analytics - and the
+build refuses to emit a byte naming an origin that is not this console.
 
 One console runs per home. It claims `$SIANA_HOME/inbox/console` before it binds,
 recording the pid, the `ps` command and the port it owns, and a second one refuses
@@ -1228,6 +1146,8 @@ deleted. Your home is left alone, queue and all. Delete it by hand when you mean
 
     bin/        the commands. Mechanics only: they stop and report when the
                 world surprises them, and never adjudicate meaning.
+    console/    the browser application `siana-console` serves: React and
+                Tailwind, built by `just build` into console/dist/.
     template/   what an install copies into the home: SIANA's instructions, the
                 standing orders every minion is started with, the brief and
                 handoff templates, the store contracts, and `pi-siana/`, the

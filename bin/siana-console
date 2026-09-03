@@ -1,18 +1,33 @@
 #!/usr/bin/env node
 /**
- * Serve the fleet over loopback HTTP, so something with a browser can read what
- * `siana-read` already answers.
+ * Serve the fleet over loopback HTTP, and the browser application that reads it.
  *
  * `siana-read` prints one JSON document per question and exits. A phone cannot run
- * it. This is the smallest process that puts those same documents on a socket, and
- * it is deliberately the whole of what it does: no browser, no static file, no
- * authentication, no tunnel, no write path, and nothing here decides anything about
- * the fleet.
+ * it. This is the smallest process that puts those same documents on a socket, plus
+ * the application that renders them: no authentication, no tunnel, no write path, and
+ * nothing here decides anything about the fleet.
  *
  *     siana-console          SIANA_CONSOLE_PORT names the loopback port
  *
+ *     GET /                         the application shell
+ *     GET /manifest.webmanifest     what makes it installable
+ *     GET /sw.js                    the offline shell and the snapshot it keeps
+ *     GET /assets/<built>           the one script and the one stylesheet
+ *     GET /icons/<built>            the app icons
  *     GET /api/state?rev=<opaque>   one snapshot of every source, or 204
  *     GET /api/stream               server-sent events announcing a new revision
+ *
+ * **The route table is a fixed set of names and never a directory.** Nothing here
+ * turns a request into a filesystem path: the bundle is read once at startup into
+ * memory, every file in it has to match one of the shapes `ASSETS` and `GENERATED`
+ * name, and a request is a lookup in that map or a 404. A build that emitted
+ * something else is refused rather than served, because a route table derived from
+ * "whatever is in the directory" is a directory listing with extra steps.
+ *
+ * **The bundle is found beside this file and never beside the caller.** `just init`
+ * links this command into a bindir, node resolves that link before it sets
+ * `__dirname`, and so the distro this file lives in is the distro whose application
+ * is served - from whatever directory the captain happened to start it in.
  *
  * **It binds `127.0.0.1` and there is no way to ask it for anything else.** Not a
  * flag, not an environment value, not a fallback. The listener is unauthenticated,
@@ -21,6 +36,16 @@
  * a host that can be misconfigured once, at which point every task, obligation and
  * decision in the home is served to the local network by a process that asks for no
  * credential.
+ *
+ * **And it answers only to its own name.** Binding loopback stops another machine
+ * connecting; it does not stop a web page. A page on any origin can make the
+ * captain's own browser connect here by resolving its hostname to `127.0.0.1`, and
+ * from that point the browser believes the answer is same-origin and lets the page
+ * read it - which is a reach no local file-reading process has. The `Host` header is
+ * the one thing that page cannot forge, because the browser writes it from the name
+ * it was asked for. So a request whose `Host` is not this listener is refused before
+ * anything is read. Slice 4 owns the other half of this, for a console that is not
+ * local-only; this is the half that holds while there is no authentication at all.
  *
  * **The fleet is read through `siana-read` and never around it.** No store is
  * opened here, herdr is never dialled, no watcher file is parsed and no process is
@@ -99,7 +124,78 @@ const HEARTBEAT_MS = 15_000;
 const CLAIM_DIR = 'inbox';
 const CLAIM = 'console';
 
-const ROUTES = { '/api/state': serveState, '/api/stream': serveStream };
+// Where the built application is, relative to this file rather than to whatever
+// directory the captain started this in. Node resolves the symlink `just init`
+// leaves in the bindir before it sets `__dirname`, so this is the distro this
+// command came out of.
+const APP_DIR = path.join(__dirname, '..', 'console', 'dist');
+
+// How to build it, said in the one place a captain will be looking when it is not
+// there.
+const BUILD = 'run `just build` in the distro this command was linked from';
+
+// The application's own routes: a file the build always emits, the path it is served
+// at, and what it is served as. Nothing is derived from the request.
+//
+// `no-store` on all three. The shell names the hashed assets below, so a browser
+// holding yesterday's copy of it would ask for a script that no longer exists; and a
+// service worker the browser will not re-fetch is one an upgrade cannot replace.
+const ASSETS = [
+  ['index.html', '/', 'text/html; charset=utf-8'],
+  ['manifest.webmanifest', '/manifest.webmanifest',
+   'application/manifest+json; charset=utf-8'],
+  ['sw.js', '/sw.js', 'text/javascript; charset=utf-8'],
+];
+
+// A year, immutable, and only for the two files whose names carry a hash of their own
+// contents: the file behind one of those never changes. Nothing else here is cached.
+const FOREVER = 'public, max-age=31536000, immutable';
+
+// The generated files, whose exact names the console cannot know before the build.
+// The shapes are exact: a name that does not match one of these is a build this does
+// not recognise, and the whole bundle is refused rather than half of it served.
+//
+// Only the two under `assets/` are cached, because only those two carry a hash of
+// their own contents in their name. The icons are emitted at fixed names, so a
+// browser told to keep one for a year would go on showing last month's artwork.
+const GENERATED = [
+  [/^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.js$/, 'text/javascript; charset=utf-8',
+   FOREVER],
+  [/^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.css$/, 'text/css; charset=utf-8', FOREVER],
+  [/^icons\/[A-Za-z0-9][A-Za-z0-9._-]*\.png$/, 'image/png', 'no-store'],
+];
+
+// The one directory level the bundle is allowed to have, so that walking it is a
+// fixed list of names and not a recursive descent through whatever is there.
+const SUBDIRECTORIES = ['assets', 'icons'];
+
+// What the application document is allowed to do, enforced by the browser rather
+// than only by the build.
+//
+// Every asset here is local, and `console/tools/plugins.mjs` refuses to emit a byte
+// naming an origin that is not this console. This is the same rule said to the
+// browser, so that it holds against a page this console never built: nothing loads
+// from anywhere else, nothing is submitted anywhere, nothing frames this and this
+// frames nothing. `form-action 'none'` is the one that matters most on a console
+// with no write endpoint - there is no form here, and now there is nowhere one
+// could post to either.
+const POLICY = [
+  "default-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+].join('; ');
+
+const ROUTES = new Map([
+  ['/api/state', serveState],
+  ['/api/stream', serveStream],
+]);
+
+// The bundle, in memory, or why there is none. Filled once at startup: a route table
+// read off disk per request is a route table that changes under a running console,
+// and a file read per request is a filesystem path in a request handler.
+let app = { routes: new Map(), error: null };
 
 // Every connected stream. Derived and disposable: it holds no fleet fact, and a
 // client that drops loses nothing, because `/api/state` is complete on its own.
@@ -560,6 +656,125 @@ function refuse(res, status, code, message, headers) {
   res.end(body);
 }
 
+/** Whether this request was addressed to this console, by name.
+ *
+ * The exact listener and nothing else. `localhost` is deliberately not accepted:
+ * this binds `127.0.0.1` literally, so `localhost` reaching it at all depends on how
+ * that name resolves on this machine, and a second accepted name is a second thing
+ * to get wrong for no reach the first does not already give.
+ *
+ * A missing `Host` is refused too. HTTP/1.1 requires one, a browser always sends
+ * one, and something that omits it is not the captain's browser.
+ */
+function addressedHere(req, port) {
+  const host = req.headers.host;
+  if (typeof host !== 'string') return false;
+  // Port 80 is the one case a browser leaves the port off, because it is the default
+  // for the scheme. Every other port is written out.
+  return host === `${HOST}:${port}` || (port === 80 && host === HOST);
+}
+
+/** Every file the build emitted, checked against the shapes above, in memory.
+ *
+ * A bundle that is absent, unreadable, or shaped differently from the one this
+ * command knows is a refusal and never a partial serve. Half an application is worse
+ * than none: the shell would load, the script it names would 404, and the captain
+ * would be looking at a blank screen with nothing anywhere saying why.
+ */
+function loadApp(dir) {
+  const routes = new Map();
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    return { routes, error: `${dir} holds no application: ${e.message}` };
+  }
+  const files = [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (!SUBDIRECTORIES.includes(entry.name)) {
+        return { routes: new Map(),
+                 error: `${dir} holds a directory this does not serve: ${entry.name}` };
+      }
+      for (const inner of fs.readdirSync(path.join(dir, entry.name),
+                                         { withFileTypes: true })) {
+        if (!inner.isFile()) {
+          return { routes: new Map(),
+                   error: `${dir}/${entry.name} holds something that is not a file: `
+                          + inner.name };
+        }
+        files.push(`${entry.name}/${inner.name}`);
+      }
+      continue;
+    }
+    if (!entry.isFile()) {
+      return { routes: new Map(),
+               error: `${dir} holds something that is not a file: ${entry.name}` };
+    }
+    files.push(entry.name);
+  }
+
+  const named = new Map(ASSETS.map(([file, route, type]) => [file, [route, type]]));
+  for (const file of files) {
+    const known = named.get(file);
+    if (known) {
+      const loaded = read(dir, file, known[0], known[1], 'no-store');
+      if (loaded.error) return { routes: new Map(), error: loaded.error };
+      routes.set(known[0], loaded.entry);
+      named.delete(file);
+      continue;
+    }
+    const generated = GENERATED.find(([shape]) => shape.test(file));
+    if (!generated) {
+      return { routes: new Map(),
+               error: `${dir} holds a file this does not serve: ${file}` };
+    }
+    const loaded = read(dir, file, `/${file}`, generated[1], generated[2]);
+    if (loaded.error) return { routes: new Map(), error: loaded.error };
+    routes.set(`/${file}`, loaded.entry);
+  }
+  if (named.size) {
+    return { routes: new Map(),
+             error: `${dir} is missing ${[...named.keys()].join(', ')}` };
+  }
+  // A shell with no script is a blank page that answers 200, which is the one
+  // failure a captain cannot diagnose from the outside.
+  for (const [what, ending] of [['script', '.js'], ['stylesheet', '.css']]) {
+    if (![...routes.keys()].some((route) => route.startsWith('/assets/')
+        && route.endsWith(ending))) {
+      return { routes: new Map(), error: `${dir} holds no built ${what}` };
+    }
+  }
+  return { routes, error: null };
+}
+
+function read(dir, file, route, type, cache) {
+  try {
+    return { entry: { route, type, cache, body: fs.readFileSync(path.join(dir, file)) } };
+  } catch (e) {
+    return { error: `${path.join(dir, file)} cannot be read: ${e.message}` };
+  }
+}
+
+function serveAsset(entry) {
+  return (req, res) => {
+    res.writeHead(200, {
+      'Content-Type': entry.type,
+      'Cache-Control': entry.cache,
+      'Content-Length': entry.body.length,
+      // Never sniffed, and never framed. Both are free here and both close a way a
+      // page could wrap this one.
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      // The policy is the document's, so it is sent with the document. On an image
+      // or a script it would say nothing about anything.
+      ...(entry.type.startsWith('text/html')
+        ? { 'Content-Security-Policy': POLICY } : {}),
+    });
+    res.end(entry.body);
+  };
+}
+
 async function serveState(req, res, url, home) {
   const doc = await snapshot(home);
   // The caller's revision, as a cache validator and never as authority. A match
@@ -670,7 +885,7 @@ async function poll(home) {
   }
 }
 
-async function handle(req, res, home) {
+async function handle(req, res, home, port) {
   // Origin-form only, and checked before anything is parsed. A request target that
   // carries its own authority makes `URL` discard the base and read the authority
   // out of the target instead, so `//evil.com/api/state`, `/\evil.com/api/state`
@@ -682,6 +897,22 @@ async function handle(req, res, home) {
   if (!req.url.startsWith('/') || req.url[1] === '/' || req.url[1] === '\\') {
     refuse(res, 400, 'BAD_TARGET',
            `${req.url} is not a path; this serves origin-form requests only`);
+    return;
+  }
+  // Addressed to this console, by name, and checked before anything is read. See
+  // the header: this is what stands between an unauthenticated local listener and
+  // any page on the internet that resolves its own hostname to `127.0.0.1`.
+  //
+  // After the check above rather than before it, because node reads `Host` out of an
+  // absolute-form target when there is one, and an absolute-form target is a request
+  // this refuses on its own terms. A browser sends neither: the rebinding case is an
+  // ordinary origin-form request whose `Host` is the attacker's name, and it reaches
+  // here.
+  if (!addressedHere(req, port)) {
+    refuse(res, 403, 'BAD_HOST',
+           `this console answers to ${HOST}:${port} and not to `
+           + `${JSON.stringify(req.headers.host ?? null)}; open `
+           + `http://${HOST}:${port}/`);
     return;
   }
   // Parsed by `URL` rather than split by hand: it resolves `.` and `..` segments
@@ -696,11 +927,24 @@ async function handle(req, res, home) {
     refuse(res, 400, 'BAD_REQUEST', `${req.url} is not a path this can read`);
     return;
   }
-  const route = ROUTES[url.pathname];
-  if (!route) {
+  // Membership rather than truthiness: an application route whose bundle is missing
+  // is present in the table with nothing behind it, and it has its own answer below.
+  if (!ROUTES.has(url.pathname) && !app.routes.has(url.pathname)) {
+    // A path this does not serve, whatever it looks like. There is no fallback, and
+    // in particular no "serve the shell for anything unrecognised": every screen in
+    // the application is a fragment of `/`, so a second application path would be an
+    // invention rather than a route.
     refuse(res, 404, 'NO_ROUTE',
            `${url.pathname} is not served; this serves `
-           + `${Object.keys(ROUTES).join(' and ')}`);
+           + `${[...ROUTES.keys(), ...app.routes.keys()].sort().join(', ')}`);
+    return;
+  }
+  const route = ROUTES.get(url.pathname) ?? app.routes.get(url.pathname);
+  if (typeof route !== 'function') {
+    // A route the bundle was meant to fill and could not. Never a 404: the captain
+    // asked for something this console is supposed to have, and the answer is what is
+    // wrong with the install rather than "no such page".
+    refuse(res, 503, 'NO_APP', `${app.error}; ${BUILD}`);
     return;
   }
   if (req.method !== 'GET') {
@@ -713,6 +957,18 @@ async function handle(req, res, home) {
     return;
   }
   await route(req, res, url, home);
+}
+
+/** The application routes, or the ones that answer with why there is no application.
+ *
+ * The route set is the same either way, deliberately. A console whose bundle is
+ * missing that answered 404 for `/` would look like a console that never served an
+ * application at all, and the captain would go looking in the wrong place. */
+function appRoutes(loaded) {
+  if (!loaded.error) {
+    return new Map([...loaded.routes].map(([route, entry]) => [route, serveAsset(entry)]));
+  }
+  return new Map(ASSETS.map(([, route]) => [route, null]));
 }
 
 
@@ -744,13 +1000,17 @@ function shutdown(signal, server, claim) {
 function main() {
   const home = homeDir();
   const port = configuredPort();
+  // Read once, before the socket is bound, so a bundle that is not there is a line on
+  // startup rather than a surprise the first time the captain opens the page.
+  const loaded = loadApp(APP_DIR);
+  app = { routes: appRoutes(loaded), error: loaded.error };
   // Claimed before the listener, because the claim is what says this port is
   // owned: binding first would leave a window in which a second console found no
   // record, bound nothing, and reported success.
   const claim = claimConsole(home, port);
 
   const server = http.createServer((req, res) => {
-    handle(req, res, home).catch((e) => {
+    handle(req, res, home, port).catch((e) => {
       process.stderr.write(`${req.method} ${req.url} failed: ${e.stack || e}\n`);
       if (!res.headersSent) {
         refuse(res, 500, 'CONSOLE_FAILED',
@@ -776,10 +1036,19 @@ function main() {
   server.listen(port, HOST, () => {
     const at = server.address();
     process.stdout.write(
-      `serving  http://${at.address}:${at.port}/api/state\n`
+      `serving  http://${at.address}:${at.port}/\n`
+      + `         http://${at.address}:${at.port}/api/state\n`
       + `         http://${at.address}:${at.port}/api/stream\n`
       + `reading  ${READ} against ${home}\n`
+      + `app      ${loaded.error ? 'none' : APP_DIR}\n`
       + `claim    ${claim}\n`);
+    if (loaded.error) {
+      // Not a refusal to start. The two API routes are unaffected and are what every
+      // acceptance of this console rests on, so the console serves them and says
+      // exactly what the browser will get instead of the application.
+      process.stderr.write(`no application is being served: ${loaded.error}\n`
+                           + `  the API is unaffected; ${BUILD}\n`);
+    }
   });
 }
 
