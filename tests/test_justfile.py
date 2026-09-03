@@ -358,8 +358,15 @@ class Doctor(Recipe):
         self.assertIn("`siana-watch` refuses to start", out)
 
 
-class Suite(unittest.TestCase):
-    """The one flag in `just test` whose cost is paid outside the suite."""
+# The one case in the suite that starts an interpreter of its own over a repository
+# module, and so the one that can put bytecode in the worktree while every flag the
+# `test` recipe carries is still in place. Named here rather than described, because
+# the residue test below has to run something real to have residue to look at.
+CHILD_INTERPRETER = "test_a_creator_killed_before_the_lock_is_visible_leaves_none"
+
+
+class Suite(HomeTest):
+    """What `just test` must not leave behind in the worktree it ran in."""
 
     def recipe(self):
         with open(os.path.join(DISTRO, "justfile")) as fh:
@@ -373,20 +380,91 @@ class Suite(unittest.TestCase):
             body.append(line)
         return body
 
-    def test_the_suite_writes_no_bytecode(self):
+    def commands(self):
+        """The recipe's command lines: no blanks, no comments, no shebang.
+
+        Comments are dropped rather than searched, because half of what the recipe
+        says about bytecode it says in prose, and a test that matched that prose
+        would pass a recipe that had kept the explanation and lost the flag.
+        """
+        return [line.strip() for line in self.recipe()
+                if line.strip() and not line.strip().startswith("#")]
+
+    def test_the_just_entry_point_runs_the_guarded_runner(self):
+        # Two ways the litter comes back, and this covers both.
+        #
         # Without `-B`, discovery compiles every test module into a `__pycache__`
         # inside whatever worktree the suite ran in. `siana-retire` refuses to remove
         # a tree holding ignored files, because git deletes those without a word and
         # a `.pyc` and a `.env` look alike to it, so that litter made every minion
-        # worktree on this project unretirable until a human cleared it by hand. The
-        # flag is one word and the failure it prevents is a manual step on every
-        # task, so it is checked rather than remembered.
-        runs = [line.strip() for line in self.recipe()
-                if line.strip().startswith("python3")]
-        self.assertTrue(runs, "the `test` recipe no longer runs python3")
-        for line in runs:
-            self.assertIn(" -B ", line,
-                          f"`{line}` writes bytecode into the worktree it runs in")
+        # worktree on this project unretirable until a human cleared it by hand.
+        #
+        # And a recipe that reaches unittest directly loses `tests/run.py`, which
+        # carries both halves of the guarantee: the flag on to each worker it spawns
+        # (`tests/run.py:446`), and PYTHONPYCACHEPREFIX on to every process a run
+        # starts (`tests/run.py:102`). Discovery would then set that prefix only by
+        # the accident of importing `tests/test_run.py`, and a run named at one
+        # module would not set it at all. `python3 -B -m unittest discover -s tests`
+        # reads as compliant to anyone checking for the flag alone, and pool residue
+        # is exactly what it would bring back. So the entry point is asserted whole:
+        # one interpreter, that runner, that flag.
+        pythons = [line for line in self.commands() if "python" in line]
+        self.assertEqual(len(pythons), 1,
+                         f"the `test` recipe should start one interpreter: {pythons}")
+        line, = pythons
+        self.assertIn(" -B ", line,
+                      f"`{line}` writes bytecode into the worktree it runs in")
+        self.assertIn("tests/run.py", line,
+                      f"`{line}` bypasses the runner `just test` is guarded by")
+
+    def test_a_finished_run_leaves_no_bytecode_in_the_worktree(self):
+        # A green run left `tests/__pycache__/helpers.pyc` in the worktree it ran
+        # in while the recipe test above passed throughout, which is why shape is
+        # not enough on its own. The recipe's flag covers the interpreter it starts
+        # and the workers that one spawns and reaches no further - a flag is not
+        # inherited - and `CHILD_INTERPRETER` starts one of its own over
+        # `tests/helpers.py`, compiled before `helpers.py:36` can set
+        # `sys.dont_write_bytecode`.
+        #
+        # Two guards close that today, PYTHONPYCACHEPREFIX in `tests/run.py` and the
+        # `-B` in `tests/test_clean.py`, and this test names neither. It reads the
+        # tree a real run left behind, so it holds for whichever of them is carrying
+        # the guarantee and goes red when the last one goes.
+        #
+        # Into a copy, because the residue this looks for is the residue that makes a
+        # worktree unretirable, and a test that produced it in this one would have to
+        # delete it again to stay green - which is the failure hidden rather than
+        # found. One worker, because the pool's own hygiene has its test in
+        # `tests/test_run.py` and what is being reproduced here is a child of a test.
+        where = self.at("distro")
+        shutil.copytree(DISTRO, where, ignore=shutil.ignore_patterns(
+            ".git", "__pycache__", "*.pyc"))
+        #
+        # 180s to match `Recipe.just` above, and it has to stay well under the
+        # runner's own guards or it is not a bound at all: the coordinator kills a
+        # worker silent for `STALL_S + GRACE_S` (490s) and the serial control arms a
+        # per-test watchdog at `STALL_S` (480s) with `exit=True`. A longer timeout
+        # here means a hung inner run takes the whole outer run down as a stalled
+        # worker, or `_exit`s past every cleanup and strands the inner tree, instead
+        # of failing as this one test with its output attached. The run it bounds
+        # takes about a second and a half.
+        out = subprocess.run(
+            ["just", "test", "-k", CHILD_INTERPRETER], cwd=where, text=True,
+            capture_output=True, timeout=180,
+            env=self.command_env({"SIANA_TEST_WORKERS": "1"}))
+        text = out.stdout + out.stderr
+        self.assertEqual(out.returncode, 0, text)
+        # A `-k` matching nothing is a green run of nothing, and green is what the
+        # rest of this reads. Without this line, renaming the case above would switch
+        # the regression off instead of breaking it.
+        self.assertIn("Ran 1 test", text)
+        left = []
+        for root, dirs, names in os.walk(where):
+            for name in dirs + names:
+                if name == "__pycache__" or name.endswith(".pyc"):
+                    left.append(os.path.relpath(os.path.join(root, name), where))
+        self.assertEqual(sorted(left), [],
+                         f"a finished run left bytecode behind: {sorted(left)}")
 
 
 @unittest.skipUnless(has("pi") and has("tasks") and has("datafile"),

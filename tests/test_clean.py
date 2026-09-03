@@ -973,8 +973,22 @@ class Run(HomeTest):
         program = self.at("park.py")
         with open(program, "w") as fh:
             fh.write(PARK_AT_THE_BOUNDARY)
+        # `-B`, because this child imports `tests/helpers.py` from the checkout and
+        # the compile happens before `helpers.py:36` can set
+        # `sys.dont_write_bytecode` on itself. The `tests/__pycache__/helpers.pyc`
+        # it leaves is enough for `siana-retire` to refuse the whole tree: git
+        # deletes ignored files without a word and a `.pyc` and a `.env` look alike
+        # to it.
+        #
+        # Redundant under `just test`, and under `python3 -m unittest discover` too:
+        # importing `tests/run.py` sets PYTHONPYCACHEPREFIX for every process a run
+        # starts, and discovery imports it by way of `tests/test_run.py`. Driven as
+        # one module it is the whole guarantee - `python3 -B -m unittest
+        # test_clean.Run.<this test>` never imports the runner, so nothing sets the
+        # prefix and only this flag stands between the child and the checkout.
+        # Checked both ways rather than reasoned about.
         parked = subprocess.Popen(
-            [sys.executable, program, HERE, self.home, reached],
+            [sys.executable, "-B", program, HERE, self.home, reached],
             env=self.command_env(), stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True)
         self.addCleanup(parked.kill)
